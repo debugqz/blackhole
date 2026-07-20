@@ -1,3 +1,9 @@
+/* Screenshot/shoulder-surfing mitigation — see main.ts installBlurOnUnfocus */
+body.bh-privacy-blur .container {
+  filter: blur(12px);
+  transition: filter 120ms ease-out;
+}
+
 .logo.vite:hover {
   filter: drop-shadow(0 0 2em #747bff);
 }

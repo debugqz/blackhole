@@ -3,6 +3,7 @@ name = "bh-daemon"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "blackhole-daemon"
@@ -16,3 +17,5 @@ bh-storage = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+dirs = "6"
+getrandom = "0.4"

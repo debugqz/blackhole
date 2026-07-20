@@ -3,14 +3,34 @@ name = "bh-network"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
+libp2p = { version = "0.56.0", features = [
+    "tokio",
+    "tcp",
+    "noise",
+    "yamux",
+    "kad",
+    "identify",
+    "macros",
+] }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing = { workspace = true }
+futures = "0.3"
+bh-crypto = { workspace = true }
+x25519-dalek = { version = "3", features = ["static_secrets", "getrandom"] }
+ed25519-dalek = "3"
+chacha20poly1305 = "0.11"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
-# Planned, not yet added — see docs/SPEC.md §5. Pull these in when the
-# networking layer is actually implemented, not before:
-#   libp2p (with kad, noise, quic/tcp, relay, dcutr features) — transport,
-#     NAT traversal (STUN via libp2p, TURN fallback), Kademlia DHT
-#   a libp2p-compatible onion routing layer for the 3+ hop circuits
-#     (SPEC.md §5.2) — no mature off-the-shelf crate for this yet, likely
-#     needs a custom circuit-building layer on top of libp2p streams
+# STUN/TURN (SPEC.md §5.1) aren't wired in yet — libp2p's own hole-punching
+# (relay + dcutr) covers a meaningful chunk of what STUN/TURN would. The
+# onion routing circuit layer (§5.2) has no mature off-the-shelf crate to
+# build on, so it's implemented directly in onion.rs on audited primitives.

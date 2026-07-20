@@ -3,14 +3,23 @@ name = "bh-storage"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+r2d2 = "0.8"
+r2d2_sqlite = { version = "0.25", features = ["bundled-sqlcipher"] }
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
 
-# Planned, not yet added — see docs/SPEC.md §7. Pull these in when local
-# storage is actually implemented, not before:
-#   rusqlite (or libsqlite3-sys) built against SQLCipher for
-#     encrypted-at-rest local storage
-#   platform key-storage bindings: Secure Enclave (iOS), Keystore/StrongBox
-#     (Android) — desktop equivalents (Keychain/DPAPI/Secret Service) as a
-#     fallback where there's no dedicated secure element
+# Platform key-storage bindings are still pending — see docs/SPEC.md §7:
+#   Secure Enclave (iOS), Keystore/StrongBox (Android) — mobile, out of
+#   scope until a mobile client exists.
+#   Desktop fallback (Keychain/DPAPI/Secret Service) is implemented via the
+#   `keyring` crate, added below.
+keyring = "3"
