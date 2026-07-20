@@ -1,0 +1,16 @@
+[package]
+name = "bh-crypto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+# Planned, not yet added — see docs/SPEC.md §2. Pull these in when protocol
+# work actually starts, not before:
+#   libsignal-protocol  — X3DH + Double Ratchet (github.com/signalapp/libsignal)
+#   openmls              — MLS groups, RFC 9420
+#   ml-kem (or pqcrypto-kyber) — the Kyber/ML-KEM side of the PQ hybrid
+#   an audited libsodium binding — every other primitive (SPEC.md §2.1: no
+#     custom crypto primitives, ever)

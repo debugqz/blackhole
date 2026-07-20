@@ -1,0 +1,18 @@
+[package]
+name = "bh-daemon"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "blackhole-daemon"
+path = "src/main.rs"
+
+[dependencies]
+bh-api = { workspace = true }
+bh-crypto = { workspace = true }
+bh-network = { workspace = true }
+bh-storage = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

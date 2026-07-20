@@ -1,0 +1,16 @@
+[package]
+name = "bh-storage"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+# Planned, not yet added — see docs/SPEC.md §7. Pull these in when local
+# storage is actually implemented, not before:
+#   rusqlite (or libsqlite3-sys) built against SQLCipher for
+#     encrypted-at-rest local storage
+#   platform key-storage bindings: Secure Enclave (iOS), Keystore/StrongBox
+#     (Android) — desktop equivalents (Keychain/DPAPI/Secret Service) as a
+#     fallback where there's no dedicated secure element

@@ -1,0 +1,5 @@
+# Rust workspace build output
+/target/
+
+# OS
+.DS_Store

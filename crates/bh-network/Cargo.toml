@@ -1,0 +1,16 @@
+[package]
+name = "bh-network"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+# Planned, not yet added — see docs/SPEC.md §5. Pull these in when the
+# networking layer is actually implemented, not before:
+#   libp2p (with kad, noise, quic/tcp, relay, dcutr features) — transport,
+#     NAT traversal (STUN via libp2p, TURN fallback), Kademlia DHT
+#   a libp2p-compatible onion routing layer for the 3+ hop circuits
+#     (SPEC.md §5.2) — no mature off-the-shelf crate for this yet, likely
+#     needs a custom circuit-building layer on top of libp2p streams
