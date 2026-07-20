@@ -220,20 +220,76 @@ guarantee.
   accidental or malicious re-init can't silently replace a user's identity
   through this endpoint.
 
+### 3.10 Third-party dependency vulnerabilities (GitHub Dependabot)
+
+Reviewed 2026-07-20. GitHub's dependency graph scans `Cargo.lock`
+statically — it flags every locked package regardless of whether that
+package is actually reachable from compiled code, so each alert below was
+individually checked with `cargo tree` (and `cargo tree --target all`,
+since some entries are target-gated) to see whether it's live or dormant.
+
+- **`yamux` 0.12.1 — GHSA-vxx9-2994-q338 / CVE-2026-32314, high, LIVE.**
+  A crafted inbound Yamux `Data` frame with `SYN` set and an oversized body
+  (> `DEFAULT_CREDIT`) panics the connection state machine
+  (`remove(...).expect("stream not found")`) — remotely triggerable by any
+  peer that can open a Yamux stream, no authentication required. This *is*
+  compiled into `bh-network`'s transport (`libp2p-yamux` depends on it
+  directly, confirmed via `cargo tree -i yamux@0.12.1` with no
+  `--target`/feature gate needed). Fixed upstream in `yamux` 0.13.10 — but
+  `libp2p-yamux` 0.47.0 (the version pulled by `libp2p` 0.56.0, currently
+  latest) depends on *both* 0.12.1 and 0.13.10 for what looks like
+  wire-protocol-version negotiation between two yamux generations, and
+  hasn't bumped the 0.12 slot yet. No fix is available by changing anything
+  in this repo — it's blocked on a `rust-libp2p` release. Not practically
+  exploitable today (no live network deployment — see the Status table),
+  but this **must be resolved before `bh-network` is wired into the daemon
+  and exposed to real peers** (tracked in §4 below).
+- **`hickory-proto` ≤0.25.2 / ≤0.26.0 — GHSA-3v94-mw7p-v465,
+  GHSA-q2qq-hmj6-3wpp, dormant.** Pulled transitively via
+  `libp2p-mdns → hickory-resolver → hickory-proto`. `libp2p`'s `mdns`
+  feature (LAN peer discovery) is not enabled anywhere in this workspace —
+  confirmed via `cargo tree -i libp2p-mdns` (and `--target all`), which
+  resolves to nothing. Locked in `Cargo.lock` because Cargo reserves a
+  compatible version for every optional dependency any crate in the graph
+  *could* activate, not just the ones actually turned on. Becomes live the
+  moment `mdns` is enabled — worth fixing at that point, not before.
+- **`libcrux-chacha20poly1305` <0.0.8 — GHSA-hc3c-63hc-2r9f, dormant.**
+  Pulled via `hpke-rs`'s optional `libcrux` backend, which `openmls_rust_crypto`
+  (the backend this repo actually uses — see `bh-crypto::mls`) does not
+  request. `cargo tree -i hpke-rs-libcrux --target all` resolves to
+  nothing.
+- **`glib` <0.20.0 — GHSA-wrw7-89jp-8q8g, dormant on the platforms built/tested
+  so far.** Part of Tauri's Linux GTK backend (`gtk`/`webkit2gtk` →
+  `glib`), gated to `target_os = "linux"`. Doesn't appear in `cargo tree`
+  for the macOS host target used during development. Linux is an explicit
+  distribution target for the desktop client (SPEC.md §10), so this
+  **will** need a fix before a Linux build ships — tracked in §4, not
+  ignorable indefinitely the way the other two dormant entries are.
+
 ## 4. Summary: open risks, ranked
 
-1. **Onion routing packet-size leak** (§3.4) — the most consequential gap;
-   position-in-circuit is inferable from packet size today.
-2. **Mailbox manifest race condition under concurrent writers** (§3.6).
-3. **No Key Transparency** (§3.1) — MITM detection is manual-verification-
+1. **Onion routing packet-size leak** (§3.4) — the most consequential
+   design gap; position-in-circuit is inferable from packet size today.
+2. **`yamux` remote panic, CVE-2026-32314** (§3.10) — live in the compiled
+   transport, upstream-blocked, must be resolved before `bh-network` is
+   wired into the daemon and exposed to real peers.
+3. **Mailbox manifest race condition under concurrent writers** (§3.6).
+4. **No Key Transparency** (§3.1) — MITM detection is manual-verification-
    only.
-4. **PQ hybrid not integrated into the live X3DH flow** (§3.3) — exists and
+5. **PQ hybrid not integrated into the live X3DH flow** (§3.3) — exists and
    is tested standalone, doesn't protect real sessions yet.
-5. **PoW not enforced anywhere** (§3.8) — primitive exists, no enforcement
+6. **PoW not enforced anywhere** (§3.8) — primitive exists, no enforcement
    point wired in.
-6. **No PIN/passphrase layer in front of the DB key** (§3.7).
-7. **MLS state not persisted** (§3.2) — functional but not durable across
+7. **No PIN/passphrase layer in front of the DB key** (§3.7).
+8. **MLS state not persisted** (§3.2) — functional but not durable across
    restarts.
+9. **`glib` GTK vulnerability** (§3.10) — dormant until a Linux build ships,
+   needs upstream Tauri/gtk-rs-core to bump first.
+
+Two entries deliberately excluded from this list: the `hickory-proto`
+alerts (§3.10) are dormant with no path to becoming live short of
+enabling a feature (`mdns`) nothing in this repo turns on — re-evaluate
+if/when that changes, not before.
 
 None of these are secret — each is called out in the relevant module's own
 doc comments. This section exists to make the aggregate picture visible in
