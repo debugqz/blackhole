@@ -20,10 +20,12 @@ fn row_to_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
         contact_id: row.get(2)?,
         group_id: row.get(3)?,
         created_at: row.get(4)?,
+        disappearing_timer_secs: row.get(5)?,
     })
 }
 
-const SELECT_COLUMNS: &str = "conversation_id, kind, contact_id, group_id, created_at";
+const SELECT_COLUMNS: &str =
+    "conversation_id, kind, contact_id, group_id, created_at, disappearing_timer_secs";
 
 impl Database {
     pub fn create_direct_conversation(
@@ -76,5 +78,34 @@ impl Database {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], row_to_conversation)?;
         rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Sets (or clears, with `None`) the disappearing-messages timer for a
+    /// conversation. Only affects messages sent *after* this call — existing
+    /// messages keep whatever `expires_at` they already had.
+    pub fn set_disappearing_timer(
+        &self,
+        conversation_id: &str,
+        timer_secs: Option<i64>,
+    ) -> Result<(), StorageError> {
+        self.conn()?.execute(
+            "UPDATE conversations SET disappearing_timer_secs = ?1 WHERE conversation_id = ?2",
+            params![timer_secs, conversation_id],
+        )?;
+        Ok(())
+    }
+
+    /// What `expires_at` a message sent right now should get, per the
+    /// conversation's current disappearing-messages timer (`None` if the
+    /// conversation doesn't exist or the timer is off).
+    pub fn compute_message_expiry(
+        &self,
+        conversation_id: &str,
+        sent_at: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        Ok(self
+            .get_conversation(conversation_id)?
+            .and_then(|c| c.disappearing_timer_secs)
+            .map(|timer| sent_at + timer))
     }
 }

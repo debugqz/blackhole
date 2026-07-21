@@ -1,0 +1,320 @@
+//! Real WebRTC (ICE/DTLS/SRTP) transport via `webrtc-rs`. This is the hop-
+//! security layer — it protects each leg to/from a relay, same as any
+//! other WebRTC app. `media_crypto.rs`'s SFrame layer rides on top,
+//! encrypting/decrypting the encoded audio/video *samples* before they're
+//! handed to (or read from) the RTP (de)packetizers here, so the payload
+//! stays confidential end-to-end even from a coerced/malicious relay.
+//!
+//! No STUN/TURN is wired in yet (mirrors `bh-network`'s current state —
+//! see `docs/SPEC.md`), so this only actually connects two peers who can
+//! reach each other directly (LAN, or same machine, as in this module's
+//! own tests) until that's added.
+
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
+use webrtc::api::APIBuilder;
+use webrtc::media::Sample;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+use crate::CallError;
+
+fn to_call_error(err: impl std::fmt::Display) -> CallError {
+    CallError::Transport(err.to_string())
+}
+
+/// Builds a fresh peer connection with Opus/VP8 (and the rest of
+/// webrtc-rs's default codec set) registered. `ice_servers` is empty by
+/// default (see module doc) — pass STUN/TURN URLs once that's wired up.
+pub async fn new_peer_connection(
+    ice_servers: Vec<webrtc::ice_transport::ice_server::RTCIceServer>,
+) -> Result<Arc<RTCPeerConnection>, CallError> {
+    let mut media_engine = MediaEngine::default();
+    media_engine
+        .register_default_codecs()
+        .map_err(to_call_error)?;
+    let api = APIBuilder::new().with_media_engine(media_engine).build();
+    let config = RTCConfiguration {
+        ice_servers,
+        ..Default::default()
+    };
+    let pc = api
+        .new_peer_connection(config)
+        .await
+        .map_err(to_call_error)?;
+    Ok(Arc::new(pc))
+}
+
+pub fn new_audio_track(stream_id: &str) -> Arc<TrackLocalStaticSample> {
+    Arc::new(TrackLocalStaticSample::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: 48_000,
+            channels: 2,
+            ..Default::default()
+        },
+        "audio".to_owned(),
+        stream_id.to_owned(),
+    ))
+}
+
+pub fn new_video_track(stream_id: &str) -> Arc<TrackLocalStaticSample> {
+    Arc::new(TrackLocalStaticSample::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_VP8.to_owned(),
+            clock_rate: 90_000,
+            ..Default::default()
+        },
+        "video".to_owned(),
+        stream_id.to_owned(),
+    ))
+}
+
+/// Writes one already-SFrame-encrypted sample (an encrypted Opus or VP8
+/// frame) to a local track. webrtc-rs packetizes it into RTP and DTLS-SRTP
+/// encrypts that for the hop to whatever's on the other end — our own
+/// encryption is already baked into `data` by the time it gets here.
+pub async fn write_encrypted_sample(
+    track: &TrackLocalStaticSample,
+    encrypted_frame: Vec<u8>,
+    duration: Duration,
+) -> Result<(), CallError> {
+    track
+        .write_sample(&Sample {
+            data: encrypted_frame.into(),
+            timestamp: SystemTime::now(),
+            duration,
+            ..Default::default()
+        })
+        .await
+        .map_err(to_call_error)
+}
+
+/// Creates a local offer, waits for ICE gathering to finish, and returns
+/// the resulting SDP (candidates included — "vanilla"/non-trickle ICE,
+/// simplest to ferry as a single opaque blob inside
+/// `envelope::CallSignal::Offer`).
+pub async fn create_local_offer(pc: &RTCPeerConnection) -> Result<String, CallError> {
+    let offer = pc.create_offer(None).await.map_err(to_call_error)?;
+    let mut gather_complete = pc.gathering_complete_promise().await;
+    pc.set_local_description(offer)
+        .await
+        .map_err(to_call_error)?;
+    let _ = gather_complete.recv().await;
+    let desc = pc
+        .local_description()
+        .await
+        .ok_or_else(|| CallError::Transport("no local description after offer".into()))?;
+    Ok(desc.sdp)
+}
+
+/// Applies a remote offer, creates the matching local answer, waits for
+/// ICE gathering, and returns the answer's SDP.
+pub async fn create_local_answer(
+    pc: &RTCPeerConnection,
+    remote_offer_sdp: String,
+) -> Result<String, CallError> {
+    let offer = RTCSessionDescription::offer(remote_offer_sdp).map_err(to_call_error)?;
+    pc.set_remote_description(offer)
+        .await
+        .map_err(to_call_error)?;
+
+    let answer = pc.create_answer(None).await.map_err(to_call_error)?;
+    let mut gather_complete = pc.gathering_complete_promise().await;
+    pc.set_local_description(answer)
+        .await
+        .map_err(to_call_error)?;
+    let _ = gather_complete.recv().await;
+    let desc = pc
+        .local_description()
+        .await
+        .ok_or_else(|| CallError::Transport("no local description after answer".into()))?;
+    Ok(desc.sdp)
+}
+
+/// The caller's side: applies the callee's answer to finish the handshake.
+pub async fn apply_remote_answer(
+    pc: &RTCPeerConnection,
+    remote_answer_sdp: String,
+) -> Result<(), CallError> {
+    let answer = RTCSessionDescription::answer(remote_answer_sdp).map_err(to_call_error)?;
+    pc.set_remote_description(answer)
+        .await
+        .map_err(to_call_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration as StdDuration;
+
+    use webrtc::media::io::sample_builder::SampleBuilder;
+    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+    use webrtc::rtp::codecs::opus::OpusPacket;
+    use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
+    use webrtc::rtp_transceiver::RTCRtpTransceiver;
+    use webrtc::track::track_remote::TrackRemote;
+
+    use crate::media_crypto::{FrameDecryptor, FrameEncryptor};
+    use crate::signaling::{IncomingCall, OutgoingCall, CALLER_SENDER_TAG};
+
+    async fn wait_connected(pc: &Arc<RTCPeerConnection>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        let tx = std::sync::Arc::new(tx);
+        pc.on_peer_connection_state_change(Box::new(move |state| {
+            if state == RTCPeerConnectionState::Connected {
+                let tx = tx.clone();
+                return Box::pin(async move {
+                    let _ = tx.send(()).await;
+                });
+            }
+            Box::pin(async {})
+        }));
+        if pc.connection_state() == RTCPeerConnectionState::Connected {
+            return;
+        }
+        // Generous timeout: this is real local UDP/ICE/DTLS negotiation,
+        // not a mock, so it's sensitive to system load — e.g. running
+        // alongside other test binaries in a full `cargo test --workspace`
+        // pass.
+        tokio::time::timeout(StdDuration::from_secs(30), rx.recv())
+            .await
+            .expect("peer connection did not reach Connected in time")
+            .expect("state-change channel closed");
+    }
+
+    /// End-to-end: two real local `RTCPeerConnection`s complete a full
+    /// offer/answer/ICE handshake, the caller sends SFrame-encrypted
+    /// "audio" frames over a real Opus track, and the callee receives them
+    /// over real RTP and decrypts them with the SFrame context derived via
+    /// `signaling.rs`'s key agreement. Confirms the whole
+    /// signaling+crypto+transport stack actually interoperates, not just
+    /// each piece in isolation.
+    #[tokio::test]
+    async fn encrypted_audio_frames_survive_a_real_local_webrtc_connection() {
+        let caller_pc = new_peer_connection(vec![]).await.unwrap();
+        let callee_pc = new_peer_connection(vec![]).await.unwrap();
+
+        let audio_track = new_audio_track("bh-calls-test-audio");
+        caller_pc
+            .add_track(audio_track.clone()
+                as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
+            .await
+            .unwrap();
+
+        let received_track: Arc<tokio::sync::Mutex<Option<Arc<TrackRemote>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let received_track_clone = received_track.clone();
+        callee_pc.on_track(Box::new(
+            move |track: Arc<TrackRemote>,
+                  _receiver: Arc<RTCRtpReceiver>,
+                  _transceiver: Arc<RTCRtpTransceiver>| {
+                let received_track_clone = received_track_clone.clone();
+                Box::pin(async move {
+                    *received_track_clone.lock().await = Some(track);
+                })
+            },
+        ));
+
+        // Signaling + key agreement (bh-crypto, via signaling.rs) — happens
+        // "out of band" here (in production: inside an encrypted chat
+        // envelope), interleaved with the real transport handshake.
+        let outgoing = OutgoingCall::new("test-call-1", false);
+        let offer_sdp = create_local_offer(&caller_pc).await.unwrap();
+        let offer_signal = outgoing.offer(offer_sdp.into_bytes());
+
+        let incoming = IncomingCall::from_offer(&offer_signal).unwrap();
+        let answer_sdp = create_local_answer(
+            &callee_pc,
+            String::from_utf8(incoming.transport_description.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (answer_signal, callee_sframe) = incoming.answer(answer_sdp.into_bytes());
+
+        let (caller_sframe, callee_answer_sdp) = outgoing.accept_answer(&answer_signal).unwrap();
+        apply_remote_answer(&caller_pc, String::from_utf8(callee_answer_sdp).unwrap())
+            .await
+            .unwrap();
+
+        wait_connected(&caller_pc).await;
+        wait_connected(&callee_pc).await;
+
+        let encryptor = FrameEncryptor::new(caller_sframe, CALLER_SENDER_TAG);
+        let decryptor = FrameDecryptor::new(callee_sframe);
+
+        // Send a handful of frames at a realistic 20ms Opus cadence.
+        let plaintexts: Vec<Vec<u8>> = (0..5)
+            .map(|i| format!("opus-frame-{i}").into_bytes())
+            .collect();
+        for plaintext in &plaintexts {
+            let encrypted = encryptor.encrypt(plaintext).unwrap();
+            write_encrypted_sample(&audio_track, encrypted, StdDuration::from_millis(20))
+                .await
+                .unwrap();
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        // `SampleBuilder` needs a *later*-timestamped packet to arrive
+        // before it will consider the previous one complete — send a few
+        // trailing filler frames purely to flush the last real frame out
+        // on the receive side (filtered out of the assertion below, not
+        // part of what's being verified).
+        for _ in 0..3 {
+            let encrypted = encryptor.encrypt(b"__flush__").unwrap();
+            write_encrypted_sample(&audio_track, encrypted, StdDuration::from_millis(20))
+                .await
+                .unwrap();
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+
+        let track = tokio::time::timeout(StdDuration::from_secs(15), async {
+            loop {
+                if let Some(t) = received_track.lock().await.clone() {
+                    return t;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("callee never received the remote track");
+
+        let mut sample_builder = SampleBuilder::new(50, OpusPacket, 48_000);
+        let mut decrypted_plaintexts = Vec::new();
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(15);
+        let mut buf = vec![0u8; 1500];
+        let received_any = AtomicBool::new(false);
+        while decrypted_plaintexts.len() < plaintexts.len()
+            && tokio::time::Instant::now() < deadline
+        {
+            match tokio::time::timeout(StdDuration::from_millis(500), track.read(&mut buf)).await {
+                Ok(Ok((packet, _attrs))) => {
+                    received_any.store(true, Ordering::SeqCst);
+                    sample_builder.push(packet);
+                    while let Some(sample) = sample_builder.pop() {
+                        let (_, _, _, plaintext) = decryptor.decrypt(&sample.data).unwrap();
+                        decrypted_plaintexts.push(plaintext);
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        assert!(
+            received_any.load(Ordering::SeqCst),
+            "never read any RTP packets"
+        );
+        assert_eq!(
+            decrypted_plaintexts, plaintexts,
+            "the real frames (filler frames excluded) must decrypt in order"
+        );
+
+        let _ = caller_pc.close().await;
+        let _ = callee_pc.close().await;
+    }
+}

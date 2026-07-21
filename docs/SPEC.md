@@ -188,6 +188,27 @@ Estos puntos fueron identificados pero decididos deliberadamente para más adela
 
 ---
 
+## 15. Funciones añadidas (post-v0.1)
+
+Implementadas sobre la base de v0.1, sin tocar ninguno de los no-negociables (§2.2, CLAUDE.md). Todas están en `bh-crypto`/`bh-storage`/`bh-api`/`bh-calls`, reales y testeadas (ver cada crate), salvo donde se indica lo contrario.
+
+- **Reacciones y respuestas citadas (quote-reply)**: reacciones por emoji (`bh_storage::reactions`) y `reply_to_message_id` en cada mensaje. Almacenamiento local únicamente — el transporte cifrado de una reacción/cita viaja como una variante más de `bh_crypto::envelope::Envelope`, indistinguible desde fuera de cualquier otro mensaje cifrado (ver más abajo).
+- **Mensajes efímeros configurables**: el sweeper de auto-destrucción de §7 ya existía; ahora cada conversación tiene su propio temporizador (`disappearing_timer_secs`, `bh_storage::conversations::set_disappearing_timer`) que se aplica automáticamente al enviar (`POST /conversations/:id/messages`).
+- **Recibos de entrega/lectura sin metadata para el operador**: en vez de un "protocolo de recibos" aparte (que filtraría "estas dos partes están intercambiando recibos ahora"), un recibo es una variante más de `bh_crypto::envelope::Envelope` (`Envelope::Receipt`) — viaja dentro de la misma sesión Double Ratchet/MLS ya autenticada que el contenido de chat, así que cualquier cosa fuera del destinatario ve ciphertext idéntico sin importar qué contiene. Ver `docs/THREAT_MODEL.md` para la fuga residual de longitud de ciphertext.
+- **Verificación por número de seguridad** (ya prevista en §3): `bh_crypto::safety_number` implementa el fingerprint iterado (SHA-512, mismo estilo que Signal) combinando ambas identidades, mostrable como 12 grupos de 5 dígitos o QR. `Contact.verified` (ya existía en el schema) se marca vía `POST /contacts/:id/verify` tras la comparación manual — la app nunca marca "verificado" por sí sola.
+- **Invitaciones expirables / de un solo uso**: `bh_crypto::invite::InvitePayload` ahora lleva un token aleatorio y una expiración opcional. Como no hay servidor, la única autoridad real es el emisor: `bh_storage::invites` lleva el registro local (`issued_invites`) y `Database::consume_invite` decide atómicamente si un intento de canje sigue siendo válido.
+- **Exportación/importación cifrada de historial**: reutiliza `bh_crypto::backup::seal`/`open` (Argon2id + ChaCha20-Poly1305), aplicado a un paquete conversación+mensajes+reacciones+recibos en vez de a todo el backup de cuenta (`bh-api::export`).
+- **Multi-cuenta (perfiles aislados)**: cada perfil es una base SQLCipher y un *service name* de keystore completamente separados (`bh_storage::profiles::ProfileManager`), el mismo modelo de aislamiento que ya exige §12 entre pagos y mensajería, aplicado aquí entre identidades. El listado de perfiles (id/nombre/fecha) es el único dato en texto plano — nunca contenido ni claves.
+- **Llamadas de voz/video E2EE** (`bh-calls`, nuevo crate):
+  - *Señalización y acuerdo de claves* (`bh_crypto::call_keys`, `bh_calls::signaling`): ECDH efímero por llamada + HKDF, independiente de las claves de sesión a largo plazo (forward secrecy específico de la llamada). El offer/answer/candidatos viaja como `Envelope::Call` dentro de la sesión cifrada existente — mismo principio que los recibos.
+  - *Cifrado de medios* (`bh_crypto::call_keys::SframeContext`): capa SFrame (estilo draft-ietf-sframe) sobre el audio/video ya codificado, con ratcheting de época — una segunda capa de cifrado independiente de DTLS-SRTP, así que ni siquiera un relay/TURN comprometido puede ver el contenido.
+  - *Transporte* (`bh_calls::transport`): WebRTC real vía `webrtc-rs` (ICE/DTLS/SRTP) — sin STUN/TURN todavía (mismo estado que `bh-network`), validado con dos `RTCPeerConnection` locales reales en los tests.
+  - *Audio* (`bh_calls::audio`): Opus (`audiopus`, bindings sobre libopus) + captura/reproducción real con `cpal`. El roundtrip de codec está testeado con PCM sintético; captura/reproducción de hardware real no se ejercita en CI (sin micrófono/altavoces).
+  - *Video* (`bh_calls::video`): captura de cámara (`nokhwa`) + codificación VP8 (`vpx-encode`, sobre libvpx). **Decodificación VP8 deliberadamente fuera de alcance**: no existe un crate Rust seguro de decodificación VP8, y escribir bindings FFI propios contra libvpx es exactamente el tipo de código no auditado que este proyecto evita escribir (mismo principio que §2.2, aplicado a códecs en vez de a criptografía) — se deja al cliente Tauri, que puede decodificar con las APIs nativas del webview.
+  - Requiere en tiempo de compilación `opus`, `libvpx` y `pkg-config` del sistema (vía Homebrew/apt/etc.) — ver comentarios en `crates/bh-calls/Cargo.toml`.
+
+---
+
 ## Apéndice — Stack tecnológico de referencia
 
 | Capa | Tecnología propuesta |

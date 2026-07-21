@@ -65,6 +65,7 @@ mod tests {
             received_at: None,
             expires_at: Some(10),
             deleted_at: None,
+            reply_to_message_id: None,
         })
         .unwrap();
 

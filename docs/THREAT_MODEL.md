@@ -266,6 +266,65 @@ since some entries are target-gated) to see whether it's live or dormant.
   **will** need a fix before a Linux build ships — tracked in §4, not
   ignorable indefinitely the way the other two dormant entries are.
 
+### 3.11 Post-v0.1 features (`bh-crypto::{envelope,safety_number,call_keys}`, `bh-storage::{reactions,receipts,invites,profiles}`, `bh-calls`)
+
+Reviewed 2026-07-20, covering everything added in SPEC.md §15.
+
+- **Information disclosure (ciphertext-length side channel)**: `Envelope`'s
+  variants (text/reaction/receipt/call-signal) are different sizes before
+  encryption, so an observer who can measure ciphertext length across many
+  messages could statistically distinguish "this looks like a receipt"
+  from "this looks like a long text message" — the same class of leak as
+  the already-tracked onion packet-size gap (§3.4, ranked #1 below), not a
+  new category of risk, but a new instance of it. No padding/bucketing is
+  implemented for envelope payloads yet.
+- **Repudiation (safety numbers)**: `bh_crypto::safety_number` computes a
+  fingerprint from *whatever* public keys are handed to it — it has no way
+  to know the caller resolved the correct contact. `Contact.verified` only
+  ever gets set by an explicit `POST /contacts/:id/verify` after a human
+  comparison; the crate itself makes no trust claim.
+- **Elevation of privilege (invite tokens are issuer-side-only)**: nothing
+  stops a scanning party from trying an expired/revoked token anyway —
+  `bh_storage::invites::consume_invite` is what actually blocks it, and
+  only the *issuer's* daemon ever calls it. A client that skips calling
+  `consume_invite` before completing a handshake would silently accept an
+  invite it shouldn't — this is a contract on whatever eventually wires
+  `bh-network` handshakes to invites, not yet enforced by a type system.
+- **Denial of service (profile keystore cache is unbounded)**:
+  `ProfileManager` caches one `Keystore` per profile for the daemon's
+  lifetime (`keystore_for`) and never evicts entries for profiles that
+  still exist — bounded in practice by how many profiles a user creates
+  through the UI, not attacker-controlled, but worth noting if profile
+  creation is ever exposed to less-trusted callers.
+- **Tampering (disappearing-timer sweeper follows only the startup
+  profile)**: the expiry sweeper (§3.7) is spawned once, against whichever
+  profile is active when the daemon starts — switching the active profile
+  at runtime (`POST /profiles/:id/activate`) does not move the sweeper to
+  the new profile's database until the next restart. Self-destructing
+  messages in a non-startup profile still expire correctly on next
+  restart; they just don't get swept promptly while that profile is
+  active without a restart.
+- **Calls — no STUN/TURN (`bh-calls::transport`)**: mirrors §3.4/general
+  network state — only peers that can reach each other directly connect
+  today. Unlike the messaging path, there's also no onion routing over
+  call signaling or media; `Envelope::Call` gets the same sealed-sender-
+  via-session protection as any other envelope, but the WebRTC media
+  itself flows directly between the two endpoints once connected (by
+  design — SFrame end-to-end encryption, not anonymity, is the property
+  calls get; see SPEC.md §15).
+- **Calls — VP8 decode intentionally unimplemented (`bh-calls::video`)**:
+  by design (SPEC.md §15) rather than an oversight — no audited safe-Rust
+  VP8 decoder exists on crates.io, and hand-rolling one against libvpx's
+  raw FFI was judged higher-risk than deferring decode/render to the
+  client's webview. Tracked here so it doesn't get mistaken for a gap that
+  "just needs plumbing" — it needs either a new audited dependency or a
+  client-side implementation.
+- **Calls — no group-call support**: `call_keys::SframeContext`'s
+  `sender_tag` is a single byte distinguishing exactly two parties
+  (caller/callee). Extending to N participants needs a per-participant
+  tag and key-distribution scheme that doesn't exist yet — noted in
+  `call_keys.rs`'s own doc comments.
+
 ## 4. Summary: open risks, ranked
 
 1. **Onion routing packet-size leak** (§3.4) — the most consequential
@@ -285,6 +344,14 @@ since some entries are target-gated) to see whether it's live or dormant.
    restarts.
 9. **`glib` GTK vulnerability** (§3.10) — dormant until a Linux build ships,
    needs upstream Tauri/gtk-rs-core to bump first.
+10. **Calls have no STUN/TURN and no anonymity properties** (§3.11) — same
+    class of gap as #1/#2, now also applicable to call media, not just
+    messaging.
+11. **Envelope ciphertext-length side channel** (§3.11) — a new instance of
+    the #1 leak class, covering reactions/receipts/call-signaling too.
+12. **Disappearing-timer sweeper doesn't follow profile switches** (§3.11)
+    — cosmetic staleness, not a correctness/security break, but worth
+    fixing before multi-account sees real use.
 
 Two entries deliberately excluded from this list: the `hickory-proto`
 alerts (§3.10) are dormant with no path to becoming live short of

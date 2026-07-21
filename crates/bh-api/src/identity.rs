@@ -40,7 +40,7 @@ pub async fn get_identity(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<IdentityStatus>, StatusCode> {
     let stored = state
-        .db
+        .db()
         .get_own_identity()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -75,7 +75,7 @@ pub async fn create_identity(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CreateIdentityResponse>, StatusCode> {
     let already_exists = state
-        .db
+        .db()
         .get_own_identity()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .is_some();
@@ -92,7 +92,7 @@ pub async fn create_identity(
     public_bytes.extend_from_slice(identity.public_agreement_key().as_bytes());
 
     state
-        .db
+        .db()
         .set_own_identity(&OwnIdentity {
             identity_public_key: public_bytes.clone(),
             identity_private_key: identity.export_bytes().to_vec(),

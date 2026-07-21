@@ -7,6 +7,7 @@ members = [
     "crates/bh-storage",
     "crates/bh-files",
     "crates/bh-api",
+    "crates/bh-calls",
     "client/desktop/src-tauri",
 ]
 
@@ -29,3 +30,4 @@ bh-network = { path = "crates/bh-network" }
 bh-storage = { path = "crates/bh-storage" }
 bh-files = { path = "crates/bh-files" }
 bh-api = { path = "crates/bh-api" }
+bh-calls = { path = "crates/bh-calls" }

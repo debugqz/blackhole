@@ -17,9 +17,12 @@ jobs:
 
       # rusqlite's bundled-sqlcipher feature links against system OpenSSL;
       # pkg-config + libssl-dev is enough for openssl-sys to find it without
-      # setting OPENSSL_DIR by hand.
+      # setting OPENSSL_DIR by hand. bh-calls (SPEC.md §15) needs real
+      # system libopus/libvpx (its Opus/VP8 codec bindings aren't bundled —
+      # see crates/bh-calls/Cargo.toml) plus libclang for the bindgen pass
+      # env-libvpx-sys runs against whatever libvpx version is installed.
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

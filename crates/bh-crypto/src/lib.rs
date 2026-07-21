@@ -8,12 +8,15 @@
 
 pub mod auth;
 pub mod backup;
+pub mod call_keys;
 pub mod device_link;
+pub mod envelope;
 pub mod identity;
 pub mod invite;
 pub mod mls;
 pub mod pq_hybrid;
 pub mod ratchet;
+pub mod safety_number;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {

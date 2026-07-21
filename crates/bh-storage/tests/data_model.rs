@@ -230,6 +230,7 @@ fn messages_listing_deletion_and_self_destruct_purge() {
         received_at: None,
         expires_at: None,
         deleted_at: None,
+        reply_to_message_id: None,
     })
     .unwrap();
     db.insert_message(&Message {
@@ -241,6 +242,7 @@ fn messages_listing_deletion_and_self_destruct_purge() {
         received_at: None,
         expires_at: Some(20),
         deleted_at: None,
+        reply_to_message_id: None,
     })
     .unwrap();
 
@@ -277,6 +279,7 @@ fn get_messages_by_ids_fetches_only_what_was_asked_for() {
             received_at: None,
             expires_at: None,
             deleted_at: None,
+            reply_to_message_id: None,
         })
         .unwrap();
     }

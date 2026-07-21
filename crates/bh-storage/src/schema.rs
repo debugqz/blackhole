@@ -7,7 +7,7 @@ use rusqlite::Connection;
 
 use crate::StorageError;
 
-pub const CURRENT_VERSION: i64 = 1;
+pub const CURRENT_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS own_identity (
@@ -105,10 +105,53 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 "#;
 
+// v2 adds: quote-reply + reactions on messages, a per-conversation
+// disappearing-messages timer, delivery/read receipts, and a local record
+// of invite links this identity has issued (for expiry/single-use
+// enforcement — SPEC.md §3). `ALTER TABLE ... ADD COLUMN` is idempotent
+// enough for our purposes: SQLite errors if the column already exists, so
+// each statement is wrapped and any "duplicate column" error is swallowed
+// by `migrate` below rather than gated behind a second idempotency check.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT REFERENCES messages(message_id);
+
+ALTER TABLE conversations ADD COLUMN disappearing_timer_secs INTEGER;
+
+CREATE TABLE IF NOT EXISTS reactions (
+    message_id  TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    contact_id  TEXT REFERENCES contacts(contact_id) ON DELETE CASCADE,
+    emoji       TEXT NOT NULL,
+    reacted_at  INTEGER NOT NULL,
+    PRIMARY KEY (message_id, contact_id, emoji)
+);
+
+CREATE TABLE IF NOT EXISTS message_receipts (
+    message_id  TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    contact_id  TEXT NOT NULL REFERENCES contacts(contact_id) ON DELETE CASCADE,
+    status      TEXT NOT NULL CHECK (status IN ('delivered','read')),
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (message_id, contact_id)
+);
+
+CREATE TABLE IF NOT EXISTS issued_invites (
+    token        BLOB PRIMARY KEY,
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER,
+    max_uses     INTEGER,
+    use_count    INTEGER NOT NULL DEFAULT 0,
+    revoked      INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
 pub fn migrate(conn: &Connection) -> Result<(), StorageError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
         conn.execute_batch(SCHEMA_V1)?;
+    }
+    if version < 2 {
+        conn.execute_batch(SCHEMA_V2)?;
+    }
+    if version < CURRENT_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {CURRENT_VERSION}"))?;
     }
     Ok(())

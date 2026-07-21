@@ -1,11 +1,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 
-use crate::{contacts, conversations, identity, moderation, panic_wipe, ApiError, AppState};
+use crate::{
+    calls, contacts, conversations, export, identity, invites, moderation, panic_wipe, profiles,
+    reactions, receipts, safety_number, ApiError, AppState,
+};
 
 #[derive(Serialize)]
 struct Health {
@@ -36,7 +39,11 @@ impl ApiServer {
         }
     }
 
-    fn router(state: Arc<AppState>) -> Router {
+    /// Exposed at `pub` visibility (rather than crate-private) so
+    /// integration tests in `tests/` can drive the whole route table
+    /// in-process via `tower::ServiceExt::oneshot`, without binding a real
+    /// TCP listener.
+    pub fn router(state: Arc<AppState>) -> Router {
         Router::new()
             .route("/health", get(health))
             .route(
@@ -50,11 +57,24 @@ impl ApiServer {
             )
             .route("/contacts/:id/block", post(contacts::block_contact))
             .route("/contacts/:id/unblock", post(moderation::unblock_contact))
-            .route("/conversations", get(conversations::list_conversations))
+            .route(
+                "/conversations",
+                get(conversations::list_conversations)
+                    .post(conversations::create_direct_conversation),
+            )
             .route(
                 "/conversations/:id/messages",
-                get(conversations::list_messages),
+                get(conversations::list_messages).post(conversations::send_message),
             )
+            .route(
+                "/conversations/:id/disappearing-timer",
+                post(conversations::set_disappearing_timer),
+            )
+            .route(
+                "/conversations/:id/export",
+                post(export::export_conversation),
+            )
+            .route("/conversations/import", post(export::import_conversation))
             .route("/message-requests", get(moderation::list_message_requests))
             .route(
                 "/message-requests/:contact_id/accept",
@@ -65,6 +85,38 @@ impl ApiServer {
                 post(moderation::decline_message_request),
             )
             .route("/reports", post(moderation::create_report))
+            .route(
+                "/messages/:id/reactions",
+                get(reactions::list_reactions).post(reactions::add_reaction),
+            )
+            .route(
+                "/messages/:id/reactions/:emoji",
+                delete(reactions::remove_reaction),
+            )
+            .route(
+                "/messages/:id/receipts",
+                get(receipts::list_receipts).post(receipts::record_receipt),
+            )
+            .route(
+                "/contacts/:id/safety-number",
+                get(safety_number::get_safety_number),
+            )
+            .route("/contacts/:id/verify", post(safety_number::set_verified))
+            .route("/invites", post(invites::create_invite))
+            .route("/invites/decode", post(invites::decode_invite))
+            .route("/invites/:token/consume", post(invites::consume_invite))
+            .route("/invites/:token/revoke", post(invites::revoke_invite))
+            .route(
+                "/profiles",
+                get(profiles::list_profiles).post(profiles::create_profile),
+            )
+            .route("/profiles/active", get(profiles::active_profile))
+            .route("/profiles/:id/activate", post(profiles::activate_profile))
+            .route("/profiles/:id", delete(profiles::delete_profile))
+            .route("/calls", post(calls::start_call))
+            .route("/calls/incoming", post(calls::accept_call))
+            .route("/calls/:call_id/complete", post(calls::complete_call))
+            .route("/calls/:call_id/hangup", post(calls::hangup_call))
             .with_state(state)
     }
 

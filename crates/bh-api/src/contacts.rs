@@ -20,7 +20,7 @@ pub async fn list_contacts(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Contact>>, StatusCode> {
     state
-        .db
+        .db()
         .list_contacts()
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -42,7 +42,7 @@ pub async fn add_contact(
     let identity_public_key =
         hex::decode(&req.identity_public_key).map_err(|_| StatusCode::BAD_REQUEST)?;
     state
-        .db
+        .db()
         .upsert_contact(&Contact {
             contact_id: req.contact_id,
             identity_public_key,
@@ -59,7 +59,7 @@ pub async fn block_contact(
     State(state): State<Arc<AppState>>,
     Path(contact_id): Path<String>,
 ) -> StatusCode {
-    match state.db.set_contact_blocked(&contact_id, true) {
+    match state.db().set_contact_blocked(&contact_id, true) {
         Ok(()) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }

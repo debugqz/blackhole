@@ -121,6 +121,11 @@ pub struct Conversation {
     pub contact_id: Option<String>,
     pub group_id: Option<String>,
     pub created_at: i64,
+    /// Disappearing-messages timer for this conversation, in seconds —
+    /// `None` means off. Applied to new outgoing messages at send time
+    /// (`sent_at + timer` becomes `expires_at`); see `expiry.rs` for the
+    /// sweeper that actually purges them.
+    pub disappearing_timer_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +139,67 @@ pub struct Message {
     pub received_at: Option<i64>,
     pub expires_at: Option<i64>,
     pub deleted_at: Option<i64>,
+    /// Quote-reply target, if this message is a reply to another one.
+    pub reply_to_message_id: Option<String>,
+}
+
+/// One reaction on a message. `contact_id: None` means the local user
+/// reacted (mirrors `Message::sender_contact_id`'s convention).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reaction {
+    pub message_id: String,
+    pub contact_id: Option<String>,
+    pub emoji: String,
+    pub reacted_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReceiptStatus {
+    Delivered,
+    Read,
+}
+
+impl ReceiptStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReceiptStatus::Delivered => "delivered",
+            ReceiptStatus::Read => "read",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "read" => ReceiptStatus::Read,
+            _ => ReceiptStatus::Delivered,
+        }
+    }
+}
+
+/// Per-recipient delivery/read status for a message we sent. Populated
+/// from the encrypted receipt envelopes described in `bh-crypto::envelope`
+/// — nothing here is ever visible to anything but the two conversation
+/// participants (SPEC.md §2.3: no operator-visible metadata).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageReceipt {
+    pub message_id: String,
+    pub contact_id: String,
+    pub status: ReceiptStatus,
+    pub updated_at: i64,
+}
+
+/// A locally-issued invite link/QR this identity created, tracked so
+/// expiry and single/limited-use redemption can be enforced without a
+/// server (SPEC.md §3): the *issuer* is the only party who can meaningfully
+/// enforce "this link only works once," since there's no central authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuedInvite {
+    pub token: Vec<u8>,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub max_uses: Option<i64>,
+    pub use_count: i64,
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

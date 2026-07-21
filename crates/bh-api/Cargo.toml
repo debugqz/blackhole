@@ -14,4 +14,15 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bh-storage = { workspace = true }
 bh-crypto = { workspace = true }
+bh-calls = { workspace = true }
 hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+getrandom = "0.4"
+ed25519-dalek = "3"
+x25519-dalek = { version = "3", features = ["static_secrets", "getrandom"] }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+keyring = "3"

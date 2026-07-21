@@ -1,0 +1,45 @@
+[package]
+name = "bh-calls"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread"] }
+tracing = { workspace = true }
+serde = { workspace = true }
+bytes = "1"
+
+bh-crypto = { workspace = true }
+
+# WebRTC transport: ICE/DTLS/SRTP and RTP (de)packetization. This gives us
+# hop-security (DTLS-SRTP) "for free" from an audited implementation; our
+# own SFrame-style layer (bh_crypto::call_keys) rides on top of it for
+# actual end-to-end confidentiality, encrypting/decrypting encoded audio
+# and video *samples* before they're handed to/read from webrtc-rs's RTP
+# (de)packetizers. See `docs/SPEC.md` calls section.
+webrtc = "0.13"
+
+# Opus audio codec (SPEC.md calls section) via bundled libopus. Requires
+# `opus` + `pkg-config` at build time (or the bundled build to succeed,
+# which itself needs autotools) — see `docs/SPEC.md` build prerequisites.
+audiopus = "0.2"
+
+# Cross-platform audio capture/playback.
+cpal = "0.15"
+
+# Cross-platform camera capture.
+nokhwa = { version = "0.10", features = ["input-native"] }
+
+# VP8 video encode/decode via bundled libvpx. Requires `libvpx` +
+# `pkg-config` at build time, plus a `generate` build (bindgen against
+# whatever libvpx version is actually installed, since env-libvpx-sys only
+# ships pregenerated bindings for specific pinned versions) — see
+# `docs/SPEC.md` build prerequisites.
+vpx-encode = "0.4"
+env-libvpx-sys = { version = "5", features = ["generate"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -63,18 +63,38 @@ and "what could go wrong here" questions are already answered there.
   design — the daemon wires it to disk and the network separately.
 - `crates/bh-api` — localhost RPC surface between daemon and UI clients.
   Real endpoints for identity bootstrap, panic wipe, contacts, moderation
-  (block/message-requests/reports), conversations/messages — all backed by
-  `bh-storage`, verified end-to-end via live HTTP smoke tests during
-  development.
+  (block/message-requests/reports), conversations/messages, reactions,
+  quote-reply, disappearing-message timers, delivery/read receipts, safety
+  numbers, expiring/limited-use invites, encrypted conversation
+  export/import, multi-account profile management, and call
+  signaling/setup — all backed by `bh-storage`/`bh-crypto`/`bh-calls`,
+  verified end-to-end via live HTTP smoke tests during development plus an
+  in-process `tower::ServiceExt` integration test suite
+  (`crates/bh-api/tests/api_smoke.rs`).
+- `crates/bh-calls` — voice/video calls: real WebRTC transport (ICE/DTLS/
+  SRTP via `webrtc-rs`) plus an independent SFrame-style end-to-end media
+  encryption layer keyed from `bh-crypto::call_keys` (so even a coerced
+  relay can't see call content). Opus audio (capture/encode/decode/
+  playback) is fully real and tested; camera capture and VP8 encoding are
+  real, but VP8 *decoding* is deliberately left to the client (no audited
+  safe-Rust VP8 decoder exists — see SPEC.md §15/THREAT_MODEL.md §3.11).
+  No STUN/TURN yet, same current limitation as `bh-network`. Needs `opus`,
+  `libvpx`, and `pkg-config` installed at build time (see
+  `crates/bh-calls/Cargo.toml`).
 - `client/desktop` — Tauri desktop client. Minimal dev shell (not product
   UI) with daemon health check, panic wipe button, and window-blur content
   mitigation wired up.
 - `docs/SPEC.md` — full spec, source of truth for architecture decisions.
+  §15 covers everything added post-v0.1 (reactions, disappearing timers,
+  receipts, safety numbers, expiring invites, encrypted export/import,
+  multi-account, calls).
 - `docs/THREAT_MODEL.md` — per-subsystem STRIDE analysis grounded in the
   actual implementation, plus a ranked list of known open risks.
 
-Workspace-wide: 93 tests across `bh-crypto`/`bh-network`/`bh-storage`/
-`bh-files`, `cargo fmt`/`clippy -D warnings` clean, CI in
-`.github/workflows/ci.yml`. Nothing here has been through independent
+Workspace-wide: 141 tests across `bh-crypto`/`bh-network`/`bh-storage`/
+`bh-files`/`bh-api`/`bh-calls` (including a real local two-peer WebRTC
+connection test in `bh-calls`), `cargo fmt`/`clippy -D warnings` clean, CI
+in `.github/workflows/ci.yml`. Nothing here has been through independent
 security review — see THREAT_MODEL.md before treating any of it as
-production-ready, especially the onion routing module.
+production-ready, especially the onion routing module and the new calls
+media path.

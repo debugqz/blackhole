@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 use crate::AppState;
 
 pub async fn panic_wipe(State(state): State<Arc<AppState>>) -> StatusCode {
-    match state.keystore.panic_wipe() {
+    match state.keystore().panic_wipe() {
         Ok(()) => {
             tracing::warn!("panic wipe executed — daemon exiting");
             tokio::spawn(async {

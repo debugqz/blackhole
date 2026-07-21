@@ -25,7 +25,7 @@ pub async fn unblock_contact(
     State(state): State<Arc<AppState>>,
     Path(contact_id): Path<String>,
 ) -> StatusCode {
-    match state.db.set_contact_blocked(&contact_id, false) {
+    match state.db().set_contact_blocked(&contact_id, false) {
         Ok(()) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -41,7 +41,7 @@ pub async fn list_message_requests(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<MessageRequest>>, StatusCode> {
     state
-        .db
+        .db()
         .list_pending_message_requests()
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -52,7 +52,7 @@ pub async fn accept_message_request(
     Path(contact_id): Path<String>,
 ) -> StatusCode {
     match state
-        .db
+        .db()
         .set_message_request_status(&contact_id, MessageRequestStatus::Accepted)
     {
         Ok(()) => StatusCode::OK,
@@ -65,7 +65,7 @@ pub async fn decline_message_request(
     Path(contact_id): Path<String>,
 ) -> StatusCode {
     match state
-        .db
+        .db()
         .set_message_request_status(&contact_id, MessageRequestStatus::Declined)
     {
         Ok(()) => StatusCode::OK,
@@ -98,7 +98,7 @@ pub async fn create_report(
     Json(req): Json<CreateReportRequest>,
 ) -> Result<Json<ReportBundle>, StatusCode> {
     let messages = state
-        .db
+        .db()
         .get_messages_by_ids(&req.message_ids)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

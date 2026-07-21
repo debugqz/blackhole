@@ -10,11 +10,15 @@ pub mod devices;
 pub mod expiry;
 pub mod files;
 pub mod groups;
+pub mod invites;
 pub mod keystore;
 pub mod message_requests;
 pub mod messages;
 pub mod models;
 pub mod own_identity;
+pub mod profiles;
+pub mod reactions;
+pub mod receipts;
 pub mod sessions;
 pub mod settings;
 

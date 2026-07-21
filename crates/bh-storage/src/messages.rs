@@ -12,18 +12,19 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         received_at: row.get(5)?,
         expires_at: row.get(6)?,
         deleted_at: row.get(7)?,
+        reply_to_message_id: row.get(8)?,
     })
 }
 
-const SELECT_COLUMNS: &str =
-    "message_id, conversation_id, sender_contact_id, body, sent_at, received_at, expires_at, deleted_at";
+const SELECT_COLUMNS: &str = "message_id, conversation_id, sender_contact_id, body, sent_at, \
+    received_at, expires_at, deleted_at, reply_to_message_id";
 
 impl Database {
     pub fn insert_message(&self, message: &Message) -> Result<(), StorageError> {
         self.conn()?.execute(
             "INSERT INTO messages
-                (message_id, conversation_id, sender_contact_id, body, sent_at, received_at, expires_at, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (message_id, conversation_id, sender_contact_id, body, sent_at, received_at, expires_at, deleted_at, reply_to_message_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 message.message_id,
                 message.conversation_id,
@@ -33,9 +34,21 @@ impl Database {
                 message.received_at,
                 message.expires_at,
                 message.deleted_at,
+                message.reply_to_message_id,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get_message(&self, message_id: &str) -> Result<Option<Message>, StorageError> {
+        let conn = self.conn()?;
+        let sql = format!("SELECT {SELECT_COLUMNS} FROM messages WHERE message_id = ?1");
+        conn.query_row(&sql, params![message_id], row_to_message)
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
     }
 
     pub fn list_messages(
