@@ -251,6 +251,73 @@ pub fn verify_consistency(
     }
 }
 
+/// A tree head (size + root), signed by the identity whose own log this
+/// is — closes the gap this module's own doc comment names: "no deployed
+/// public log service here." Rather than a separate, third-party-operated
+/// log server (real infrastructure this project has deliberately deferred
+/// — see the module doc), each identity signs and gossips *its own* tree
+/// head over the DHT (`bh_network::tree_head`), so a contact can fetch it
+/// and verify (via [`verify_inclusion`]) that a claimed identity key is
+/// actually the one that identity itself published — the same
+/// "server can't lie without it being detectable" property Certificate
+/// Transparency gives, just self-hosted per identity rather than run by a
+/// shared third party.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedTreeHead {
+    pub size: u64,
+    pub root: Hash,
+    pub timestamp: i64,
+    pub signer_public_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+fn tree_head_signed_bytes(size: u64, root: &Hash, timestamp: i64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + 32 + 8);
+    buf.extend_from_slice(&size.to_be_bytes());
+    buf.extend_from_slice(root);
+    buf.extend_from_slice(&timestamp.to_be_bytes());
+    buf
+}
+
+/// Signs a tree head with `identity`'s own long-term signing key — the
+/// same key that already signs prekeys and safety-number attestations,
+/// extended to one more use rather than minting a new key type.
+pub fn sign_tree_head(
+    identity: &crate::identity::IdentityKeyPair,
+    size: u64,
+    root: Hash,
+    timestamp: i64,
+) -> SignedTreeHead {
+    let signature = identity.sign(&tree_head_signed_bytes(size, &root, timestamp));
+    SignedTreeHead {
+        size,
+        root,
+        timestamp,
+        signer_public_key: identity.public_signing_key().to_bytes(),
+        signature: signature.to_bytes(),
+    }
+}
+
+/// Verifies `sth`'s signature against its own embedded `signer_public_key`
+/// — this only proves internal self-consistency ("whoever holds this
+/// signing key really did produce this tree head"), not that
+/// `signer_public_key` belongs to whoever the caller thinks it does. Same
+/// caveat as everywhere else identity trust is handled in this codebase
+/// (SPEC.md §3): the caller must have separately verified the signer's
+/// identity key (safety number comparison, an existing contact record) to
+/// get any real assurance from this.
+pub fn verify_tree_head(sth: &SignedTreeHead) -> bool {
+    let Ok(signer) = ed25519_dalek::VerifyingKey::from_bytes(&sth.signer_public_key) else {
+        return false;
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(&sth.signature);
+    crate::identity::IdentityKeyPair::verify(
+        &signer,
+        &tree_head_signed_bytes(sth.size, &sth.root, sth.timestamp),
+        &signature,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +434,47 @@ mod tests {
 
         let other_root = tree_hash(&leaves(6));
         assert!(!verify_consistency(5, &root, 5, &other_root, &[]));
+    }
+
+    #[test]
+    fn a_freshly_signed_tree_head_verifies() {
+        let identity = crate::identity::IdentityKeyPair::generate().unwrap();
+        let root = tree_hash(&leaves(3));
+        let sth = sign_tree_head(&identity, 3, root, 1_700_000_000);
+        assert!(verify_tree_head(&sth));
+    }
+
+    #[test]
+    fn a_tampered_field_breaks_verification() {
+        let identity = crate::identity::IdentityKeyPair::generate().unwrap();
+        let root = tree_hash(&leaves(3));
+        let sth = sign_tree_head(&identity, 3, root, 1_700_000_000);
+
+        let mut tampered_size = sth.clone();
+        tampered_size.size = 4;
+        assert!(!verify_tree_head(&tampered_size));
+
+        let mut tampered_root = sth.clone();
+        tampered_root.root = tree_hash(&leaves(4));
+        assert!(!verify_tree_head(&tampered_root));
+
+        let mut tampered_timestamp = sth;
+        tampered_timestamp.timestamp += 1;
+        assert!(!verify_tree_head(&tampered_timestamp));
+    }
+
+    #[test]
+    fn a_signature_from_a_different_signer_does_not_verify_against_this_one() {
+        let identity = crate::identity::IdentityKeyPair::generate().unwrap();
+        let impostor = crate::identity::IdentityKeyPair::generate().unwrap();
+        let root = tree_hash(&leaves(3));
+
+        let mut sth = sign_tree_head(&identity, 3, root, 1_700_000_000);
+        // Swap in a signature produced by a different key but keep the
+        // original (now mismatched) signer_public_key — simulates someone
+        // trying to graft another identity's signature onto this claim.
+        let impostor_sth = sign_tree_head(&impostor, 3, root, 1_700_000_000);
+        sth.signature = impostor_sth.signature;
+        assert!(!verify_tree_head(&sth));
     }
 }

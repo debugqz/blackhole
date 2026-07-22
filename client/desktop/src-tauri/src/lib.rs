@@ -11,9 +11,36 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+mod call_stream_bridge;
+mod daemon_lifecycle;
 mod link_preview;
+mod prf_unlock;
 
 const DEFAULT_DAEMON_PORT: u16 = 47_853;
+
+/// Matches `daemon/src/main.rs`'s own `data_dir()` exactly — both sides
+/// need to agree on where the daemon's per-process bearer token
+/// (`api_token`, `server.rs`'s `require_bearer_token`) gets written and
+/// read from.
+pub(crate) fn data_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("BLACKHOLE_DATA_DIR") {
+        return dir.into();
+    }
+    dirs::data_dir()
+        .expect("no platform data directory available")
+        .join("blackhole")
+}
+
+/// Reads the daemon's current bearer token from disk. `None` if the file
+/// doesn't exist yet (daemon hasn't started, or hasn't gotten far enough
+/// to write it) — callers should surface the existing "daemon
+/// unreachable"-style error in that case, same as any other
+/// daemon-not-up scenario.
+pub(crate) fn read_api_token() -> Option<String> {
+    std::fs::read_to_string(data_dir().join("api_token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
 
 #[derive(Serialize)]
 pub struct DaemonResponse {
@@ -56,9 +83,12 @@ fn daemon_request(
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
 
+    let token = read_api_token().ok_or_else(|| {
+        "daemon unreachable: no API token on disk yet (has the daemon started?)".to_string()
+    })?;
     let payload = body.unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         payload.len(),
         payload
     );
@@ -105,7 +135,19 @@ fn fetch_link_preview(url: String) -> Result<link_preview::LinkPreviewResponse, 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![daemon_call, fetch_link_preview])
+        .manage(daemon_lifecycle::DaemonProcess::default())
+        .manage(call_stream_bridge::CallStreamBridges::default())
+        .invoke_handler(tauri::generate_handler![
+            daemon_call,
+            fetch_link_preview,
+            daemon_lifecycle::ensure_daemon_running,
+            daemon_lifecycle::stop_daemon,
+            prf_unlock::get_prf_unlock_config,
+            prf_unlock::save_prf_unlock_config,
+            prf_unlock::clear_prf_unlock_config,
+            call_stream_bridge::subscribe_call_stream,
+            call_stream_bridge::unsubscribe_call_stream,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

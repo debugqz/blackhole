@@ -1,14 +1,18 @@
 //! Keeps a [`Node`] (and the [`Dht`]/[`Mailbox`] built on top of it) alive
-//! across the failure this codebase can't fix directly: the `yamux`
-//! remote-panic CVE documented in `docs/THREAT_MODEL.md` §3.10 (ranked
-//! #2). A crafted inbound frame can panic `libp2p-yamux`'s internal state
-//! machine; the fix is blocked on an upstream `rust-libp2p` release, not
-//! anything changeable in this repo. `Node::spawn`'s event loop already
-//! runs as its own `tokio::spawn`ed task, so that panic doesn't crash the
-//! daemon process — but without this module, it silently and permanently
-//! kills *that node's* networking: every `Node`/`Dht`/`Mailbox` clone
-//! sharing its channel starts returning `NetworkError::NodeShutDown`
-//! forever, until someone notices and restarts the whole daemon.
+//! across any panic in the swarm event loop. This module was originally
+//! written to contain a specific yamux remote-panic CVE
+//! (`docs/THREAT_MODEL.md` §3.10) — verification since then found that
+//! CVE isn't actually reachable through the yamux core this node runs
+//! (`transport.rs`'s `yamux::Config::default()` resolves to the fixed
+//! core, not the vulnerable one), so this module's value today is general
+//! defense-in-depth against *any* future event-loop panic, not a
+//! mitigation for that one bug specifically. `Node::spawn`'s event loop
+//! already runs as its own `tokio::spawn`ed task, so a panic there
+//! doesn't crash the daemon process — but without this module, it would
+//! silently and permanently kill *that node's* networking: every
+//! `Node`/`Dht`/`Mailbox` clone sharing its channel would start returning
+//! `NetworkError::NodeShutDown` forever, until someone noticed and
+//! restarted the whole daemon.
 //!
 //! [`SupervisedNetwork`] instead periodically checks [`Node::is_alive`]
 //! and, if the event loop has died, spawns a fresh `Node` (new identity —
@@ -106,6 +110,18 @@ impl SupervisedNetwork {
         node.listen_addrs().await
     }
 
+    /// Dials another peer so this node's DHT/mailbox actually reaches
+    /// them — two `SupervisedNetwork`s spawned independently (as two
+    /// separate daemon processes are) start out with empty Kademlia
+    /// routing tables and never see each other's records until at least
+    /// one side dials the other. Real deployments need a bootstrap-node
+    /// list for this; tests dial directly using a peer's own
+    /// `listen_addrs()`/`peer_id()`.
+    pub async fn dial(&self, addr: libp2p::Multiaddr) -> Result<(), NetworkError> {
+        let node = self.stack.read().expect(LOCK_POISON_MSG).node.clone();
+        node.dial(addr).await
+    }
+
     /// Fetch fresh before each use — see the module doc for why a
     /// long-held clone can go stale across a respawn.
     pub fn dht(&self) -> Dht {
@@ -165,6 +181,40 @@ mod tests {
             .expect("lookup should not hang")
             .unwrap();
         assert_eq!(ok, None);
+    }
+
+    #[tokio::test]
+    async fn two_independently_spawned_networks_can_dial_and_see_each_others_records() {
+        let a = SupervisedNetwork::spawn("/ip4/127.0.0.1/tcp/0", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let b = SupervisedNetwork::spawn("/ip4/127.0.0.1/tcp/0", Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        let a_addr = a
+            .listen_addrs()
+            .await
+            .into_iter()
+            .next()
+            .unwrap()
+            .with_p2p(a.peer_id())
+            .unwrap();
+        b.dial(a_addr).await.unwrap();
+
+        for attempt in 0..20 {
+            match a
+                .dht()
+                .publish(b"dial-test-key", b"dial-test-value".to_vec())
+                .await
+            {
+                Ok(()) => break,
+                Err(_) if attempt < 19 => tokio::time::sleep(Duration::from_millis(200)).await,
+                Err(e) => panic!("publish failed after retries: {e}"),
+            }
+        }
+        let seen = b.dht().lookup(b"dial-test-key").await.unwrap();
+        assert_eq!(seen, Some(b"dial-test-value".to_vec()));
     }
 
     #[tokio::test]

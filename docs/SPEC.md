@@ -338,6 +338,114 @@ correspondiente salvo donde se indica lo contrario.
 
 ---
 
+## 17. Conectar la red real y cerrar riesgos pendientes (post-§16)
+
+Tercera tanda: a diferencia de §15/§16 (funciones nuevas), esta ronda
+conecta capacidad que ya existía pero corría en local/aislado, y cierra
+pragmáticamente varios de los riesgos ya documentados en
+`docs/THREAT_MODEL.md`. Mismo criterio de siempre: nada toca los
+no-negociables (§2.2, CLAUDE.md).
+
+- **Mensajería `Direct` real sobre `bh-network`**: hasta ahora,
+   `bh-network` (DHT, buzones, sealed sender, onion routing) y el envío de
+   mensajes vivían en mundos separados — el daemon spawneaba la red
+   (`GET /network/status`, solo lectura) pero `POST /conversations/:id/
+   messages` nunca la usaba. Ahora sí: para conversaciones `Direct`,
+   `bh-api::message_crypto::send_encrypted_over_network` hace un handshake
+   X3DH + Double Ratchet real (reutilizando `bh_crypto::ratchet` tal cual,
+   sin tocar el protocolo), envuelve el ciphertext con sealed sender, y lo
+   empuja al buzón Kademlia del destinatario; un loop en segundo plano
+   (`message_receive::spawn_receive_loop`) hace polling del buzón propio,
+   descifra, y entrega. Probado con un test de integración genuino de dos
+   daemons independientes, dos identidades reales, sin estado de proceso
+   compartido — no una sesión "sombra" en el mismo proceso como device
+   sync o grupos. **Las conversaciones `Group` siguen sin conectar** — el
+   fan-out de ciphertext MLS real vía `Mailbox::fan_out` queda
+   explícitamente fuera de esta ronda.
+- **Hardening pragmático de tres riesgos ya conocidos** (ver
+   `docs/THREAT_MODEL.md` para el análisis STRIDE completo de cada uno):
+   el bucketing de tamaño de paquete onion (§3.4) se refinó a una
+   progresión más fina y un fallback de cuarto de bucket en vez de un
+   bucket entero; el merge de manifiesto de buzones (§3.6) ahora espera un
+   backoff aleatorio entre reintentos en vez de reintentar inmediatamente,
+   reduciendo colisiones bajo contención; y el desbloqueo local por
+   passkey/TOTP (§3.11), que hasta ahora solo gateaba la UI *después* de
+   que el daemon ya había abierto la base SQLCipher, ahora tiene una
+   alternativa real: un passkey enrolado específicamente para esto deriva
+   un secreto de 32 bytes vía la extensión PRF de WebAuthn (hardware —
+   Secure Enclave/TPM/llave de seguridad — no algo que tenga que vivir
+   legible en el keystore del SO), y el shell Tauri no lanza el proceso
+   del daemon hasta tener ese secreto, pasándolo como `BLACKHOLE_DB_PIN`.
+   TOTP se investigó y se descartó deliberadamente para este camino
+   específico — un secreto TOTP tiene que ser legible por el cliente para
+   verificar un código sin la base abierta, lo que lo vuelve tan expuesto
+   como la propia clave que protegería.
+- **Admisión al routing table del DHT acotada por subred**
+   (`bh_network::routing_admission`): antes, cualquier peer que
+   respondiera a Identify entraba sin límite a la tabla Kademlia. Ahora se
+   admite como máximo un puñado de peers distintos por prefijo de IP
+   (/24 en IPv4, /48 en IPv6), mismo principio de diversidad de subred que
+   ya usaba la selección de saltos del onion routing (§5.2). No es
+   S/Kademlia completo — un atacante con diversidad real de IP no se ve
+   frenado por esto — pero cierra la versión más burda del problema
+   (inundar la tabla con Sybils desde un solo bloque de direcciones).
+- **Streaming de llamadas hacia el cliente + UI completa** (`bh-calls`
+   ya tenía transporte/cifrado reales desde §15, pero nada los conectaba a
+   una pantalla): nuevo canal `GET /calls/:call_id/ws`
+   (`bh-api::call_stream`) — eventos de estado como JSON y frames de
+   video/screen-share ya descifrados como binario. El audio nunca viaja
+   por este canal: se decodifica y reproduce nativamente dentro del propio
+   proceso daemon vía `cpal` (`bh-api::call_audio`), así que no hay nada
+   que la UI necesite renderizar para eso. El webview no puede abrir ese
+   WebSocket directamente (su handshake siempre lleva un header `Origin`,
+   que el middleware de seguridad del daemon rechaza), así que el propio
+   proceso Tauri hace de puente (`call_stream_bridge.rs`, cliente
+   `tokio-tungstenite`) y reenvía eventos/frames al webview vía el sistema
+   de eventos de Tauri. El cliente decodifica VP8 con la API `WebCodecs`
+   del navegador (`Vp8CanvasRenderer` en `calls.ts`) — el daemon nunca
+   decodifica video, mismo principio que §15 ya estableció para VP8.
+   **Alcance**: como la entrega de señalización de llamada entre dos
+   dispositivos reales todavía no está conectada a la red P2P, cada
+   llamada que arranca esta UI hace de llamante y llamado contra el mismo
+   daemon — la conexión WebRTC, la captura/codificación de medios, y el
+   cifrado SFrame de extremo a extremo son genuinos, solo el salto de
+   señalización es local en vez de ir por la red, y la UI lo dice
+   explícitamente (mismo patrón ya usado para la vinculación de
+   dispositivo en §4).
+- **Token de portador entre el cliente Tauri y el daemon**
+   (`bh-api::server::require_bearer_token`): cierra el hueco que
+   `docs/THREAT_MODEL.md` §3.9 dejaba abierto — enlazar solo a loopback
+   defiende contra la red, pero no contra otro proceso local en la misma
+   máquina. Cada request ahora debe llevar `Authorization: Bearer
+   <token>`, un token aleatorio generado por proceso del daemon y escrito
+   a un archivo con permisos `0600` que el cliente Tauri lee de vuelta —
+   independiente del middleware que ya rechazaba requests con header
+   `Origin` (defiende contra una pestaña de navegador maliciosa, no contra
+   otro proceso).
+- **Key Transparency gossip desplegado**: `bh_crypto::key_transparency`
+   ahora tiene `SignedTreeHead`/`sign_tree_head`/`verify_tree_head` — una
+   identidad firma su propio tree head con la misma clave de firma a largo
+   plazo que ya firma prekeys/safety numbers, y `bh_network::tree_head` lo
+   publica sobre la DHT bajo una clave bien conocida derivada de la clave
+   pública del firmante. El daemon repubblica cada 10 minutos (los
+   registros Kademlia expiran); `create_identity` también dispara un
+   publish inmediato en el bootstrap. `get_safety_number` ahora devuelve
+   `key_transparency_corroborated`: fetch-and-verify best-effort del tree
+   head publicado del contacto, evidencia corroborante **adicional** (nunca
+   reemplazo) de la comparación manual out-of-band — `None` (sin red, o el
+   contacto nunca publicó) se trata como "no se pudo verificar", no como
+   bandera roja; `Some(false)` (un tree head válidamente firmado que no
+   coincide con la clave en archivo) es una señal genuina que vale la pena
+   mostrar. **Brecha residual**: esto solo detecta que un contacto
+   silenciosamente recibió una clave *diferente* sobre la red — si caller
+   y contacto terminan hablando en vistas de red disjuntas/particionadas
+   (un atacante controlando *ambos* lados de la lookup del DHT), el gossip
+   solo no puede detectarlo; un diseño tipo Certificate Transparency real
+   necesitaría monitores independientes con chequeos cruzados,
+   explícitamente fuera de scope para un log auto-publicado por identidad.
+
+---
+
 ## Apéndice — Stack tecnológico de referencia
 
 | Capa | Tecnología propuesta |

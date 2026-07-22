@@ -112,6 +112,18 @@ pub async fn create_identity(
         .ensure_self_conversation(now())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Best-effort, fire-and-forget: publishes this identity's tree head
+    // (docs/THREAT_MODEL.md §3.1) if a network is attached, without
+    // making identity creation itself wait on a DHT round trip or fail
+    // when there's no live network (every test in this crate, and any
+    // real daemon startup that hasn't finished connecting yet).
+    if let Some(network) = state.network.clone() {
+        let state_for_publish = state.clone();
+        tokio::spawn(async move {
+            crate::tree_head::publish_own_tree_head(&state_for_publish, &network).await;
+        });
+    }
+
     let (signing_pub, agreement_pub) =
         split_public(&public_bytes).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(CreateIdentityResponse {

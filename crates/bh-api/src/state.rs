@@ -103,14 +103,26 @@ pub struct AppState {
     /// platform instead).
     pub passkey: Arc<PasskeyManager>,
     /// `bh-network`'s Node/DHT/Mailbox stack (SPEC.md §5), self-healing
-    /// across the yamux CVE panic (`docs/THREAT_MODEL.md` §3.10) — see
-    /// `bh_network::supervised`. `None` unless the daemon explicitly
+    /// across any swarm event loop panic (`docs/THREAT_MODEL.md` §3.10) —
+    /// see `bh_network::supervised`. `None` unless the daemon explicitly
     /// attaches one via [`AppState::with_network`]; every integration
     /// test in this crate constructs `AppState` without a real network
     /// stack (no need to bind a TCP listener per test) and leaves this
     /// `None`. `network.rs`'s `GET /network/status` reports `enabled:
     /// false` rather than erroring in that case.
     pub network: Option<SupervisedNetwork>,
+    /// Shared secret every request to this loopback API must present as
+    /// `Authorization: Bearer <api_token>` (`server.rs`'s
+    /// `require_bearer_token` middleware). Closes the gap the module doc
+    /// on `reject_browser_origin` already names: binding to loopback only
+    /// defends against a browser tab, not another local process/malware
+    /// on the same machine, which could otherwise reach every route here
+    /// with nothing but a TCP connection. Generated fresh per process
+    /// unless `BLACKHOLE_API_TOKEN` is set (tests fix a known value this
+    /// way — see `crates/bh-api/tests/api_smoke.rs`'s `use_mock_keychain`);
+    /// `daemon/src/main.rs` reads this back after construction and
+    /// persists it to a `0600`-permissioned file the Tauri client reads.
+    pub api_token: String,
 }
 
 /// How often the expiry sweeper checks for self-destructing messages past
@@ -144,6 +156,11 @@ impl AppState {
         let rp_origin_url = Url::parse(&rp_origin).expect("invalid BLACKHOLE_RP_ORIGIN");
         let passkey = PasskeyManager::new(&rp_id, &rp_origin_url)
             .expect("invalid BLACKHOLE_RP_ID/BLACKHOLE_RP_ORIGIN for passkey relying party");
+        let api_token = std::env::var("BLACKHOLE_API_TOKEN").unwrap_or_else(|_| {
+            let mut bytes = [0u8; 32];
+            getrandom::fill(&mut bytes).expect("system RNG unavailable");
+            hex::encode(bytes)
+        });
 
         let state = Self {
             manager,
@@ -155,6 +172,7 @@ impl AppState {
             local_auth: Arc::new(LocalAuthRegistry::default()),
             passkey: Arc::new(passkey),
             network: None,
+            api_token,
         };
         state.restart_expiry_sweeper();
         state

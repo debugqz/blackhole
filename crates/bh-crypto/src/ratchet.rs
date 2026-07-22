@@ -108,6 +108,81 @@ impl PreKeyBundle {
             .verify(&self.pq_prekey.to_bytes(), &self.pq_prekey_signature)
             .map_err(|_| CryptoError::InvalidSignature)
     }
+
+    /// Wire bytes for publishing this (public-only) bundle somewhere a
+    /// peer can fetch it (SPEC.md §5.3: a mailbox/DHT record keyed by this
+    /// identity's own recipient-key-hash). Signature verification against
+    /// `identity_signing_key` still happens in [`x3dh_initiate`] on the
+    /// fetching side — this is just the encoding, not a trust boundary.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let pq_prekey_bytes = self.pq_prekey.to_bytes();
+        let mut out =
+            Vec::with_capacity(32 + 32 + 4 + 32 + 64 + 4 + pq_prekey_bytes.len() + 64 + 1 + 4 + 32);
+        out.extend_from_slice(self.identity_agreement_key.as_bytes());
+        out.extend_from_slice(self.identity_signing_key.as_bytes());
+        out.extend_from_slice(&self.signed_prekey_id.to_be_bytes());
+        out.extend_from_slice(self.signed_prekey.as_bytes());
+        out.extend_from_slice(&self.signed_prekey_signature.to_bytes());
+        out.extend_from_slice(&(pq_prekey_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&pq_prekey_bytes);
+        out.extend_from_slice(&self.pq_prekey_signature.to_bytes());
+        match (self.one_time_prekey_id, &self.one_time_prekey) {
+            (Some(id), Some(public)) => {
+                out.push(1);
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(public.as_bytes());
+            }
+            _ => out.push(0),
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let mut offset = 0;
+        let identity_agreement_key = X25519PublicKey::from(read_array32(bytes, &mut offset)?);
+        let identity_signing_key = VerifyingKey::from_bytes(&read_array32(bytes, &mut offset)?)
+            .map_err(|_| CryptoError::Malformed("prekey bundle: bad identity signing key"))?;
+        let signed_prekey_id = read_u32(bytes, &mut offset)?;
+        let signed_prekey = X25519PublicKey::from(read_array32(bytes, &mut offset)?);
+        let signed_prekey_signature = Signature::from_bytes(&{
+            let arr: [u8; 64] = read_exact(bytes, &mut offset, 64)?
+                .try_into()
+                .expect("checked length");
+            arr
+        });
+        let pq_prekey_len = read_u32(bytes, &mut offset)? as usize;
+        let pq_prekey =
+            HybridPublicKey::from_bytes(read_exact(bytes, &mut offset, pq_prekey_len)?)?;
+        let pq_prekey_signature = Signature::from_bytes(&{
+            let arr: [u8; 64] = read_exact(bytes, &mut offset, 64)?
+                .try_into()
+                .expect("checked length");
+            arr
+        });
+        let has_otk = *read_exact(bytes, &mut offset, 1)?
+            .first()
+            .expect("checked length");
+        let (one_time_prekey_id, one_time_prekey) = match has_otk {
+            0 => (None, None),
+            1 => {
+                let id = read_u32(bytes, &mut offset)?;
+                let public = X25519PublicKey::from(read_array32(bytes, &mut offset)?);
+                (Some(id), Some(public))
+            }
+            _ => return Err(CryptoError::Malformed("prekey bundle: bad otk flag")),
+        };
+        Ok(Self {
+            identity_agreement_key,
+            identity_signing_key,
+            signed_prekey_id,
+            signed_prekey,
+            signed_prekey_signature,
+            pq_prekey,
+            pq_prekey_signature,
+            one_time_prekey_id,
+            one_time_prekey,
+        })
+    }
 }
 
 fn hkdf_sk(input_key_material: &[u8]) -> [u8; 32] {
@@ -148,6 +223,57 @@ pub struct InitialMessage {
     pub used_signed_prekey_id: u32,
     pub used_one_time_prekey_id: Option<u32>,
     pub pq_ciphertext: HybridCiphertext,
+}
+
+impl InitialMessage {
+    /// Wire bytes for the X3DH handshake message a first-contact envelope
+    /// carries alongside the first Double Ratchet ciphertext — the
+    /// recipient needs this to derive the same shared secret via
+    /// [`x3dh_respond`] before it can decrypt anything.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let pq_bytes = self.pq_ciphertext.to_bytes();
+        let mut out = Vec::with_capacity(32 + 32 + 4 + 1 + 4 + pq_bytes.len());
+        out.extend_from_slice(self.sender_identity_agreement_key.as_bytes());
+        out.extend_from_slice(self.sender_ephemeral_key.as_bytes());
+        out.extend_from_slice(&self.used_signed_prekey_id.to_be_bytes());
+        match self.used_one_time_prekey_id {
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(&id.to_be_bytes());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&pq_bytes);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let mut offset = 0;
+        let sender_identity_agreement_key =
+            X25519PublicKey::from(read_array32(bytes, &mut offset)?);
+        let sender_ephemeral_key = X25519PublicKey::from(read_array32(bytes, &mut offset)?);
+        let used_signed_prekey_id = read_u32(bytes, &mut offset)?;
+        let has_otk = *read_exact(bytes, &mut offset, 1)?
+            .first()
+            .expect("checked length");
+        let used_one_time_prekey_id = match has_otk {
+            0 => None,
+            1 => Some(read_u32(bytes, &mut offset)?),
+            _ => return Err(CryptoError::Malformed("initial message: bad otk flag")),
+        };
+        let pq_ciphertext = HybridCiphertext::from_bytes(
+            bytes
+                .get(offset..)
+                .ok_or(CryptoError::Malformed("initial message: truncated"))?,
+        )?;
+        Ok(Self {
+            sender_identity_agreement_key,
+            sender_ephemeral_key,
+            used_signed_prekey_id,
+            used_one_time_prekey_id,
+            pq_ciphertext,
+        })
+    }
 }
 
 /// Alice's side of X3DH: given Bob's published prekey bundle, derive the
@@ -233,6 +359,30 @@ pub fn x3dh_respond(
     Ok(combine_classical_and_pq(&classical_sk, &pq_secret))
 }
 
+/// The Double Ratchet's `associated_data` must be byte-for-byte identical
+/// on both ends of a session (it's mixed into every message's AEAD AAD —
+/// see [`Session::encrypt`]/[`Session::decrypt`]), but the two parties
+/// don't agree in advance on who's "Alice" and who's "Bob": the initiator
+/// only knows "my identity, their identity" and the responder only knows
+/// "my identity, their identity" — same two values, opposite labels.
+/// Canonically ordering the two 64-byte identity blobs (`signing_key ||
+/// agreement_key`, see `bh_crypto::identity::IdentityKeyPair::
+/// public_identity_bytes`/`Contact::identity_public_key`) by byte value
+/// before concatenating them means both sides compute the exact same
+/// bytes regardless of which side they're on — the same idea as Signal's
+/// own `Encode(IKA) || Encode(IKB)` X3DH associated data.
+pub fn session_associated_data(identity_a: &[u8], identity_b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(identity_a.len() + identity_b.len());
+    if identity_a <= identity_b {
+        out.extend_from_slice(identity_a);
+        out.extend_from_slice(identity_b);
+    } else {
+        out.extend_from_slice(identity_b);
+        out.extend_from_slice(identity_a);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------
 // Double Ratchet
 // ---------------------------------------------------------------------
@@ -303,6 +453,70 @@ pub struct RatchetMessage {
     pub prev_chain_len: u32,
     pub counter: u32,
     pub ciphertext: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------
+// Wire/persistence serialization. Deliberately hand-rolled, not `serde` —
+// several of the types serialized here (`X25519Secret`, `Session`'s
+// `Zeroizing` fields) either don't implement it or shouldn't have their
+// exact in-memory representation treated as a stable wire format, so this
+// mirrors the existing `IdentityKeyPair::export_bytes`/`import_bytes` and
+// `sealed_sender.rs` framing style: explicit, auditable byte layout, no
+// derive magic. Every multi-byte integer is big-endian.
+// ---------------------------------------------------------------------
+
+fn read_exact<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], CryptoError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(CryptoError::Malformed("length overflow"))?;
+    let slice = bytes
+        .get(*offset..end)
+        .ok_or(CryptoError::Malformed("truncated"))?;
+    *offset = end;
+    Ok(slice)
+}
+
+fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, CryptoError> {
+    let slice = read_exact(bytes, offset, 4)?;
+    Ok(u32::from_be_bytes(
+        slice.try_into().expect("checked length"),
+    ))
+}
+
+fn read_array32(bytes: &[u8], offset: &mut usize) -> Result<[u8; 32], CryptoError> {
+    let slice = read_exact(bytes, offset, 32)?;
+    Ok(slice.try_into().expect("checked length"))
+}
+
+impl RatchetMessage {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 4 + 4 + 4 + self.ciphertext.len());
+        out.extend_from_slice(&self.dh_public);
+        out.extend_from_slice(&self.prev_chain_len.to_be_bytes());
+        out.extend_from_slice(&self.counter.to_be_bytes());
+        out.extend_from_slice(&(self.ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let mut offset = 0;
+        let dh_public = read_array32(bytes, &mut offset)?;
+        let prev_chain_len = read_u32(bytes, &mut offset)?;
+        let counter = read_u32(bytes, &mut offset)?;
+        let ciphertext_len = read_u32(bytes, &mut offset)? as usize;
+        let ciphertext = read_exact(bytes, &mut offset, ciphertext_len)?.to_vec();
+        Ok(Self {
+            dh_public,
+            prev_chain_len,
+            counter,
+            ciphertext,
+        })
+    }
 }
 
 /// An established 1:1 session between two identities — the persistent
@@ -517,6 +731,115 @@ impl Session {
                 },
             )
             .map_err(|_| CryptoError::Decrypt)
+    }
+
+    /// Serializes this session's full ratchet state — the opaque blob
+    /// `bh-storage::sessions.ratchet_state` persists (see that model's own
+    /// doc comment). Contains long-term-sensitive key material; the caller
+    /// is responsible for keeping the resulting bytes inside an
+    /// already-encrypted store (SQLCipher here), same trust boundary as
+    /// everything else this crate hands to `bh-storage`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        out.extend_from_slice(&(self.associated_data.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.associated_data);
+        out.extend_from_slice(&*self.root_key);
+        out.extend_from_slice(&self.dh_self_secret.to_bytes());
+        match &self.dh_remote_public {
+            Some(k) => {
+                out.push(1);
+                out.extend_from_slice(k.as_bytes());
+            }
+            None => out.push(0),
+        }
+        match &self.sending_chain_key {
+            Some(k) => {
+                out.push(1);
+                out.extend_from_slice(&**k);
+            }
+            None => out.push(0),
+        }
+        match &self.receiving_chain_key {
+            Some(k) => {
+                out.push(1);
+                out.extend_from_slice(&**k);
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&self.send_count.to_be_bytes());
+        out.extend_from_slice(&self.recv_count.to_be_bytes());
+        out.extend_from_slice(&self.prev_chain_len.to_be_bytes());
+        out.extend_from_slice(&(self.skipped_keys.len() as u32).to_be_bytes());
+        for ((dh, counter), key) in &self.skipped_keys {
+            out.extend_from_slice(dh);
+            out.extend_from_slice(&counter.to_be_bytes());
+            out.extend_from_slice(&**key);
+        }
+        out
+    }
+
+    /// Inverse of [`to_bytes`](Self::to_bytes).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let mut offset = 0;
+        let ad_len = read_u32(bytes, &mut offset)? as usize;
+        let associated_data = read_exact(bytes, &mut offset, ad_len)?.to_vec();
+        let root_key = Zeroizing::new(read_array32(bytes, &mut offset)?);
+        let dh_self_secret = X25519Secret::from(read_array32(bytes, &mut offset)?);
+        let dh_self_public = X25519PublicKey::from(&dh_self_secret);
+
+        let has_remote = *read_exact(bytes, &mut offset, 1)?
+            .first()
+            .expect("checked length");
+        let dh_remote_public = match has_remote {
+            0 => None,
+            1 => Some(X25519PublicKey::from(read_array32(bytes, &mut offset)?)),
+            _ => return Err(CryptoError::Malformed("session: bad remote-key flag")),
+        };
+
+        let has_sending = *read_exact(bytes, &mut offset, 1)?
+            .first()
+            .expect("checked length");
+        let sending_chain_key = match has_sending {
+            0 => None,
+            1 => Some(Zeroizing::new(read_array32(bytes, &mut offset)?)),
+            _ => return Err(CryptoError::Malformed("session: bad sending-chain flag")),
+        };
+
+        let has_receiving = *read_exact(bytes, &mut offset, 1)?
+            .first()
+            .expect("checked length");
+        let receiving_chain_key = match has_receiving {
+            0 => None,
+            1 => Some(Zeroizing::new(read_array32(bytes, &mut offset)?)),
+            _ => return Err(CryptoError::Malformed("session: bad receiving-chain flag")),
+        };
+
+        let send_count = read_u32(bytes, &mut offset)?;
+        let recv_count = read_u32(bytes, &mut offset)?;
+        let prev_chain_len = read_u32(bytes, &mut offset)?;
+
+        let skipped_count = read_u32(bytes, &mut offset)?;
+        let mut skipped_keys = HashMap::with_capacity(skipped_count as usize);
+        for _ in 0..skipped_count {
+            let dh = read_array32(bytes, &mut offset)?;
+            let counter = read_u32(bytes, &mut offset)?;
+            let key = Zeroizing::new(read_array32(bytes, &mut offset)?);
+            skipped_keys.insert((dh, counter), key);
+        }
+
+        Ok(Self {
+            associated_data,
+            root_key,
+            dh_self_secret,
+            dh_self_public,
+            dh_remote_public,
+            sending_chain_key,
+            receiving_chain_key,
+            send_count,
+            recv_count,
+            prev_chain_len,
+            skipped_keys,
+        })
     }
 }
 
@@ -743,5 +1066,113 @@ mod tests {
 
         let msg = alice_session.encrypt(b"hello").unwrap();
         assert!(bob_session.decrypt(&msg).is_err());
+    }
+
+    #[test]
+    fn session_associated_data_is_order_independent() {
+        let a = b"alice-identity-bytes";
+        let b = b"bob-identity-bytes";
+        assert_eq!(session_associated_data(a, b), session_associated_data(b, a));
+        assert_ne!(session_associated_data(a, b), a.to_vec());
+    }
+
+    #[test]
+    fn ratchet_message_roundtrips_through_bytes() {
+        let msg = RatchetMessage {
+            dh_public: [7u8; 32],
+            prev_chain_len: 3,
+            counter: 42,
+            ciphertext: b"some ciphertext bytes".to_vec(),
+        };
+        let decoded = RatchetMessage::from_bytes(&msg.to_bytes()).unwrap();
+        assert_eq!(decoded.dh_public, msg.dh_public);
+        assert_eq!(decoded.prev_chain_len, msg.prev_chain_len);
+        assert_eq!(decoded.counter, msg.counter);
+        assert_eq!(decoded.ciphertext, msg.ciphertext);
+    }
+
+    #[test]
+    fn initial_message_roundtrips_through_bytes_with_and_without_otk() {
+        let alice_id = IdentityKeyPair::generate().unwrap();
+        let bob_id = IdentityKeyPair::generate().unwrap();
+        let bob_spk = SignedPreKey::generate(&bob_id, 1);
+
+        for otk in [None, Some(generate_one_time_prekeys(1, 1).remove(0))] {
+            let bundle = bob_bundle(&bob_id, &bob_spk, otk.as_ref());
+            let (_sk, initial_msg) = x3dh_initiate(&alice_id, &bundle).unwrap();
+            let decoded = InitialMessage::from_bytes(&initial_msg.to_bytes()).unwrap();
+            assert_eq!(
+                decoded.sender_identity_agreement_key.to_bytes(),
+                initial_msg.sender_identity_agreement_key.to_bytes()
+            );
+            assert_eq!(
+                decoded.sender_ephemeral_key.to_bytes(),
+                initial_msg.sender_ephemeral_key.to_bytes()
+            );
+            assert_eq!(
+                decoded.used_signed_prekey_id,
+                initial_msg.used_signed_prekey_id
+            );
+            assert_eq!(
+                decoded.used_one_time_prekey_id,
+                initial_msg.used_one_time_prekey_id
+            );
+
+            // The round-tripped `InitialMessage` must still let Bob derive
+            // the exact same shared secret `x3dh_initiate` produced — not
+            // just structurally equal fields.
+            let bob_sk = x3dh_respond(&bob_id, &bob_spk, otk.as_ref(), &decoded).unwrap();
+            let alice_sk = x3dh_respond(&bob_id, &bob_spk, otk.as_ref(), &initial_msg).unwrap();
+            assert_eq!(bob_sk, alice_sk);
+        }
+    }
+
+    #[test]
+    fn prekey_bundle_roundtrips_through_bytes_and_stays_verifiable() {
+        let bob_id = IdentityKeyPair::generate().unwrap();
+        let bob_spk = SignedPreKey::generate(&bob_id, 1);
+        let otk = generate_one_time_prekeys(5, 1).remove(0);
+        let bundle = bob_bundle(&bob_id, &bob_spk, Some(&otk));
+
+        let decoded = PreKeyBundle::from_bytes(&bundle.to_bytes()).unwrap();
+        assert_eq!(
+            decoded.identity_agreement_key.to_bytes(),
+            bundle.identity_agreement_key.to_bytes()
+        );
+        assert_eq!(
+            decoded.identity_signing_key.to_bytes(),
+            bundle.identity_signing_key.to_bytes()
+        );
+        assert_eq!(decoded.signed_prekey_id, bundle.signed_prekey_id);
+        assert_eq!(decoded.one_time_prekey_id, bundle.one_time_prekey_id);
+
+        // A decoded bundle must still pass the same signature check a
+        // real `x3dh_initiate` call runs against it — proves the encoding
+        // didn't silently corrupt anything the signature covers.
+        let alice_id = IdentityKeyPair::generate().unwrap();
+        assert!(x3dh_initiate(&alice_id, &decoded).is_ok());
+    }
+
+    #[test]
+    fn session_roundtrips_through_bytes_mid_conversation() {
+        let (mut alice, mut bob) = establish_session_pair();
+
+        // Advance the ratchet a bit in both directions before snapshotting,
+        // so the round-trip actually exercises chain keys/counters/DH
+        // state, not just the freshly-initialized case.
+        let m1 = alice.encrypt(b"hi bob").unwrap();
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"hi bob");
+        let m2 = bob.encrypt(b"hi alice").unwrap();
+        assert_eq!(alice.decrypt(&m2).unwrap(), b"hi alice");
+
+        let alice_bytes = alice.to_bytes();
+        let mut alice_restored = Session::from_bytes(&alice_bytes).unwrap();
+
+        // The restored session must produce a message the *original* live
+        // `bob` session (continuing independently) can still decrypt —
+        // proving the restored state is really live ratchet state, not
+        // just structurally similar bytes.
+        let m3 = alice_restored.encrypt(b"still me").unwrap();
+        assert_eq!(bob.decrypt(&m3).unwrap(), b"still me");
     }
 }

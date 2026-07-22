@@ -32,12 +32,69 @@ pub struct SealedSenderEnvelope {
     pub ciphertext: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize)]
+impl SealedSenderEnvelope {
+    /// Compact wire bytes: `ephemeral_public` followed directly by
+    /// `ciphertext` (no length prefix needed — `ciphertext` always runs to
+    /// the end). Prefer this over `serde_json`/`Serialize` for anything
+    /// actually placed on the wire (e.g. a `Mailbox::push` payload):
+    /// `ciphertext` here routinely carries an X3DH `InitialMessage`
+    /// (~1.1KB, mostly the ML-KEM ciphertext), and JSON's default `Vec<u8>`
+    /// encoding as an array of decimal numbers bloats that roughly 5x —
+    /// enough to push a single mailbox record from a few KB to observably
+    /// slower/less reliable DHT round trips.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + self.ciphertext.len());
+        out.extend_from_slice(&self.ephemeral_public);
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let ephemeral_public: [u8; 32] = bytes.get(..32)?.try_into().ok()?;
+        let ciphertext = bytes.get(32..)?.to_vec();
+        Some(Self {
+            ephemeral_public,
+            ciphertext,
+        })
+    }
+}
+
 struct SealedContent {
     sender_identity_public: [u8; 32],
-    sender_signature: Vec<u8>,
+    sender_signature: [u8; 64],
     timestamp: i64,
     inner_message: Vec<u8>,
+}
+
+impl SealedContent {
+    /// Compact wire bytes, not `serde_json` — this is the *plaintext*
+    /// [`seal`] AEAD-encrypts, and `inner_message` routinely carries a
+    /// multi-KB `bh-crypto::ratchet` envelope (an X3DH `InitialMessage` on
+    /// a first contact is mostly the ML-KEM ciphertext); JSON's default
+    /// `Vec<u8>` encoding as an array of decimal numbers bloats that
+    /// several-fold for no benefit once it's about to be encrypted anyway.
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 64 + 8 + self.inner_message.len());
+        out.extend_from_slice(&self.sender_identity_public);
+        out.extend_from_slice(&self.sender_signature);
+        out.extend_from_slice(&self.timestamp.to_be_bytes());
+        out.extend_from_slice(&self.inner_message);
+        out
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let sender_identity_public: [u8; 32] = bytes.get(..32)?.try_into().ok()?;
+        let sender_signature: [u8; 64] = bytes.get(32..96)?.try_into().ok()?;
+        let timestamp_bytes: [u8; 8] = bytes.get(96..104)?.try_into().ok()?;
+        let timestamp = i64::from_be_bytes(timestamp_bytes);
+        let inner_message = bytes.get(104..)?.to_vec();
+        Some(Self {
+            sender_identity_public,
+            sender_signature,
+            timestamp,
+            inner_message,
+        })
+    }
 }
 
 fn derive_key(shared: &[u8; 32]) -> [u8; 32] {
@@ -67,11 +124,11 @@ pub fn seal(
     let signature = sender_identity.sign(&signed_bytes(timestamp, &inner_message));
     let content = SealedContent {
         sender_identity_public: sender_identity.public_signing_key().to_bytes(),
-        sender_signature: signature.to_bytes().to_vec(),
+        sender_signature: signature.to_bytes(),
         timestamp,
         inner_message,
     };
-    let plaintext = serde_json::to_vec(&content).map_err(|e| NetworkError::Setup(e.to_string()))?;
+    let plaintext = content.to_bytes();
 
     let ephemeral_secret = X25519Secret::random();
     let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
@@ -113,17 +170,12 @@ pub fn unseal(
         .decrypt(&Nonce::default(), envelope.ciphertext.as_slice())
         .map_err(|_| NetworkError::Query("sealed_sender: decryption failed".to_string()))?;
 
-    let content: SealedContent =
-        serde_json::from_slice(&plaintext).map_err(|e| NetworkError::Query(e.to_string()))?;
+    let content = SealedContent::from_bytes(&plaintext)
+        .ok_or_else(|| NetworkError::Query("sealed_sender: malformed content".to_string()))?;
 
     let sender_identity = VerifyingKey::from_bytes(&content.sender_identity_public)
         .map_err(|_| NetworkError::Query("sealed_sender: bad sender identity key".to_string()))?;
-    let signature_bytes: [u8; 64] = content
-        .sender_signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| NetworkError::Query("sealed_sender: bad signature length".to_string()))?;
-    let signature = Signature::from_bytes(&signature_bytes);
+    let signature = Signature::from_bytes(&content.sender_signature);
     sender_identity
         .verify(
             &signed_bytes(content.timestamp, &content.inner_message),

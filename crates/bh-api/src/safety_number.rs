@@ -33,6 +33,16 @@ pub struct SafetyNumberResponse {
     pub digits: String,
     pub grouped: String,
     pub qr_svg: String,
+    /// Best-effort Key Transparency corroboration
+    /// (`docs/THREAT_MODEL.md` §3.1) for this contact's key — additional
+    /// evidence alongside, never a replacement for, comparing `digits`
+    /// out of band. `null` means "couldn't check" (no network attached,
+    /// or the contact has never published a tree head): the same
+    /// manual-verification-only status quo as before this existed, not a
+    /// red flag. `false` means a validly-signed tree head was fetched but
+    /// doesn't match this contact's key on file — worth surfacing to the
+    /// user as a reason to be extra careful about the manual comparison.
+    pub key_transparency_corroborated: Option<bool>,
 }
 
 pub async fn get_safety_number(
@@ -59,10 +69,18 @@ pub async fn get_safety_number(
     let grouped = sn::format_grouped(&digits);
     let qr_svg = sn::to_qr_svg(&digits).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let key_transparency_corroborated = match &state.network {
+        Some(network) => {
+            crate::tree_head::fetch_and_verify_contact(network, &contact.identity_public_key).await
+        }
+        None => None,
+    };
+
     Ok(Json(SafetyNumberResponse {
         digits,
         grouped,
         qr_svg,
+        key_transparency_corroborated,
     }))
 }
 

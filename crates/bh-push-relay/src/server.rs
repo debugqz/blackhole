@@ -6,6 +6,8 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::GovernorLayer;
 
 use crate::RelayState;
 
@@ -40,7 +42,9 @@ async fn register(
     if !valid_token(&req.token) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    state.register(req.token);
+    if !state.register(req.token) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     Ok(Json(RegisterResponse { registered: true }))
 }
 
@@ -87,16 +91,39 @@ impl RelayServer {
     /// whole route table in-process via `tower::ServiceExt::oneshot`,
     /// mirroring `bh-api`'s test setup (`crates/bh-api/tests/api_smoke.rs`)
     /// — no real TCP listener needed to prove the register/wake contract.
+    ///
+    /// Rate-limited per source IP (`GovernorLayer`, `PeerIpKeyExtractor`)
+    /// — this is the one genuinely internet-facing surface in the repo
+    /// (binds all interfaces, unlike `bh-api`'s loopback-only daemon), so
+    /// unlike `bh-api` it needs a real, if deliberately loose, throttle
+    /// against automated abuse of `/register`/`/wake/:token`.
+    /// `PeerIpKeyExtractor` reads connection info from request
+    /// extensions, which only a real `axum::serve(...,
+    /// into_make_service_with_connect_info::<SocketAddr>())` populates —
+    /// tests that drive this router directly via `oneshot` must insert a
+    /// `ConnectInfo<SocketAddr>` extension on their requests themselves.
     pub fn router(state: Arc<RelayState>) -> Router {
+        let governor_config = Arc::new(
+            GovernorConfigBuilder::default()
+                .finish()
+                .expect("default governor config is always valid"),
+        );
         Router::new()
             .route("/register", post(register))
             .route("/wake/:token", post(wake))
+            .layer(GovernorLayer {
+                config: governor_config,
+            })
             .with_state(state)
     }
 
     pub async fn run(self) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         tracing::info!(addr = %listener.local_addr()?, "push relay listening");
-        axum::serve(listener, Self::router(self.state)).await
+        axum::serve(
+            listener,
+            Self::router(self.state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
     }
 }

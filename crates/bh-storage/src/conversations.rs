@@ -68,6 +68,45 @@ impl Database {
         Ok(())
     }
 
+    /// Looks up the (at most one, enforced by `conversations`' own data
+    /// model — a contact has exactly one direct conversation) direct
+    /// conversation with `contact_id`, if one already exists.
+    pub fn get_direct_conversation_for_contact(
+        &self,
+        contact_id: &str,
+    ) -> Result<Option<Conversation>, StorageError> {
+        let conn = self.conn()?;
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM conversations WHERE kind = 'direct' AND contact_id = ?1"
+        );
+        conn.query_row(&sql, params![contact_id], row_to_conversation)
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// Find-or-create: returns the existing direct conversation with
+    /// `contact_id`, or creates a fresh one (with a random id) if this is
+    /// the first message to/from this contact. Used by the message
+    /// receive path (`crates/bh-api/src/conversations.rs`'s mailbox-pull
+    /// loop), which — unlike `POST /conversations` — has no client request
+    /// to originate a conversation id from.
+    pub fn ensure_direct_conversation(
+        &self,
+        contact_id: &str,
+        created_at: i64,
+    ) -> Result<Conversation, StorageError> {
+        if let Some(existing) = self.get_direct_conversation_for_contact(contact_id)? {
+            return Ok(existing);
+        }
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        self.create_direct_conversation(&conversation_id, contact_id, created_at)?;
+        self.get_conversation(&conversation_id)?
+            .ok_or(StorageError::NotFound)
+    }
+
     pub fn get_conversation(
         &self,
         conversation_id: &str,

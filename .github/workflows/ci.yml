@@ -47,6 +47,50 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  cargo-deny:
+    name: Dependency advisories (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
+  fuzz-smoke:
+    name: Fuzz smoke (60s per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libclang-dev clang
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # A short, bounded smoke run per target — not the continuous fuzzing
+      # program SPEC.md §13 explicitly defers, just enough to catch a
+      # regression that makes one of these parsers panic on malformed
+      # input. Runs against the attacker-reachable byte parsers: onion
+      # packet peeling, sealed-sender envelope unsealing, mailbox manifest
+      # deserialization (all bh-network), and plaintext envelope decoding
+      # (bh-crypto).
+      - name: Fuzz bh-network targets
+        working-directory: crates/bh-network
+        run: |
+          for target in fuzz_onion_peel_layer fuzz_sealed_sender_unseal fuzz_mailbox_manifest; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          done
+
+      - name: Fuzz bh-crypto targets
+        working-directory: crates/bh-crypto
+        run: cargo +nightly fuzz run fuzz_envelope_decode -- -max_total_time=60
+
   desktop-frontend:
     name: Desktop client (typecheck + build)
     runs-on: ubuntu-latest

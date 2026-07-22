@@ -30,7 +30,22 @@ getrandom = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Onion routing (onion.rs, SPEC.md §5.2) packet format: the real Sphinx
+# construction (Danezis-Goldberg), via the Nym mixnet project's own
+# production implementation — composition of an existing implementation,
+# same pattern as `openmls` for MLS, rather than hand-deriving Sphinx's
+# filler-string algorithm from scratch (see onion.rs's module doc for why
+# that's the wrong call for a from-scratch attempt here).
+sphinx-packet = "0.6"
+# `sphinx-packet` depends on x25519-dalek 2.x; this workspace is on 3.x.
+# Both coexist fine as separate major-version instances, but aren't the
+# same Rust type — `onion.rs` converts explicitly at the boundary via this
+# aliased import rather than silently picking up whichever version a
+# `use` statement happens to resolve to.
+x25519-dalek-v2 = { package = "x25519-dalek", version = "2.0.1", features = [
+    "static_secrets",
+    "getrandom",
+] }
+
 # STUN/TURN (SPEC.md §5.1) aren't wired in yet — libp2p's own hole-punching
-# (relay + dcutr) covers a meaningful chunk of what STUN/TURN would. The
-# onion routing circuit layer (§5.2) has no mature off-the-shelf crate to
-# build on, so it's implemented directly in onion.rs on audited primitives.
+# (relay + dcutr) covers a meaningful chunk of what STUN/TURN would.

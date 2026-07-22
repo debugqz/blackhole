@@ -17,6 +17,15 @@ import {
   LINK_PREVIEW_SETTING_COPY,
   renderLinkPreviewCard,
 } from "./link_preview";
+import { ensureDaemonRunning } from "./daemon_lifecycle";
+import { subscribeToCallStream, FrameKind, Vp8CanvasRenderer, type CallEvent } from "./calls";
+import {
+  bytesToHex,
+  clearPrfUnlockConfig,
+  derivePrfSecret,
+  enrollDatabaseUnlockGate,
+  getPrfUnlockConfig,
+} from "./prf_unlock";
 
 // Screenshot/shoulder-surfing mitigation (SPEC.md §7): blur the whole app
 // whenever the window loses focus. Real, cross-platform, but not equivalent
@@ -120,6 +129,16 @@ let typingPollHandle: ReturnType<typeof setInterval> | null = null;
 let lastTypingPingAt = 0;
 const TYPING_PING_MIN_INTERVAL_MS = 3_000;
 
+// ---------------- calls ----------------
+let activeCallId: string | null = null;
+let activeCallIsGroup = false;
+let activeCallUnsubscribe: (() => Promise<void>) | null = null;
+let remoteCallRenderer: Vp8CanvasRenderer | null = null;
+let localCallRenderer: Vp8CanvasRenderer | null = null;
+let cameraOn = false;
+let screenShareOn = false;
+const groupCallParticipants = new Set<number>();
+
 function contactFor(conversation: Conversation): Contact | undefined {
   return conversation.contact_id ? contactsById.get(conversation.contact_id) : undefined;
 }
@@ -168,17 +187,76 @@ function resetAppState() {
     "screen-profiles",
     "screen-requests",
     "screen-import",
+    "screen-call",
   ]) {
     $<HTMLDivElement>(id).hidden = true;
   }
+  void hangupActiveCall();
 }
 
 // ---------------- unlock flow ----------------
+/// Ensures the daemon is actually running before anything else — either
+/// starting it plainly, or, if a PRF database-unlock gate is configured
+/// (`prf_unlock.ts`), waiting on a passkey assertion first and starting
+/// the daemon with the derived secret as `BLACKHOLE_DB_PIN`. This is the
+/// real gate THREAT_MODEL.md §3.7 describes: unlike the *client-UI-only*
+/// passkey/TOTP screen further down in `boot()` (which runs after the
+/// daemon has already opened the database), the daemon process here
+/// genuinely does not exist — and so cannot have opened anything — until
+/// this resolves. Returns `false` (having already rendered its own
+/// retry/unlock UI into `actions`) if the daemon isn't up yet; `boot()`
+/// must stop and wait rather than proceed to `api.health()`.
+async function ensureDaemonBeforeBoot(
+  status: HTMLParagraphElement,
+  actions: HTMLDivElement,
+): Promise<boolean> {
+  const gate = await getPrfUnlockConfig().catch(() => null);
+
+  if (!gate) {
+    try {
+      status.textContent = "Starting daemon…";
+      await ensureDaemonRunning(null);
+      return true;
+    } catch (err) {
+      status.textContent = `Could not start the daemon: ${errorMessage(err)}`;
+      const retry = el("button", "btn-outline wide", "Retry");
+      retry.type = "button";
+      retry.addEventListener("click", boot);
+      actions.append(retry);
+      return false;
+    }
+  }
+
+  status.textContent = "This profile's database is locked. Unlock with your passkey to continue.";
+  const unlockBtn = el("button", "btn-primary wide", "Unlock with passkey");
+  unlockBtn.type = "button";
+  unlockBtn.addEventListener("click", async () => {
+    unlockBtn.disabled = true;
+    status.textContent = "Waiting for your passkey…";
+    try {
+      const secret = await derivePrfSecret(gate);
+      if (!secret) {
+        throw new Error("Your authenticator did not return a PRF result.");
+      }
+      await ensureDaemonRunning(bytesToHex(secret));
+      await boot();
+    } catch (err) {
+      status.textContent = errorMessage(err);
+      unlockBtn.disabled = false;
+    }
+  });
+  actions.append(unlockBtn);
+  return false;
+}
+
 async function boot() {
   const status = $<HTMLParagraphElement>("unlock-status");
   const actions = $<HTMLDivElement>("unlock-actions");
   actions.replaceChildren();
   showOnly("screen-unlock");
+
+  if (!(await ensureDaemonBeforeBoot(status, actions))) return;
+  actions.replaceChildren();
 
   try {
     await api.health();
@@ -472,6 +550,9 @@ async function openConversation(conversationId: string) {
   $<HTMLButtonElement>("report-contact").disabled = !contact;
   $<HTMLButtonElement>("manage-members").hidden = !isGroup;
   $<HTMLButtonElement>("verify-group-crypto").hidden = !isGroup;
+  $<HTMLButtonElement>("call-audio").hidden = conversation.kind !== "direct";
+  $<HTMLButtonElement>("call-video").hidden = conversation.kind !== "direct";
+  $<HTMLButtonElement>("call-group").hidden = !isGroup;
 
   const msgs = $<HTMLDivElement>("msgs");
   msgs.replaceChildren(el("div", "msg-meta", "Loading…"));
@@ -491,6 +572,183 @@ async function openConversation(conversationId: string) {
     msgs.replaceChildren(el("div", "msg-meta", errorMessage(err)));
   }
 }
+
+// ---------------- calls ----------------
+// No real signaling delivery is wired between two separate devices yet
+// (calls.rs's module doc: a client gets a real offer/answer/SFrame call
+// session out of the API, but is responsible for ferrying the signal JSON
+// to the other party itself, over a channel that doesn't exist here). So,
+// like the existing "device linking (local simulation, labeled as such in
+// the UI)" and groups' locally-generated "shadow" MLS members, every call
+// this UI starts plays both the caller and callee role against this same
+// daemon — a real WebRTC connection, real media capture/encode, and real
+// SFrame end-to-end encryption, just between two sessions on one machine
+// instead of two separate ones.
+
+function setCallStatus(text: string) {
+  $<HTMLParagraphElement>("call-status").textContent = text;
+}
+
+function updateCallControls() {
+  $<HTMLButtonElement>("call-toggle-camera").hidden = activeCallIsGroup;
+  $<HTMLButtonElement>("call-toggle-screen").hidden = activeCallIsGroup;
+  $<HTMLButtonElement>("call-toggle-camera").textContent = cameraOn ? "Stop camera" : "Start camera";
+  $<HTMLButtonElement>("call-toggle-screen").textContent = screenShareOn ? "Stop sharing" : "Share screen";
+  $<HTMLDivElement>("call-videos").hidden = activeCallIsGroup;
+  $<HTMLDivElement>("call-participants").hidden = !activeCallIsGroup;
+}
+
+function renderGroupCallParticipants() {
+  const container = $<HTMLDivElement>("call-participants");
+  container.replaceChildren();
+  for (const tag of Array.from(groupCallParticipants).sort((a, b) => a - b)) {
+    container.append(el("div", "call-participant-tile", tag === 0 ? "You" : `Participant ${tag}`));
+  }
+}
+
+function handleCallEvent(event: CallEvent) {
+  switch (event.type) {
+    case "connected":
+      setCallStatus("Connected");
+      break;
+    case "participant_joined":
+      groupCallParticipants.add(event.tag);
+      renderGroupCallParticipants();
+      break;
+    case "participant_left":
+      groupCallParticipants.delete(event.tag);
+      renderGroupCallParticipants();
+      break;
+    case "hangup":
+      setCallStatus("Call ended");
+      void endCallUi();
+      break;
+  }
+}
+
+function openCallOverlay(title: string, isGroup: boolean) {
+  activeCallIsGroup = isGroup;
+  cameraOn = false;
+  screenShareOn = false;
+  groupCallParticipants.clear();
+  $<HTMLSpanElement>("call-title").textContent = title;
+  setCallStatus("Connecting…");
+  updateCallControls();
+  renderGroupCallParticipants();
+  $<HTMLDivElement>("screen-call").hidden = false;
+}
+
+async function endCallUi() {
+  if (activeCallUnsubscribe) {
+    await activeCallUnsubscribe().catch(() => {});
+    activeCallUnsubscribe = null;
+  }
+  remoteCallRenderer?.close();
+  localCallRenderer?.close();
+  remoteCallRenderer = null;
+  localCallRenderer = null;
+  activeCallId = null;
+  activeCallIsGroup = false;
+  cameraOn = false;
+  screenShareOn = false;
+  groupCallParticipants.clear();
+  $<HTMLDivElement>("screen-call").hidden = true;
+}
+
+async function hangupActiveCall() {
+  const callId = activeCallId;
+  if (!callId) {
+    $<HTMLDivElement>("screen-call").hidden = true;
+    return;
+  }
+  try {
+    if (activeCallIsGroup) await api.hangupGroupCall(callId);
+    else await api.hangupCall(callId);
+  } catch {
+    // Best-effort — still tear down the local UI/subscription below even
+    // if the daemon-side hangup call failed (e.g. already ended).
+  }
+  await endCallUi();
+}
+
+async function attachCallStream(callId: string) {
+  activeCallId = callId;
+  remoteCallRenderer = new Vp8CanvasRenderer($<HTMLCanvasElement>("call-remote-video"));
+  localCallRenderer = new Vp8CanvasRenderer($<HTMLCanvasElement>("call-local-video"));
+  activeCallUnsubscribe = await subscribeToCallStream(callId, {
+    onEvent: handleCallEvent,
+    onFrame: (frame) => {
+      if (frame.kind === FrameKind.RemoteVideo || frame.kind === FrameKind.RemoteScreen) {
+        remoteCallRenderer?.feed(frame.bytes);
+      } else {
+        localCallRenderer?.feed(frame.bytes);
+      }
+    },
+  });
+}
+
+async function startTestCall(video: boolean) {
+  const callId = crypto.randomUUID();
+  openCallOverlay(video ? "Video call (local test)" : "Call (local test)", false);
+  try {
+    const offer = await api.startCall(callId, video);
+    const answer = await api.acceptCall(offer.signal);
+    await api.completeCall(callId, answer.signal);
+    await attachCallStream(callId);
+  } catch (err) {
+    setCallStatus(`Failed to start call: ${errorMessage(err)}`);
+  }
+}
+
+async function startTestGroupCall() {
+  const callId = crypto.randomUUID();
+  openCallOverlay("Group call (local test)", true);
+  try {
+    const started = await api.startGroupCall(callId, false, 2);
+    groupCallParticipants.add(started.local_tag);
+    for (const tag of started.participant_tags) groupCallParticipants.add(tag);
+    renderGroupCallParticipants();
+    await attachCallStream(callId);
+  } catch (err) {
+    setCallStatus(`Failed to start group call: ${errorMessage(err)}`);
+  }
+}
+
+$<HTMLButtonElement>("call-audio").addEventListener("click", () => void startTestCall(false));
+$<HTMLButtonElement>("call-video").addEventListener("click", () => void startTestCall(true));
+$<HTMLButtonElement>("call-group").addEventListener("click", () => void startTestGroupCall());
+$<HTMLButtonElement>("close-call").addEventListener("click", () => void hangupActiveCall());
+$<HTMLButtonElement>("call-hangup").addEventListener("click", () => void hangupActiveCall());
+$<HTMLButtonElement>("call-toggle-camera").addEventListener("click", async () => {
+  if (!activeCallId) return;
+  try {
+    if (cameraOn) {
+      await api.stopCamera(activeCallId);
+      cameraOn = false;
+    } else {
+      await api.startCamera(activeCallId);
+      cameraOn = true;
+    }
+    updateCallControls();
+  } catch (err) {
+    setCallStatus(`Camera error: ${errorMessage(err)}`);
+  }
+});
+$<HTMLButtonElement>("call-toggle-screen").addEventListener("click", async () => {
+  if (!activeCallId) return;
+  try {
+    if (screenShareOn) {
+      await api.stopScreenShare(activeCallId);
+      screenShareOn = false;
+    } else {
+      await api.startScreenShare(activeCallId);
+      screenShareOn = true;
+    }
+    updateCallControls();
+  } catch (err) {
+    setCallStatus(`Screen share error: ${errorMessage(err)}`);
+  }
+});
 
 function renderMessages(messages: Message[]) {
   const msgs = $<HTMLDivElement>("msgs");
@@ -2180,6 +2438,7 @@ async function renderLocalAuthStatus() {
     el2.textContent = errorMessage(err);
   }
   await renderPasskeyList();
+  await renderDbLockStatus();
 }
 
 async function renderPasskeyList() {
@@ -2259,6 +2518,72 @@ $<HTMLButtonElement>("remove-totp").addEventListener("click", async () => {
     await renderLocalAuthStatus();
   } catch (err) {
     window.alert(errorMessage(err));
+  }
+});
+
+async function renderDbLockStatus() {
+  const statusEl = $<HTMLParagraphElement>("db-lock-status");
+  const enableBtn = $<HTMLButtonElement>("enable-db-lock");
+  const disableBtn = $<HTMLButtonElement>("disable-db-lock");
+  try {
+    const [dbPin, gate] = await Promise.all([api.dbPinStatus(), getPrfUnlockConfig()]);
+    const locked = dbPin.pin_set && gate !== null;
+    statusEl.textContent = locked
+      ? "Enabled — the daemon needs your passkey to open the database."
+      : dbPin.pin_set
+        ? "A manual database PIN is set, but not via this passkey gate."
+        : "Not enabled.";
+    enableBtn.hidden = locked || dbPin.pin_set;
+    disableBtn.hidden = !locked;
+  } catch (err) {
+    statusEl.textContent = errorMessage(err);
+  }
+}
+
+$<HTMLButtonElement>("enable-db-lock").addEventListener("click", async () => {
+  const button = $<HTMLButtonElement>("enable-db-lock");
+  button.disabled = true;
+  try {
+    // Reuses the daemon's own passkey relying-party id (from the regular
+    // local-unlock ceremony start) rather than a dedicated endpoint —
+    // the ceremony state it also creates server-side is simply never
+    // finished, which is harmless (bounded, in-memory, cleared on
+    // restart), not a new endpoint worth adding just for one field.
+    const { challenge_json } = await api.passkeyRegisterStart();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rpId = (challenge_json as any).publicKey.rp.id as string;
+    const secret = await enrollDatabaseUnlockGate(rpId);
+    await api.setDbPin(bytesToHex(secret));
+    window.alert(
+      "Database lock enabled. The daemon will ask for this passkey the next time it starts.",
+    );
+    await renderDbLockStatus();
+  } catch (err) {
+    window.alert(errorMessage(err));
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$<HTMLButtonElement>("disable-db-lock").addEventListener("click", async () => {
+  const button = $<HTMLButtonElement>("disable-db-lock");
+  const gate = await getPrfUnlockConfig().catch(() => null);
+  if (!gate) {
+    window.alert("No database lock is configured.");
+    return;
+  }
+  button.disabled = true;
+  try {
+    const secret = await derivePrfSecret(gate);
+    if (!secret) throw new Error("Your authenticator did not return a PRF result.");
+    await api.clearDbPin(bytesToHex(secret));
+    await clearPrfUnlockConfig();
+    window.alert("Database lock disabled.");
+    await renderDbLockStatus();
+  } catch (err) {
+    window.alert(errorMessage(err));
+  } finally {
+    button.disabled = false;
   }
 });
 

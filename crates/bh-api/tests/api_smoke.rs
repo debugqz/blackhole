@@ -25,10 +25,23 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+/// Fixed value every test request authenticates with — `AppState::
+/// with_expiry_sweep_interval` reads `BLACKHOLE_API_TOKEN` if set (rather
+/// than generating a random token per `AppState`), so every `AppState`
+/// this test binary constructs ends up using this same known value,
+/// letting `json_request`/`get_request`/`signed_paid_request` attach a
+/// fixed `Authorization` header instead of reading each `AppState`'s
+/// generated token back individually.
+const TEST_API_TOKEN: &str = "test-api-token-not-a-real-secret";
+
 fn use_mock_keychain() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        // SAFETY: set once, before any test spawns threads that read env
+        // vars concurrently (`Once` guarantees this runs before any test
+        // body executes), and never removed/changed afterward.
+        unsafe { std::env::set_var("BLACKHOLE_API_TOKEN", TEST_API_TOKEN) };
     });
 }
 
@@ -93,11 +106,16 @@ async fn body_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn auth_header() -> String {
+    format!("Bearer {TEST_API_TOKEN}")
+}
+
 fn json_request(method: &str, uri: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
+        .header("authorization", auth_header())
         .body(Body::from(body.to_string()))
         .unwrap()
 }
@@ -106,6 +124,7 @@ fn get_request(uri: &str) -> Request<Body> {
     Request::builder()
         .method("GET")
         .uri(uri)
+        .header("authorization", auth_header())
         .body(Body::empty())
         .unwrap()
 }
@@ -119,6 +138,7 @@ fn signed_paid_request(uri: &str, secret: &[u8; 32], purchase_id: &str) -> Reque
         .uri(uri)
         .header("content-type", "application/json")
         .header("x-blackhole-webhook-signature", hex::encode(signature))
+        .header("authorization", auth_header())
         .body(Body::from("{}"))
         .unwrap()
 }
@@ -135,6 +155,51 @@ async fn health_check_responds_ok() {
 
     let response = app.oneshot(get_request("/health")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// A request with no `Authorization` header at all — not even a request
+/// carrying the *wrong* token, just none — must be rejected. This is the
+/// actual proof `require_bearer_token` (`server.rs`) is wired in and
+/// enforced on the router, not merely present in the source: every other
+/// test in this file goes through `get_request`/`json_request`, which
+/// always attach the correct header, so without a test like this the
+/// whole suite would pass identically whether the middleware layer was
+/// there or not.
+#[tokio::test]
+async fn requests_without_a_bearer_token_are_rejected() {
+    use_mock_keychain();
+    let dir = test_dir("no-auth");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-no-auth");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .header("authorization", "Bearer wrong-token-entirely")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// Exercises the full multi-account lifecycle end to end: create an
@@ -228,6 +293,7 @@ async fn multi_account_profiles_are_isolated_and_switchable() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/profiles/{default_id}"))
+                .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -985,6 +1051,7 @@ async fn local_auth_totp_enrollment_and_verification() {
             Request::builder()
                 .method("DELETE")
                 .uri("/local-auth/totp")
+                .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1088,6 +1155,7 @@ async fn groups_round_trip_create_add_remove_and_self_test() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/groups/{group_id}/members/c1"))
+                .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1299,6 +1367,7 @@ async fn groups_survive_a_daemon_restart_via_the_http_api() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/groups/{group_id}/members/c2"))
+                .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1487,6 +1556,7 @@ async fn file_attachment_upload_list_and_download_round_trip() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/attachments/{content_hash}"))
+                .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1773,6 +1843,7 @@ async fn cosmetics_catalog_purchase_and_equip_round_trip() {
             Request::builder()
                 .method("DELETE")
                 .uri("/cosmetics/equipped/banner")
+                .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3510,4 +3581,340 @@ async fn calls_start_accept_complete_screen_share_and_hangup_round_trip() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// The capstone test for real `bh-network` wiring (`message_crypto.rs`/
+/// `message_receive.rs`): two independent `AppState`s, each with its own
+/// real identity and its own real `SupervisedNetwork` (two genuinely
+/// separate libp2p nodes, dialed together exactly like two daemon
+/// processes on a LAN would be), send a `Direct` message from A to B with
+/// no shared process state whatsoever — A's daemon never touches B's
+/// database or B's `IdentityKeyPair`. The message travels as real X3DH +
+/// Double Ratchet ciphertext through A's `send_message` HTTP call, over a
+/// real Kademlia mailbox push/pull between the two nodes, and is only
+/// ever plaintext again once B's receive loop decrypts it. If any layer
+/// (recipient-key-hash derivation, prekey bundle publish/fetch, sealed
+/// sender, the ratchet handshake, associated-data agreement) were wrong,
+/// this test would hang until timeout or assert on the wrong body — it
+/// does not take the crypto's correctness on faith the way a same-process
+/// shadow-session test (`device_sync.rs`'s, `groups.rs`'s) necessarily
+/// does.
+///
+/// Needs a genuine multi-thread runtime (unlike every other test in this
+/// file): the default single-threaded `#[tokio::test]` runs this test's
+/// many blocking SQLCipher/crypto operations (profile creation, identity
+/// bootstrap, X3DH+PQ handshakes) on the *same* thread that has to poll
+/// each `Node`'s background swarm event loop, which can starve it long
+/// enough for an in-flight Kademlia query to spuriously fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_message_travels_a_real_network_between_two_daemons_and_decrypts() {
+    use_mock_keychain();
+
+    let dir_a = test_dir("e2e-network-a");
+    let manager_a = ProfileManager::new(&dir_a, "bh-api-smoke-e2e-a");
+    let profile_a = manager_a.create_profile("A", 0).unwrap();
+    let session_a = open_profile_session(&manager_a, &profile_a.id, true);
+    let network_a = bh_network::supervised::SupervisedNetwork::spawn(
+        "/ip4/127.0.0.1/tcp/0",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let state_a = Arc::new(AppState::new(manager_a, session_a).with_network(network_a));
+    let app_a = ApiServer::router(state_a.clone());
+
+    let dir_b = test_dir("e2e-network-b");
+    let manager_b = ProfileManager::new(&dir_b, "bh-api-smoke-e2e-b");
+    let profile_b = manager_b.create_profile("B", 0).unwrap();
+    let session_b = open_profile_session(&manager_b, &profile_b.id, true);
+    let network_b = bh_network::supervised::SupervisedNetwork::spawn(
+        "/ip4/127.0.0.1/tcp/0",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let state_b = Arc::new(AppState::new(manager_b, session_b).with_network(network_b));
+    let app_b = ApiServer::router(state_b.clone());
+
+    // Real daemons need a bootstrap-node list to find each other; this
+    // test dials directly, same shortcut `dht.rs`/`mailbox.rs`'s own
+    // `connected_pair()` test helpers use. Only one direction — identify
+    // reciprocates the routing-table entry on both sides over the same
+    // connection; a second, opposite-direction dial on top of an
+    // already-connected peer was observed to confuse libp2p's connection
+    // bookkeeping enough to make `put_record` fail every time.
+    let a_addr = state_a
+        .network
+        .as_ref()
+        .unwrap()
+        .listen_addrs()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .with_p2p(state_a.network.as_ref().unwrap().peer_id())
+        .unwrap();
+    state_b
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(a_addr)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let identity_a: Value = body_json(
+        app_a
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let identity_b: Value = body_json(
+        app_b
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let signing_a = identity_a["public_signing_key"].as_str().unwrap();
+    let agreement_a = identity_a["public_agreement_key"].as_str().unwrap();
+    let signing_b = identity_b["public_signing_key"].as_str().unwrap();
+    let agreement_b = identity_b["public_agreement_key"].as_str().unwrap();
+
+    // Started *before* A sends anything: B must publish its own prekey
+    // bundle (this loop's per-tick side effect, see
+    // `message_receive.rs::receive_tick`) before A can establish a
+    // session with B at all — nothing else in this test triggers that
+    // publish for B, since B never calls `send_message` itself. Also
+    // creates B's incoming conversation with A once the message arrives,
+    // later in this test.
+    bh_api::message_receive::spawn_receive_loop(state_b.clone(), Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Each side adds the other as a contact — same convention the desktop
+    // client uses (`contact_id` = the other party's signing key hex,
+    // `identity_public_key` = signing || agreement hex, concatenated).
+    let response = app_a
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/contacts",
+            json!({
+                "contact_id": signing_b,
+                "identity_public_key": format!("{signing_b}{agreement_b}"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = app_b
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/contacts",
+            json!({
+                "contact_id": signing_a,
+                "identity_public_key": format!("{signing_a}{agreement_a}"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let conversation: Value = body_json(
+        app_a
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/conversations",
+                json!({"contact_id": signing_b}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let conversation_id = conversation["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Same shortcut every other real-network test in this workspace takes
+    // (`mailbox.rs`'s `publish_with_retry`, `dht.rs`'s own retry loop): a
+    // freshly-dialed 2-node Kademlia routing table can take a few round
+    // trips to converge enough for a `put_record`/`get_record` to
+    // succeed, so B's bundle publish and/or A's fetch of it may
+    // transiently fail the first few tries even though nothing is
+    // actually broken.
+    let mut send_status = StatusCode::SERVICE_UNAVAILABLE;
+    for attempt in 0..30 {
+        let response = app_a
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/conversations/{conversation_id}/messages"),
+                json!({"body": "hello over the real network"}),
+            ))
+            .await
+            .unwrap();
+        send_status = response.status();
+        if send_status == StatusCode::OK {
+            break;
+        }
+        assert!(attempt < 29, "send_message never succeeded after retries");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        send_status,
+        StatusCode::OK,
+        "send_message over a live network must succeed, not just store locally"
+    );
+
+    // B has no conversation with A yet at all — the receive loop (already
+    // running, started above) must create one
+    // (`ensure_direct_conversation`), not just insert a message into a
+    // pre-existing one.
+    let mut found_body = None;
+    for _ in 0..100 {
+        let conversations: Value = body_json(
+            app_b
+                .clone()
+                .oneshot(get_request("/conversations"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if let Some(conv) = conversations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["contact_id"] == json!(signing_a))
+        {
+            let conv_id = conv["conversation_id"].as_str().unwrap();
+            let messages: Value = body_json(
+                app_b
+                    .clone()
+                    .oneshot(get_request(&format!("/conversations/{conv_id}/messages")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if let Some(msg) = messages.as_array().unwrap().first() {
+                found_body = msg["body"].as_str().map(str::to_string);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        found_body,
+        Some("hello over the real network".to_string()),
+        "B's receive loop must have decrypted and stored A's real message within the poll window"
+    );
+}
+
+/// Verifies the "first event is otherwise always missed" fix
+/// (`CallRegistry::record_event`/`subscribe_with_current_state`,
+/// `call_stream.rs`'s `handle_socket`): a real WebSocket client that opens
+/// `GET /calls/:call_id/ws` *after* `complete_call` already published
+/// `Connected` still receives that event as its very first message,
+/// instead of waiting forever for an event that already happened —
+/// `tokio::sync::broadcast::Sender::send` only reaches receivers that
+/// already exist at send time, and no real client could possibly have
+/// subscribed before the HTTP response that triggered the event even
+/// returned.
+///
+/// Needs a real TCP listener (unlike every other test in this file, which
+/// drives the router in-process via `tower::ServiceExt::oneshot`) — a
+/// WebSocket upgrade needs an actual bidirectional IO stream to hand off
+/// to, which the mocked `oneshot` request/response cycle can't provide.
+/// The signaling calls (`/calls`, `/calls/incoming`, `/calls/:id/complete`)
+/// still go through `oneshot` against the same router — its `AppState` is
+/// the same `Arc` the real listener serves, so both views see the same
+/// call registry.
+#[tokio::test]
+async fn call_ws_replays_the_last_known_state_to_a_late_subscriber() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    use_mock_keychain();
+    let dir = test_dir("call-ws");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-call-ws");
+    let profile = manager.create_profile("A", 0).unwrap();
+    let session = open_profile_session(&manager, &profile.id, true);
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_app = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, serve_app).await.unwrap();
+    });
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/calls",
+            json!({"call_id": "ws-call-1", "video": false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let offer = body_json(response).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/calls/incoming",
+            json!({"offer": offer["signal"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let answer = body_json(response).await;
+
+    // `complete_call` records `Connected` synchronously, strictly before
+    // this test ever attempts to open the WebSocket below — exactly the
+    // race `subscribe_with_current_state` exists to close.
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/calls/ws-call-1/complete",
+            json!({"answer": answer["signal"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Same `require_bearer_token` gate as every other route (server.rs) —
+    // a plain URL has no way to carry it, so build the handshake request
+    // by hand and attach it, same as `call_stream_bridge.rs`'s real client
+    // does.
+    let url = format!("ws://{addr}/calls/ws-call-1/ws");
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("Authorization", auth_header().parse().unwrap());
+    let (mut ws, _response) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("timed out waiting for the replayed Connected event")
+        .expect("stream ended before any message arrived")
+        .unwrap();
+    let text = match first {
+        WsMessage::Text(text) => text,
+        other => panic!("expected a text frame carrying the Connected event, got {other:?}"),
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event, json!({"type": "connected"}));
+
+    ws.close(None).await.unwrap();
 }

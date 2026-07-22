@@ -18,10 +18,11 @@ structural property of the protocol.
 
 ## Status
 
-**Core protocol logic is implemented and tested (285 tests across
+**Core protocol logic is implemented and tested (328 tests across
 `bh-crypto`/`bh-network`/`bh-storage`/`bh-files`/`bh-api`/`bh-calls`/
-`bh-push-relay`), and the desktop client is now a real, end-to-end wired
-product UI — but there is still no live P2P network deployment.**
+`bh-push-relay`), and the desktop client is a real, end-to-end wired
+product UI with calls (1:1/group/screen-share) fully usable — but there
+is still no deployed public P2P network.**
 Concretely:
 
 | Piece | State |
@@ -29,19 +30,19 @@ Concretely:
 | Identity, X3DH + Double Ratchet (1:1 sessions) | ✅ Implemented, tested — **PQ hybrid now integrated into live sessions** (see below) |
 | MLS groups (via `openmls`), incl. broadcast channels | ✅ Implemented, tested — state now **survives a daemon restart** |
 | Post-quantum hybrid handshake (X25519 + ML-KEM-768) | ✅ Implemented, tested, **and wired into every real X3DH session** — not just a standalone primitive anymore |
-| Key Transparency (RFC 6962 Merkle proofs) | 🟡 Client-side primitive implemented, tested — no gossiped log deployed yet, so MITM detection in practice is still manual-verification-only |
+| Key Transparency (RFC 6962 Merkle proofs) | ✅ Client-side primitive implemented, tested — **now extended with SignedTreeHead/verify_tree_head**; identities publish their own tree head over the DHT every 10 minutes, best-effort corroboration alongside safety-number verification (THREAT_MODEL.md §3.1) |
 | Onion routing (3+ hop circuits) | ✅ Implemented, tested — packet-size **bucketed/padded** (mitigated, not eliminated), see below |
-| Kademlia DHT, node selection, Sybil/Eclipse resistance | ✅ Implemented, tested against local multi-node scenarios |
-| Mailboxes (store-and-forward) + sealed sender | ✅ Implemented, tested — manifest race now closed (read-merge-write-verify retry); PoW now enforced server-side |
+| Kademlia DHT, node selection, Sybil/Eclipse resistance | ✅ Implemented, tested against local multi-node scenarios — **now with routing-table admission control per subnet** (max 4 peers per /24 IPv4 or /48 IPv6, THREAT_MODEL.md §3.5) |
+| Mailboxes (store-and-forward) + sealed sender | ✅ Implemented, tested — manifest race now closed (read-merge-write-verify retry + jittered backoff); PoW now enforced server-side |
 | Cover traffic, anti-spam PoW | ✅ Implemented, tested, **PoW now verified server-side by mailbox nodes** |
-| `bh-network` spawned by the daemon | 🟡 Listening and supervised (auto-respawns on the live `yamux` CVE panic) — **still not wired into message send/receive**, `bh-api` talks to the local DB directly |
-| Local encrypted storage (SQLCipher), OS keystore, panic wipe | ✅ Implemented, tested — optional PIN layer in front of the DB key |
-| File chunking, per-chunk E2EE, resumable download | ✅ Implemented, tested |
-| Daemon localhost API (`bh-api`) | ✅ ~90 real endpoints across 28 modules, verified via live HTTP smoke tests + an in-process integration suite |
-| Desktop client (Tauri) | ✅ Real product UI ("Event Horizon") — see [Feature set](#feature-set) below for the full list |
-| Voice/video calls, 1:1 (`bh-calls`) | ✅ Real WebRTC + SFrame media encryption, tested — no STUN/TURN yet, no client UI yet |
-| Group calls (full-mesh, MLS-exporter-keyed) | ✅ Implemented, tested — same STUN/TURN and client-UI gap as 1:1 |
-| Screen sharing (same VP8/SFrame pipeline as camera) | ✅ Implemented, tested — same STUN/TURN and client-UI gap |
+| `bh-network` spawned by the daemon | ✅ Listening and supervised (auto-respawns on the live `yamux` CVE panic) — **now wired into Direct message send/receive**: `bh-api::message_crypto::send_encrypted_over_network` does real X3DH/Double Ratchet + mailbox push; `message_receive::spawn_receive_loop` polls/decrypts/delivers; proven by a genuine two-daemon integration test (`bh-api/tests/api_smoke.rs::direct_message_travels_a_real_network_between_two_daemons_and_decrypts`). **Group conversations not wired yet** — MLS fan-out via `Mailbox::fan_out` is a separate follow-up. |
+| Local encrypted storage (SQLCipher), OS keystore, panic wipe | ✅ Implemented, tested — optional PIN layer in front of the DB key, **now also reachable via a WebAuthn passkey's PRF-derived secret** (hardware-backed, not TOTP — THREAT_MODEL.md §3.7) |
+| File chunking, per-chunk E2EE, resumable download | ✅ Implemented, tested — **attachments now swept by the disappearing-message timer** (expiry sweeper deletes orphaned chunk directories from disk, not just DB rows) |
+| Daemon localhost API (`bh-api`) | ✅ ~90 real endpoints across 28 modules, verified via live HTTP smoke tests + an in-process integration suite — **now with bearer-token auth** (`Authorization: Bearer <token>`, token in 0600 file, THREAT_MODEL.md §3.9) |
+| Desktop client (Tauri) | ✅ Real product UI ("Event Horizon") — see [Feature set](#feature-set) below for the full list — **now with full calls UI** (1:1 audio/video/screen-share, group audio, VP8 decode via WebCodecs, `Vp8CanvasRenderer` in `calls.ts`) |
+| Voice/video calls, 1:1 (`bh-calls`) | ✅ Real WebRTC + SFrame media encryption, tested — no STUN/TURN yet, **client UI now exists** (Tauri event bridge for `/calls/:call_id/ws`, `call_stream_bridge.rs`) |
+| Group calls (full-mesh, MLS-exporter-keyed) | ✅ Implemented, tested — same STUN/TURN gap, **client UI now exists** (audio-only participant grid, `MAX_GROUP_CALL_PARTICIPANTS = 6`) |
+| Screen sharing (same VP8/SFrame pipeline as camera) | ✅ Implemented, tested — same STUN/TURN gap, **client UI now exists** (parallel "screen" track, same VP8 decode path) |
 | Device sync (keep a linked device's history current) | ✅ Real X3DH/Double Ratchet round-trip — peer is a locally-simulated shadow device, not a real second process yet |
 | Cosmetics store, sticker packs | ✅ Implemented, tested — payment *confirmation* deliberately requires a real BTCPay webhook, not reachable from the client |
 | Opaque wake-push relay (`bh-push-relay`) | ✅ New, separate, internet-facing binary — real register/wake contract, tested; not yet wired to a real APNs/FCM/UnifiedPush backend or to the daemon's mailbox code |
@@ -55,7 +56,9 @@ Concretely:
 (`.github/workflows/ci.yml`). **Nothing here has been through independent
 security review.** Treat every claim below as "implements the intended
 design, unreviewed" — see `docs/THREAT_MODEL.md` for the honest per-module
-breakdown, especially the onion routing module and the calls media path.
+breakdown, especially the onion routing module, the calls media path, and
+the `bh-network` integration (now live for `Direct` messages, not yet for
+`Group`).
 
 ---
 
@@ -198,6 +201,7 @@ before group calls/screen sharing were added — see
 | Device linking (local simulation) | ✅ | `bh-api::device_link` |
 | **Device sync** (keep a linked device's history current) | ✅ | `bh-api::device_sync` |
 | Passkey/TOTP local unlock | ✅ | `bh-api::local_auth` |
+| **Database lock via WebAuthn PRF** (gates daemon spawn, not just UI) | ✅ | `client/desktop/src-tauri/src/daemon_lifecycle.rs`, `prf_unlock.rs` |
 | Groups (MLS) | ✅ | `bh-api::groups`, `bh-crypto::mls` |
 | **Broadcast channels** (owner-only posting) | ✅ | `bh-api::groups`/`conversations` (`broadcast_only`) |
 | **Notes to self** (local-only, no session) | ✅ | `bh-storage::conversations::ensure_self_conversation` |
@@ -210,9 +214,9 @@ before group calls/screen sharing were added — see
 | **Opt-in client-side link previews** | ✅ | `client/desktop/src-tauri/src/link_preview.rs` |
 | **Opt-in wake-push registration** | ✅ | `bh-api::push`, `crates/bh-push-relay` |
 | Panic wipe, PIN-locked DB key | ✅ | `bh-api::{panic_wipe,security}` |
-| Voice/video calls, 1:1 | ❌ backend only | `bh-calls::session` |
-| **Group calls** (full-mesh, MLS-exporter-keyed) | ❌ backend only | `bh-calls::group` |
-| **Screen sharing** | ❌ backend only | `bh-calls::screen` |
+| Voice/video calls, 1:1 | ✅ | `bh-calls::session`, `bh-api::call_stream`, `client/desktop/src/calls.ts` |
+| **Group calls** (full-mesh, MLS-exporter-keyed) | ✅ | `bh-calls::group`, `bh-api::calls` |
+| **Screen sharing** | ✅ | `bh-calls::screen`, `bh-api::calls` |
 | Crypto payment requests in chat | ✅ | `bh-api::payment_requests` |
 | Moderation (block, message requests, reports) | ✅ | `bh-api::moderation` |
 
@@ -290,10 +294,11 @@ crates/
                          groups incl. broadcast channels, file/voice
                          attachments, cosmetics/stickers, presence, push,
                          search, call signaling incl. group + screen-share,
-                         network status) — all backed by `bh-storage`/
-                         `bh-crypto`/`bh-calls`/`bh-files`, verified
-                         end-to-end via live HTTP smoke tests plus an
-                         in-process integration suite. (SPEC.md §6, §15-16)
+                         network status, **message crypto over bh-network
+                         for Direct conversations**) — all backed by
+                         `bh-storage`/`bh-crypto`/`bh-calls`/`bh-files`,
+                         verified end-to-end via live HTTP smoke tests plus
+                         an in-process integration suite. (SPEC.md §6, §15-17)
 
   bh-calls/             Voice/video calls: real WebRTC (ICE/DTLS/SRTP) +
                          independent SFrame media encryption. (SPEC.md §15)
@@ -319,12 +324,14 @@ client/
                          conversations/messages incl. editing, reactions,
                          receipts, safety numbers, invites, export/import,
                          multi-profile, device linking + sync, local-auth,
-                         groups incl. broadcast channels, notes to self,
-                         file/voice attachments, local search, cosmetics
-                         store + stickers, typing presence, link previews,
-                         wake-push toggle, panic wipe. Calls (1:1/group/
-                         screen-share) have real backend support but no UI
-                         yet — needs STUN/TURN first.
+                         **Database lock via WebAuthn PRF** (gates daemon
+                         spawn), groups incl. broadcast channels, notes to
+                         self, file/voice attachments, local search,
+                         cosmetics store + stickers, typing presence, link
+                         previews, wake-push toggle, panic wipe. **Calls
+                         (1:1/group/screen-share) now have full UI**:
+                         in-call overlay, VP8 decode via WebCodecs,
+                         camera/screen-share toggle, audio-only group grid.
       src/api.ts             typed request/response surface for daemon_call
       src/link_preview.ts      client-side-only link preview fetch/parse/render
       src-tauri/src/link_preview.rs  the Tauri command backing it (bypasses the daemon)
@@ -340,11 +347,18 @@ docs/
 
 ---
 
-## How a message travels (1:1, target design)
+## How a message travels (1:1, **now live**)
 
 This is the intended end-to-end flow once `bh-network` is wired into the
-daemon. Every stage below already exists as tested code; what's pending is
-the daemon calling into it on the send/receive path.
+daemon. **For `Direct` conversations, this is no longer aspirational**:
+`bh-api::conversations::send_message` runs a real X3DH + Double Ratchet
+handshake (PQ-hybrid, X25519 + ML-KEM-768), wraps the ciphertext in a
+sealed-sender envelope, pushes it to the recipient's Kademlia mailbox via
+`bh-network`, and a background loop (`message_receive::spawn_receive_loop`)
+polls/decrypts/delivers. Proven by a genuine two-daemon integration test
+(`bh-api/tests/api_smoke.rs::direct_message_travels_a_real_network_between_two_daemons_and_decrypts`)
+— not a same-process shadow session. **`Group` conversations still aren't
+wired** — MLS fan-out via `Mailbox::fan_out` is a separate follow-up.
 
 ```mermaid
 sequenceDiagram
@@ -422,8 +436,12 @@ no new attack surface beyond "the pixels shown are now the pixels sent,"
 which is the client's job to make an obvious, deliberate user action.
 
 Both group calls and screen sharing have complete, tested backend support
-today but **no client UI yet** — the same gap 1:1 calls already had before
-either was built (needs STUN/TURN first; see [Status](#status)).
+**and a full client UI today** — the Tauri event bridge
+(`call_stream_bridge.rs`) dials the daemon's `/calls/:call_id/ws`
+WebSocket (which the webview can't open directly due to its `Origin`
+header), relays events/frames to the webview, and `calls.ts`'s
+`Vp8CanvasRenderer` decodes VP8 via WebCodecs. **Same STUN/TURN gap
+remains**: peers must be able to reach each other directly.
 
 ---
 
@@ -511,13 +529,17 @@ graph LR
 **⚠️ Known open risk, mitigated but not eliminated — onion packet-size
 leak.** Packets are now length-prefixed and padded to the nearest of a
 fixed set of size buckets at every hop, so same-bucket payloads of
-different real sizes become indistinguishable on the wire. Unlike Sphinx
-(constant packet size end-to-end), this is bucketing, not perfectly
-constant size: two payloads straddling a bucket boundary — or one larger
-than every bucket — are still distinguishable, and packet-shrinkage
-patterns can still leak coarse position-in-circuit information. Still the
-single most consequential unresolved gap in the codebase today — see
-`docs/THREAT_MODEL.md` §3.4.
+different real sizes become indistinguishable on the wire. The bucket
+ladder was later refined from a coarse 2x-doubling table topping out at
+64KiB to a finer ~1.5x progression extended up to 1MiB, and the fallback
+stride for anything still bigger dropped from a full extra bucket to a
+quarter of one — real, tested reductions in both average padding overhead
+and how coarse the size categories are. Unlike Sphinx (constant packet size
+end-to-end), this is bucketing, not perfectly constant size: two payloads
+straddling a bucket boundary — or one larger than every bucket — are still
+distinguishable, and packet-shrinkage patterns can still leak coarse
+position-in-circuit information. Still the single most consequential
+unresolved gap in the codebase today — see `docs/THREAT_MODEL.md` §3.4.
 
 ---
 
@@ -562,14 +584,21 @@ single most consequential unresolved gap in the codebase today — see
   rate-limited, proof-of-work-gated, DHT-distributed lookup — never a
   centralized, always-on directory.
 - **Key verification**: safety-number / QR verification between contacts
-  (Signal-style) is the real trust anchor today, not the display name.
-  Complemented in the target design by a **Key Transparency** log —
-  `bh-crypto::key_transparency` implements the RFC 6962 Merkle tree
-  hash/inclusion/consistency-proof primitives from scratch, exhaustively
-  tested including tampered-proof and rewritten-history negative cases,
-  but nothing gossips signed tree heads yet — it's a tested building
-  block, not a deployed defense. MITM detection in practice is still
-  manual-verification-only.
+   (Signal-style) is the real trust anchor today, not the display name.
+   **Now complemented by Key Transparency gossip**: `bh-crypto::key_transparency`
+   implements RFC 6962 Merkle tree hash/inclusion/consistency-proof
+   primitives from scratch, exhaustively tested including tampered-proof
+   and rewritten-history negative cases, **now extended with
+   SignedTreeHead/sign_tree_head/verify_tree_head** — an identity signs
+   its own tree head with its long-term signing key and publishes it over
+   the DHT every 10 minutes (`bh_network::tree_head`). `get_safety_number`
+   returns `key_transparency_corroborated`: best-effort fetch-and-verify
+   of the contact's published tree head, **additional evidence alongside**
+   (never replacing) manual out-of-band comparison. **Residual gap**: this
+   only detects a contact silently getting handed a *different* key over
+   the network — if the caller and the contact end up talking to disjoint,
+   partitioned network views, gossip alone can't detect that (same caveat
+   as any CT-style design without independent monitors).
 - **Multi-device**: new devices link via QR scan against an already
   authenticated device; private keys are never uploaded in the clear to
   any server. Users can see and instantly revoke any linked device. Once
@@ -677,14 +706,18 @@ total; most of the earliest-identified ones are now FIXED/MITIGATED, kept
 in the numbered list with that status rather than renumbered, so
 cross-references stay stable). The genuinely still-**open** ones today:
 
-1. **Onion routing packet-size leak** — mitigated (bucketed/padded sizes),
+1. **Onion routing packet-size leak** — mitigated (bucketed/padded sizes
+   with a finer ~1.5x ladder up to 1MiB + quarter-bucket fallback stride),
    not eliminated: two payloads straddling a bucket boundary are still
    distinguishable (§3.4).
 2. **`yamux` remote-panic CVE-2026-32314** — the node auto-respawns on
    crash now (`bh_network::supervised`), but the underlying panic is still
    open, blocked on an upstream `rust-libp2p` release (§3.10).
-3. **No Key Transparency deployment** — the RFC 6962 primitive is real and
-   tested; nothing gossips signed tree heads yet (§3.1).
+3. **Key Transparency gossip is deployed, not monitored**: identities
+   publish their own tree heads over the DHT every 10 minutes, and
+   `get_safety_number` does best-effort fetch-and-verify — but there are
+   no independent monitors cross-checking different network views, so a
+   partitioned MITM isn't caught by gossip alone (§3.1).
 4. **`glib` GTK vulnerability** — dormant until a Linux build ships (§3.10).
 5. **Calls have no STUN/TURN or anonymity properties** — applies equally
    to 1:1, group calls, and screen sharing (§3.11/§3.12).
@@ -696,23 +729,36 @@ cross-references stay stable). The genuinely still-**open** ones today:
    unauthenticated** — inherent to the concept, off by default (§3.12).
 8. **Device sync's crypto is real, its peer is not** — same simulated-peer
    caveat as device linking and groups' shadow members (§3.12).
-9. **Broadcast-channel posting restriction lives in one function, not
-   structurally** — same pattern already accepted for invite-token
-   consumption (§3.12).
+9. **Broadcast-channel posting restriction lives in two places
+   (API + storage), not structurally** — same pattern already accepted for
+   invite-token consumption (§3.12).
 10. **File attachments have no resumability** — swept by the
     disappearing-message timer now, but uploads are still fully
     synchronous with nothing to resume without a live `bh-network` peer
     (§3.11).
 11. **Device linking and device sync are same-daemon simulations**, not
     real cross-device/cross-process behavior yet (§3.11/§3.12).
+12. **`Group` conversations not wired to `bh-network`** — `Direct` messages
+    travel over the real P2P network (proven by a two-daemon integration
+    test), but MLS fan-out via `Mailbox::fan_out` hasn't been connected
+    yet (§17, `message_crypto.rs` module doc).
 
 Several other historically-tracked items are now **FIXED**: PQ hybrid is
 integrated into every live X3DH session (was #4 above), PoW is verified
 server-side by mailbox nodes (was #5), an opt-in PIN layer now sits in
-front of the SQLCipher key (was #6), MLS group state survives a daemon
-restart (was #7), and the mailbox manifest race is closed via
-read-merge-write-verify retry — see `docs/THREAT_MODEL.md` §4 for the full
-list with what specifically closed each one.
+front of the SQLCipher key with a **WebAuthn PRF path** that genuinely
+gates daemon spawn (was #6), MLS group state survives a daemon restart
+(was #7), the mailbox manifest race is closed via read-merge-write-verify
+retry + jittered backoff (was #8), **Direct messages now travel over the
+real P2P network** with a two-daemon integration test proving it (was #9),
+DHT routing-table admission is now bounded per subnet (was #10), the
+daemon API now requires bearer-token auth (was #11), the expiry sweeper
+now follows profile switches and deletes orphaned file chunks (was #12),
+broadcast-channel enforcement now lives at two independent layers (was
+#13), **calls have a full client UI** with VP8 decode via WebCodecs (was
+#14), and link previews now have an SSRF guard + explicit toggle copy (was
+#15) — see `docs/THREAT_MODEL.md` §4 for the full list with what
+specifically closed each one.
 
 None of these are hidden — each is called out in the relevant module's own
 doc comments. This section (and the doc it summarizes) exists to make the

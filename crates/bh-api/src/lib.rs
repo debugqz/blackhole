@@ -2,6 +2,8 @@
 //! never talks to the P2P network directly — only to this daemon, over
 //! localhost. See `docs/SPEC.md` §6.
 
+pub mod call_audio;
+pub mod call_stream;
 pub mod calls;
 pub mod contacts;
 pub mod conversations;
@@ -14,6 +16,8 @@ pub mod groups;
 pub mod identity;
 pub mod invites;
 pub mod local_auth;
+pub mod message_crypto;
+pub mod message_receive;
 pub mod moderation;
 pub mod network;
 pub mod panic_wipe;
@@ -29,6 +33,7 @@ pub mod security;
 pub mod server;
 pub mod state;
 pub mod stickers;
+pub mod tree_head;
 
 pub use server::ApiServer;
 pub use state::AppState;

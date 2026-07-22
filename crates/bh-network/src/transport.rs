@@ -22,6 +22,7 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::routing_admission::RoutingAdmission;
 use crate::NetworkError;
 
 const PROTOCOL_VERSION: &str = "/blackhole/0.1.0";
@@ -72,6 +73,14 @@ impl Node {
             .with_tcp(
                 tcp::Config::default(),
                 noise::Config::new,
+                // `libp2p_yamux::Config::default()` resolves to the fixed
+                // 0.13.10 yamux core, not the vulnerable 0.12.1 one
+                // `libp2p-yamux` also bundles for legacy API compatibility
+                // — see docs/THREAT_MODEL.md §3.10 for the verified
+                // finding. Do not add any `yamux::WindowUpdateMode`-based
+                // config here; that's the only API surface that switches
+                // to the vulnerable core, and it's `#[deprecated]`
+                // upstream so CI's `-D warnings` would already catch it.
                 yamux::Config::default,
             )
             .map_err(|e| NetworkError::Setup(e.to_string()))?
@@ -118,9 +127,12 @@ impl Node {
     }
 
     /// `false` once the background swarm event loop has stopped running —
-    /// e.g. after an unrecoverable panic inside `libp2p`/`yamux` itself
-    /// (see the yamux CVE in `docs/THREAT_MODEL.md` §3.10: a crafted
-    /// inbound frame can panic `libp2p-yamux`'s internal state machine).
+    /// e.g. after an unrecoverable panic inside `libp2p` itself (this
+    /// used to cite the yamux CVE, docs/THREAT_MODEL.md §3.10, as the
+    /// motivating example — corrected: that specific bug isn't reachable
+    /// through the yamux core this node actually runs, see the comment on
+    /// `yamux::Config::default` above; this check guards against any
+    /// future panic in the event loop, not that one specifically).
     /// A `tokio::spawn`ed task panicking doesn't crash the process, but it
     /// does drop everything the task owned — including `command_rx` here
     /// — which is exactly what this checks: `mpsc::Sender::is_closed` is
@@ -191,6 +203,7 @@ async fn run_event_loop(mut swarm: Swarm<Behaviour>, mut command_rx: mpsc::Recei
     let mut listen_addr_waiters: Vec<oneshot::Sender<Vec<Multiaddr>>> = Vec::new();
     let mut pending_get: PendingGetRecord = HashMap::new();
     let mut pending_put: PendingPutRecord = HashMap::new();
+    let mut routing_admission = RoutingAdmission::new();
 
     loop {
         tokio::select! {
@@ -202,6 +215,7 @@ async fn run_event_loop(mut swarm: Swarm<Behaviour>, mut command_rx: mpsc::Recei
                     &mut listen_addr_waiters,
                     &mut pending_get,
                     &mut pending_put,
+                    &mut routing_admission,
                 );
             }
             command = command_rx.recv() => {
@@ -248,6 +262,7 @@ fn handle_swarm_event(
     listen_addr_waiters: &mut Vec<oneshot::Sender<Vec<Multiaddr>>>,
     pending_get: &mut PendingGetRecord,
     pending_put: &mut PendingPutRecord,
+    routing_admission: &mut RoutingAdmission,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -261,8 +276,16 @@ fn handle_swarm_event(
             info,
             ..
         })) => {
+            // Routing-table admission control (docs/THREAT_MODEL.md §3.5):
+            // don't let one address block flood the table with Sybil peer
+            // ids. This is the only place peers get into Kademlia's
+            // routing table at all, so it's the right — and only —
+            // interception point, rather than wrapping the whole
+            // `NetworkBehaviour`.
             for addr in info.listen_addrs {
-                swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                if routing_admission.try_admit(peer_id, &addr) {
+                    swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                }
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {

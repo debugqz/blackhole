@@ -7,7 +7,7 @@ use rusqlite::Connection;
 
 use crate::StorageError;
 
-pub const CURRENT_VERSION: i64 = 14;
+pub const CURRENT_VERSION: i64 = 15;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS own_identity (
@@ -425,6 +425,31 @@ BEGIN
 END;
 "#;
 
+// v15 adds this identity's own long-term X3DH prekey material (SPEC.md
+// §2.1/§5.3): a single non-rotating signed prekey plus a hybrid PQ prekey,
+// generated once (lazily, on first use — see
+// `crates/bh-api/src/conversations.rs`) and persisted here so a contact
+// who fetches this identity's published `PreKeyBundle` from the network
+// after a daemon restart still gets a bundle this daemon can actually
+// respond to. Single-row, same pattern as `own_identity`/
+// `push_registration`. Deliberate v1 simplification, documented rather than
+// hidden: one signed prekey that never rotates and no one-time prekeys —
+// forward secrecy still comes from the Double Ratchet itself once a
+// session is established; what's given up is Signal's *extra* protection
+// against a single compromised prekey being reused across many first
+// contacts. A real prekey-rotation/replenishment scheme is a follow-up.
+const SCHEMA_V15: &str = r#"
+CREATE TABLE IF NOT EXISTS own_prekey (
+    id                      INTEGER PRIMARY KEY CHECK (id = 1),
+    signed_prekey_id        INTEGER NOT NULL,
+    signed_prekey_secret    BLOB NOT NULL,
+    signed_prekey_signature BLOB NOT NULL,
+    pq_prekey_seed          BLOB NOT NULL,
+    pq_prekey_signature     BLOB NOT NULL,
+    created_at              INTEGER NOT NULL
+);
+"#;
+
 /// Each step's DDL runs together with `PRAGMA user_version = N` for that
 /// same step. `SCHEMA_V2`/`SCHEMA_V5` contain `ALTER TABLE ... ADD COLUMN`,
 /// which is *not* idempotent (SQLite errors on a column that already
@@ -453,6 +478,7 @@ const STEPS: &[(i64, &str, bool)] = &[
     (12, SCHEMA_V12, false),
     (13, SCHEMA_V13, false),
     (14, SCHEMA_V14, false),
+    (15, SCHEMA_V15, false),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StorageError> {

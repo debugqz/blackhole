@@ -55,6 +55,29 @@ impl HybridPublicKey {
         out.extend_from_slice(self.ml_kem_encap.to_bytes().as_slice());
         out
     }
+
+    /// Inverse of [`to_bytes`](Self::to_bytes) — reconstructs a peer's
+    /// published hybrid public key from wire bytes (e.g. a `PreKeyBundle`
+    /// fetched from a mailbox/DHT record).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let x25519_bytes = bytes
+            .get(..32)
+            .ok_or(CryptoError::Malformed("hybrid public key: truncated"))?;
+        let x25519_public =
+            X25519PublicKey::from(<[u8; 32]>::try_from(x25519_bytes).expect("checked length"));
+        let ek_bytes = bytes
+            .get(32..)
+            .ok_or(CryptoError::Malformed("hybrid public key: truncated"))?;
+        let arr: ml_kem::Key<EncapsulationKey768> = ek_bytes
+            .try_into()
+            .map_err(|_| CryptoError::Malformed("hybrid public key: bad ml-kem key length"))?;
+        let ml_kem_encap = EncapsulationKey768::new(&arr)
+            .map_err(|_| CryptoError::Malformed("hybrid public key: invalid ml-kem key"))?;
+        Ok(Self {
+            x25519_public,
+            ml_kem_encap,
+        })
+    }
 }
 
 /// What the initiator sends to the responder: their ephemeral X25519
@@ -65,10 +88,70 @@ pub struct HybridCiphertext {
     pub ml_kem_ciphertext: Vec<u8>,
 }
 
+impl HybridCiphertext {
+    /// Wire bytes: the ephemeral X25519 public key, then the ML-KEM
+    /// ciphertext length-prefixed (ML-KEM's ciphertext size is fixed per
+    /// parameter set, but length-prefixing avoids hardcoding that constant
+    /// here).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 4 + self.ml_kem_ciphertext.len());
+        out.extend_from_slice(self.x25519_ephemeral_public.as_bytes());
+        out.extend_from_slice(&(self.ml_kem_ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.ml_kem_ciphertext);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let x25519_bytes = bytes
+            .get(..32)
+            .ok_or(CryptoError::Malformed("hybrid ciphertext: truncated"))?;
+        let x25519_ephemeral_public =
+            X25519PublicKey::from(<[u8; 32]>::try_from(x25519_bytes).expect("checked length"));
+        let len_bytes = bytes
+            .get(32..36)
+            .ok_or(CryptoError::Malformed("hybrid ciphertext: truncated"))?;
+        let len = u32::from_be_bytes(len_bytes.try_into().expect("checked length")) as usize;
+        let ml_kem_ciphertext = bytes
+            .get(36..36 + len)
+            .ok_or(CryptoError::Malformed("hybrid ciphertext: truncated"))?
+            .to_vec();
+        Ok(Self {
+            x25519_ephemeral_public,
+            ml_kem_ciphertext,
+        })
+    }
+}
+
 impl HybridSecretKey {
     pub fn generate() -> Self {
         let x25519_secret = X25519Secret::random();
         let (ml_kem_decap, _ml_kem_encap) = MlKem768::generate_keypair();
+        Self {
+            x25519_secret,
+            ml_kem_decap,
+        }
+    }
+
+    /// Generates a fresh key together with the compact 96-byte seed it was
+    /// derived from (32 bytes for the X25519 secret, 64 for ML-KEM's own
+    /// seed form — `DecapsulationKey::from_seed`), for callers that need
+    /// to *persist* this key (e.g. a long-term signed prekey surviving a
+    /// daemon restart) without storing ML-KEM's much larger (~2400-byte)
+    /// fully-expanded private key encoding. Use [`Self::from_seed_bytes`]
+    /// to rebuild the identical key from the returned seed later.
+    pub fn generate_with_seed() -> ([u8; 96], Self) {
+        let mut seed = [0u8; 96];
+        getrandom::fill(&mut seed).expect("getrandom failure");
+        (seed, Self::from_seed_bytes(&seed))
+    }
+
+    /// Inverse of [`Self::generate_with_seed`].
+    pub fn from_seed_bytes(seed: &[u8; 96]) -> Self {
+        let x25519_secret =
+            X25519Secret::from(<[u8; 32]>::try_from(&seed[..32]).expect("checked length"));
+        let ml_kem_seed: ml_kem::Seed =
+            ml_kem::array::Array::from(<[u8; 64]>::try_from(&seed[32..]).expect("checked length"));
+        let ml_kem_decap = DecapsulationKey768::from_seed(ml_kem_seed);
         Self {
             x25519_secret,
             ml_kem_decap,
@@ -164,5 +247,41 @@ mod tests {
 
         let responder_secret = hybrid_decapsulate(&responder_key, &ciphertext).unwrap();
         assert_ne!(initiator_secret, responder_secret);
+    }
+
+    #[test]
+    fn hybrid_public_key_roundtrips_through_bytes() {
+        let secret = HybridSecretKey::generate();
+        let public = secret.public_key();
+        let decoded = HybridPublicKey::from_bytes(&public.to_bytes()).unwrap();
+        assert_eq!(decoded.to_bytes(), public.to_bytes());
+    }
+
+    #[test]
+    fn hybrid_ciphertext_roundtrips_through_bytes() {
+        let responder_key = HybridSecretKey::generate();
+        let (secret, ciphertext) = hybrid_encapsulate(&responder_key.public_key()).unwrap();
+        let decoded = HybridCiphertext::from_bytes(&ciphertext.to_bytes()).unwrap();
+        let decoded_secret = hybrid_decapsulate(&responder_key, &decoded).unwrap();
+        assert_eq!(secret, decoded_secret);
+    }
+
+    #[test]
+    fn hybrid_secret_key_rebuilt_from_seed_bytes_behaves_identically() {
+        let (seed, original) = HybridSecretKey::generate_with_seed();
+        let rebuilt = HybridSecretKey::from_seed_bytes(&seed);
+
+        // Same public key...
+        assert_eq!(
+            original.public_key().to_bytes(),
+            rebuilt.public_key().to_bytes()
+        );
+
+        // ...and the rebuilt key can decapsulate a ciphertext produced
+        // against the original's public key, proving it's really the same
+        // private key, not just a coincidentally-matching public half.
+        let (secret, ciphertext) = hybrid_encapsulate(&original.public_key()).unwrap();
+        let decapsulated = hybrid_decapsulate(&rebuilt, &ciphertext).unwrap();
+        assert_eq!(secret, decapsulated);
     }
 }

@@ -1,0 +1,26 @@
+[package]
+name = "bh-crypto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Standalone from the main workspace, matching cargo-fuzz's own
+# convention — fuzz targets need a nightly toolchain + sanitizer flags the
+# rest of the workspace shouldn't be built with.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bh-crypto]
+path = ".."
+
+[[bin]]
+name = "fuzz_envelope_decode"
+path = "fuzz_targets/fuzz_envelope_decode.rs"
+test = false
+doc = false
+bench = false

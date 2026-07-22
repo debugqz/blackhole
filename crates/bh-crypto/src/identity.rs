@@ -98,6 +98,36 @@ impl IdentityKeyPair {
         let agreement = X25519Secret::from(<[u8; 32]>::try_from(&bytes[32..]).unwrap());
         Ok(Self { signing, agreement })
     }
+
+    /// Public identity as `signing_key || agreement_key` (64 bytes) — the
+    /// same layout `client/desktop`'s invite-accept flow already
+    /// concatenates client-side into `Contact.identity_public_key`
+    /// (`decoded.identity_signing_key + decoded.identity_agreement_key`).
+    /// Exists so server-side code deriving a [`recipient_key_hash`] for
+    /// *this* identity (to publish this identity's own `PreKeyBundle`, or
+    /// pull this identity's own mailbox) uses byte-for-byte the same
+    /// convention as it does for a `Contact`.
+    pub fn public_identity_bytes(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(self.public_signing_key().as_bytes());
+        out[32..].copy_from_slice(self.public_agreement_key().as_bytes());
+        out
+    }
+}
+
+/// Derives the routing key `bh_network::mailbox::Mailbox`/the prekey
+/// directory key on an identity's public key bytes — never the identity
+/// itself, so a mailbox/DHT node only ever sees this hash, not who it
+/// belongs to. Callers on both sides (message sender computing a
+/// recipient's key, and that recipient computing their own key to know
+/// what to pull) must derive it from the *same* input: `identity_public_key`
+/// as stored on `Contact` (`signing_key || agreement_key`, 64 bytes) or, for
+/// one's own identity, [`IdentityKeyPair::public_identity_bytes`].
+pub fn recipient_key_hash(identity_public_key: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(identity_public_key);
+    hasher.finalize().into()
 }
 
 /// A BIP39 12-24 word recovery seed. Losing this and all linked devices

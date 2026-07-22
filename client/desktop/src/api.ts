@@ -235,6 +235,10 @@ export interface LocalAuthStatus {
   totp_enrolled: boolean;
 }
 
+export interface DbPinStatus {
+  pin_set: boolean;
+}
+
 export interface TotpEnrollStartResponse {
   ceremony_id: string;
   provisioning_uri: string;
@@ -372,6 +376,24 @@ export interface DownloadAttachmentResponse {
   data_base64: string;
   file_name: string | null;
   mime_type: string | null;
+}
+
+// ---------------- calls ----------------
+// `CallSignal` (`bh_crypto::envelope::CallSignal`) is an opaque, tagged
+// blob (WebRTC offer/answer plus the SFrame key-agreement material) —
+// this client only ever ferries it between `start_call`/`accept_call`/
+// `complete_call`, never inspects its contents, so `unknown` is the
+// honest type here rather than a partial reimplementation of its shape.
+export type CallSignal = unknown;
+
+export interface CallSignalResponse {
+  signal: CallSignal;
+}
+
+export interface GroupCallStartedResponse {
+  call_id: string;
+  local_tag: number;
+  participant_tags: number[];
 }
 
 export const api = {
@@ -547,6 +569,11 @@ export const api = {
   passkeyDelete: (credentialId: string) =>
     call<void>("DELETE", `/local-auth/passkey/${encodeURIComponent(credentialId)}`),
 
+  // ---------------- database PIN (THREAT_MODEL.md §3.7) ----------------
+  dbPinStatus: () => call<DbPinStatus>("GET", "/security/db-pin"),
+  setDbPin: (pin: string) => call<void>("POST", "/security/db-pin", { pin }),
+  clearDbPin: (pin: string) => call<void>("POST", "/security/db-pin/clear", { pin }),
+
   // ---------------- groups (MLS) ----------------
   listGroups: () => call<GroupDTO[]>("GET", "/groups"),
   createGroup: (
@@ -637,4 +664,31 @@ export const api = {
     call<DownloadAttachmentResponse>("GET", `/attachments/${encodeURIComponent(contentHash)}/download`),
   deleteAttachment: (contentHash: string) =>
     call<void>("DELETE", `/attachments/${encodeURIComponent(contentHash)}`),
+
+  // ---------------- calls (1:1, group, screen-share) ----------------
+  startCall: (callId: string, video: boolean) =>
+    call<CallSignalResponse>("POST", "/calls", { call_id: callId, video }),
+  acceptCall: (offer: CallSignal) =>
+    call<CallSignalResponse>("POST", "/calls/incoming", { offer }),
+  completeCall: (callId: string, answer: CallSignal) =>
+    call<void>("POST", `/calls/${encodeURIComponent(callId)}/complete`, { answer }),
+  hangupCall: (callId: string) => call<void>("POST", `/calls/${encodeURIComponent(callId)}/hangup`),
+
+  startCamera: (callId: string, fps?: number) =>
+    call<void>("POST", `/calls/${encodeURIComponent(callId)}/camera/start`, { fps }),
+  stopCamera: (callId: string) => call<void>("POST", `/calls/${encodeURIComponent(callId)}/camera/stop`),
+
+  startScreenShare: (callId: string, fps?: number) =>
+    call<void>("POST", `/calls/${encodeURIComponent(callId)}/screen-share/start`, { fps }),
+  stopScreenShare: (callId: string) =>
+    call<void>("POST", `/calls/${encodeURIComponent(callId)}/screen-share/stop`),
+
+  startGroupCall: (callId: string, video: boolean, participantCount: number) =>
+    call<GroupCallStartedResponse>("POST", "/calls/group/start", {
+      call_id: callId,
+      video,
+      participant_count: participantCount,
+    }),
+  hangupGroupCall: (callId: string) =>
+    call<void>("POST", `/calls/group/${encodeURIComponent(callId)}/hangup`),
 };

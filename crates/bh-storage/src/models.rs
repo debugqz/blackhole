@@ -9,6 +9,23 @@ pub struct OwnIdentity {
     pub created_at: i64,
 }
 
+/// This identity's own long-term X3DH prekey material — see `schema.rs`'s
+/// `SCHEMA_V15` doc comment for the v1 scoping (one non-rotating signed
+/// prekey, no one-time prekeys). `bh-crypto::ratchet::SignedPreKey`/
+/// `bh_crypto::pq_hybrid::HybridSecretKey` are rebuilt from these bytes on
+/// demand (`signed_prekey_secret` via `X25519Secret::from`,
+/// `pq_prekey_seed` via `HybridSecretKey::from_seed_bytes`) rather than
+/// this crate depending on `bh-crypto`'s types directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnPrekey {
+    pub signed_prekey_id: i64,
+    pub signed_prekey_secret: Vec<u8>,
+    pub signed_prekey_signature: Vec<u8>,
+    pub pq_prekey_seed: Vec<u8>,
+    pub pq_prekey_signature: Vec<u8>,
+    pub created_at: i64,
+}
+
 /// Local record of this profile's opt-in "wake push" registration (SPEC.md
 /// §5.6, `crates/bh-push-relay`) — an opaque, locally-generated token and
 /// whether the feature is currently on. Never message content, never a

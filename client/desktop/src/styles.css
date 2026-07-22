@@ -32,6 +32,16 @@
   box-sizing: border-box;
 }
 
+/* Without this, the `hidden` attribute loses to any author rule that sets
+ * `display` at equal specificity (e.g. `.overlay { display: flex }`) —
+ * the browser's own `[hidden] { display: none }` UA-stylesheet rule isn't
+ * `!important`, so it never wins that tie. Every screen/overlay in this
+ * app is toggled by setting `.hidden`, so this one rule has to hold for
+ * all of them. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   height: 100%;
@@ -1061,4 +1071,55 @@ button {
   font-size: 11.5px;
   color: var(--text-faint);
   padding: 6px 0;
+}
+
+.call-window {
+  width: 520px;
+  max-width: 92vw;
+}
+.call-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.call-videos {
+  position: relative;
+  background: #000;
+  border-radius: 10px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+}
+.call-video-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+.call-video-canvas.call-video-local {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 30%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: #000;
+}
+.call-participants {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 8px;
+}
+.call-participant-tile {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 8px;
+  text-align: center;
+  font-size: 11.5px;
+  font-weight: 650;
+  background: var(--surface-2);
+}
+.call-controls {
+  justify-content: center;
 }

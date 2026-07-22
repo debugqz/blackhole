@@ -30,3 +30,19 @@ serde_json = { workspace = true }
 ureq = "3"
 url = "2"
 
+# Locating the daemon's per-process API token file (`api_token`, written
+# to the same data dir `daemon/src/main.rs`'s own `data_dir()` computes —
+# see `lib.rs::data_dir`).
+dirs = "6"
+
+# Call-stream bridge (src/call_stream_bridge.rs): the webview can't open
+# the daemon's `GET /calls/:call_id/ws` directly (its WebSocket handshake
+# always carries an `Origin` header, which `reject_browser_origin` rejects
+# — see that module's doc), so this process dials it instead and relays
+# frames to the webview via Tauri's event system. Runs on the same async
+# runtime Tauri's own async commands already use (`tauri::async_runtime`).
+tokio = { workspace = true, features = ["sync"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+base64 = "0.22"
+

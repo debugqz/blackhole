@@ -41,4 +41,6 @@ pub enum CryptoError {
     NoSession,
     #[error("signature verification failed")]
     InvalidSignature,
+    #[error("malformed serialized data: {0}")]
+    Malformed(&'static str),
 }

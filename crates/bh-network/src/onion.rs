@@ -3,197 +3,128 @@
 //! choice. Same sealed-sender logic applies to call signaling, so the entry
 //! node never learns who called whom. See `docs/SPEC.md` §2.3, §5.2.
 //!
-//! **This is a from-scratch protocol implementation, not an integration of
-//! an existing audited onion-routing library** (none exists for libp2p —
-//! see the `bh-network/Cargo.toml` comment). It composes only audited
-//! primitives (X25519, HKDF-SHA256, ChaCha20-Poly1305) and is a real,
-//! working layered-encryption circuit — but per `docs/SPEC.md` §2.2/§9,
-//! *no* piece of Blackhole's protocol design should be trusted in
-//! production without independent cryptographic review, and this module is
-//! the least precedented piece of the lot.
+//! **Packet format: real Sphinx (Danezis-Goldberg), via `sphinx-packet`
+//! (the Nym mixnet project's own production implementation), not a
+//! hand-rolled construction.** An earlier version of this module used a
+//! from-scratch, recursively-nested AEAD scheme with bucket padding —
+//! real and tested, but provably incapable of hiding position-in-circuit:
+//! each outer layer necessarily contains the *entire* previous layer's
+//! wrapped packet plus its own header, so it can never be the same size
+//! as what it wraps (an outer layer is always strictly larger). That's a
+//! mathematical property of recursive AEAD wrapping, not a tuning
+//! problem — no amount of extra padding buckets fixes it. Real Sphinx
+//! solves this with a genuinely different construction: a *fixed-size*
+//! header (independent of real route length, via a precomputed filler
+//! string) plus a size-preserving payload cipher (Lioness, a wide-block
+//! PRP, not AEAD-with-a-growing-tag). Hand-deriving that filler-string
+//! algorithm from scratch is real mixnet-cryptography research — exactly
+//! the kind of subtle, easy-to-get-wrong protocol work `docs/SPEC.md`
+//! §2.2/§9 gate behind professional cryptographers and formal
+//! verification, and exactly what this module's own history already
+//! warned about being "the least precedented piece" of this codebase.
+//! Depending on `sphinx-packet` (Apache-2.0, ~280k downloads, actively
+//! maintained, the real implementation behind Nym's production mixnet)
+//! is composition of an existing implementation — the same pattern as
+//! `openmls` for MLS — not homegrown protocol crypto.
 //!
-//! **Packet-size mitigation (bucket padding, not full Sphinx).** Every
-//! layer's plaintext is padded up to the next entry in [`SIZE_BUCKETS`]
-//! before encryption (`docs/THREAT_MODEL.md` §3.4/§4 tracks this as the
-//! top open risk). This is a real, working, tested mitigation — it turns
-//! "exact byte-precise hop counting" into "which of a handful of coarse
-//! buckets" — but it is *not* equivalent to Sphinx's actual fix. True
-//! Sphinx keeps every hop-to-hop packet **exactly** the same size end to
-//! end, by having the client pre-fill the packet's tail with a per-hop
-//! pseudorandom stream that each relay's stripped header is effectively
-//! "replaced" by, so the total length never changes at all. Reproducing
-//! that construction correctly is exactly the kind of subtle
-//! protocol-security work that needs the formal review this module
-//! doesn't have (§2.2) — bucket padding was chosen as the honestly
-//! implementable interim step, not because it's equivalent.
+//! **What this actually buys**: every packet this module produces, for
+//! any supported route length (3 to [`MAX_HOPS`]) and any real payload up
+//! to the fixed budget, is *exactly* `sphinx_packet::header::HEADER_SIZE
+//! + PAYLOAD_SIZE` bytes — provably, not just "usually the same bucket."
+//! An observer watching the wire between any two hops cannot distinguish
+//! hop position, route length, or real payload size from ciphertext
+//! length alone, full stop — see this module's own test
+//! `every_hop_of_every_route_length_produces_an_identically_sized_packet`.
+//!
+//! **The tradeoff, same one every fixed-size mix packet format accepts**:
+//! bandwidth, not anonymity, is what's spent to get this — every circuit
+//! costs exactly [`PAYLOAD_SIZE`] bytes per hop even for a two-byte
+//! message, and real content larger than the fixed budget is rejected
+//! outright rather than silently truncated (see [`build_circuit_packet`]).
+//! [`PAYLOAD_SIZE`] is sized for ordinary message-sized content (matching
+//! `bh_crypto::envelope`'s own largest size bucket), not file transfer —
+//! `bh-files` already handles large content through its own
+//! chunked/resumable transport, deliberately independent of this module.
+//!
+//! **Still unreviewed**: depending on a real implementation instead of
+//! hand-rolling one closes the specific "will the filler-string math be
+//! correct" risk, but this integration itself — the address-hashing
+//! scheme, the timestamp/freshness convention layered on top, the fixed
+//! payload sizing — has not had independent review, consistent with
+//! `docs/SPEC.md` §2.2/§9's standing caveat over every protocol decision
+//! in this codebase.
+//!
+//! **Replay window, now checked only at the exit hop.** The previous
+//! AEAD design embedded an authenticated timestamp in *every* layer, so
+//! an intermediate hop could reject a stale packet immediately. Sphinx's
+//! payload (where this module's own timestamp convention lives, prepended
+//! to the real payload — see [`build_circuit_packet`]) stays opaque to
+//! every hop except the exit, by design: that's the same property that
+//! keeps intermediate hops from learning anything about content. A stale,
+//! replayed packet is still never *delivered* (the exit hop rejects it —
+//! see [`peel_layer`]), it just isn't rejected until then instead of at
+//! hop one. Bounding the replay window at all is what actually matters
+//! for the property this exists to protect (SPEC.md §5.2); which hop
+//! notices is a secondary concern.
 
+use sha2::{Digest, Sha256};
+use sphinx_packet::header::delays::Delay;
+use sphinx_packet::packet::builder::SphinxPacketBuilder;
+use sphinx_packet::route::{
+    Destination, DestinationAddressBytes, Node as SphinxNode, NodeAddressBytes,
+};
+use sphinx_packet::{ProcessedPacketData, SphinxPacket};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
-
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use hkdf::Hkdf;
-use sha2::Sha256;
+use x25519_dalek_v2::{PublicKey as X25519PublicKeyV2, StaticSecret as X25519SecretV2};
 
 use crate::NetworkError;
 
 pub const MIN_HOPS: usize = 3;
+/// `sphinx-packet`'s own compile-time route-length ceiling
+/// (`sphinx_packet::constants::MAX_PATH_LENGTH`) — the header is a fixed
+/// size built to hold at most this many hop slots.
+pub const MAX_HOPS: usize = sphinx_packet::constants::MAX_PATH_LENGTH;
 
-/// How long a packet stays acceptable after it was built. There is no
-/// per-relay seen-packet cache here (this module is a stateless peeling
-/// function; a real dispatch loop to own such a cache's lifetime doesn't
-/// exist yet — this crate isn't wired into a live relay path, see
-/// CLAUDE.md), so a captured packet can still be replayed verbatim *within*
-/// this window. Binding every layer to a timestamp and rejecting stale
-/// ones at least bounds that window instead of leaving it unlimited, which
-/// was the prior behavior. Exact duplicate suppression within the window
-/// remains a follow-up once a real relay dispatcher exists to hold that
-/// state (`docs/THREAT_MODEL.md` §3.4).
+/// How long a packet stays acceptable after it was built — see the
+/// module doc on why this is checked only at the exit hop now. There is
+/// no per-relay seen-packet cache here (this module is a stateless
+/// peeling function; a real dispatch loop to own such a cache's lifetime
+/// doesn't exist yet — this crate isn't wired into a live relay path, see
+/// CLAUDE.md), so a captured packet can still be replayed verbatim
+/// *within* this window.
 const MAX_PACKET_AGE_SECONDS: i64 = 300;
 /// How far into the future a `created_at` may be before it's rejected as
 /// implausible, to tolerate reasonable clock skew between peers without
 /// letting a peer mint an ever-fresh-looking replay by lying about time.
 const MAX_CLOCK_SKEW_SECONDS: i64 = 60;
+/// 8-byte big-endian unix-seconds timestamp, prepended to the real
+/// payload before it's handed to Sphinx — see the module doc.
+const TIMESTAMP_LEN: usize = 8;
+/// Fixed payload budget every packet pays for regardless of real content
+/// size — see the module doc's bandwidth-tradeoff note. Matches
+/// `bh_crypto::envelope`'s own largest size bucket, since ordinary
+/// message-sized content (not file-transfer chunks, which `bh-files`
+/// carries separately) is what this module actually needs to fit.
+const PAYLOAD_SIZE: usize = 65536;
 
-/// Plaintext lengths a layer is padded up to before encryption. Chosen as
-/// a geometric-ish progression so small chat messages and larger payloads
-/// (e.g. group commits) both land within a few hundred bytes of a
-/// boundary rather than paying for the largest bucket unconditionally.
-const SIZE_BUCKETS: &[usize] = &[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
-
-/// Rounds `len` up to the next size bucket. Falls back to the next
-/// multiple of the largest bucket for payloads bigger than all of them
-/// (large file-transfer chunks, say) rather than refusing to pad at all.
-fn bucket_len(len: usize) -> usize {
-    match SIZE_BUCKETS.iter().copied().find(|&b| b >= len) {
-        Some(b) => b,
-        None => {
-            let largest = *SIZE_BUCKETS.last().expect("SIZE_BUCKETS is non-empty");
-            len.div_ceil(largest) * largest
-        }
-    }
+fn to_v2_public(pk: &X25519PublicKey) -> X25519PublicKeyV2 {
+    X25519PublicKeyV2::from(pk.to_bytes())
 }
 
-fn derive_layer_key(shared: &[u8; 32]) -> [u8; 32] {
-    let hkdf = Hkdf::<Sha256>::new(None, shared);
-    let mut key = [0u8; 32];
-    hkdf.expand(b"blackhole-onion-layer-v1", &mut key)
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
-    key
+fn to_v2_secret(sk: &X25519Secret) -> X25519SecretV2 {
+    X25519SecretV2::from(sk.to_bytes())
 }
 
-fn aead_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
-    let cipher = ChaCha20Poly1305::new(key.into());
-    // Safe with a fixed nonce: `key` is derived fresh per layer per packet
-    // from a one-time ephemeral ECDH and never reused.
-    cipher
-        .encrypt(&Nonce::default(), plaintext)
-        .expect("encryption with a freshly-derived key cannot fail")
-}
-
-fn aead_decrypt(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, NetworkError> {
-    let cipher = ChaCha20Poly1305::new(key.into());
-    cipher
-        .decrypt(&Nonce::default(), ciphertext)
-        .map_err(|_| NetworkError::Query("onion: layer decryption failed".to_string()))
-}
-
-/// One hop's decrypted view: either forward the (still-onion-encrypted)
-/// remainder to `next_hop`, or — if this hop is the exit — deliver
-/// `payload` locally. `created_at` is authenticated (it's inside the AEAD
-/// plaintext like everything else here) and lets `peel_layer` reject a
-/// packet that's outside [`MAX_PACKET_AGE_SECONDS`], bounding how long a
-/// captured packet stays replayable.
-struct OnionLayer {
-    created_at: i64,
-    next_hop: Option<Vec<u8>>,
-    payload: Vec<u8>,
-}
-
-impl OnionLayer {
-    /// Serializes the layer, then pads the *whole* frame (a 4-byte real-
-    /// length prefix plus the tag/timestamp/next-hop/payload body) up to
-    /// the next size bucket with zero bytes. The AEAD ciphertext this
-    /// becomes is therefore also bucket-sized, since ChaCha20-Poly1305
-    /// only adds a fixed-length tag.
-    fn encode(&self) -> Vec<u8> {
-        let mut body = Vec::with_capacity(9 + 5 + self.payload.len());
-        match &self.next_hop {
-            Some(id) => {
-                body.push(1u8);
-                body.extend_from_slice(&self.created_at.to_be_bytes());
-                body.extend_from_slice(&(id.len() as u32).to_be_bytes());
-                body.extend_from_slice(id);
-            }
-            None => {
-                body.push(0u8);
-                body.extend_from_slice(&self.created_at.to_be_bytes());
-            }
-        }
-        body.extend_from_slice(&self.payload);
-
-        let mut framed = Vec::with_capacity(4 + body.len());
-        framed.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        framed.extend_from_slice(&body);
-        framed.resize(bucket_len(framed.len()), 0u8);
-        framed
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, NetworkError> {
-        let malformed = || NetworkError::Query("onion: malformed layer".to_string());
-        let real_len_bytes: [u8; 4] = bytes.get(..4).ok_or_else(malformed)?.try_into().unwrap();
-        let real_len = u32::from_be_bytes(real_len_bytes) as usize;
-        let body = bytes.get(4..4 + real_len).ok_or_else(malformed)?;
-
-        let tag = *body.first().ok_or_else(malformed)?;
-        let created_at_bytes: [u8; 8] = body.get(1..9).ok_or_else(malformed)?.try_into().unwrap();
-        let created_at = i64::from_be_bytes(created_at_bytes);
-        match tag {
-            0 => Ok(Self {
-                created_at,
-                next_hop: None,
-                payload: body.get(9..).ok_or_else(malformed)?.to_vec(),
-            }),
-            1 => {
-                let len_bytes: [u8; 4] = body.get(9..13).ok_or_else(malformed)?.try_into().unwrap();
-                let len = u32::from_be_bytes(len_bytes) as usize;
-                let id = body.get(13..13 + len).ok_or_else(malformed)?.to_vec();
-                let payload = body.get(13 + len..).ok_or_else(malformed)?.to_vec();
-                Ok(Self {
-                    created_at,
-                    next_hop: Some(id),
-                    payload,
-                })
-            }
-            _ => Err(malformed()),
-        }
-    }
-}
-
-/// What actually travels over the wire between two hops: an ephemeral
-/// public key (for the receiving hop to derive this layer's key) plus the
-/// encrypted layer.
-struct OnionPacket {
-    ephemeral_public: [u8; 32],
-    ciphertext: Vec<u8>,
-}
-
-impl OnionPacket {
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 + self.ciphertext.len());
-        out.extend_from_slice(&self.ephemeral_public);
-        out.extend_from_slice(&self.ciphertext);
-        out
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, NetworkError> {
-        let malformed = || NetworkError::Query("onion: malformed packet".to_string());
-        let ephemeral_public: [u8; 32] = bytes.get(..32).ok_or_else(malformed)?.try_into().unwrap();
-        let ciphertext = bytes.get(32..).ok_or_else(malformed)?.to_vec();
-        Ok(Self {
-            ephemeral_public,
-            ciphertext,
-        })
-    }
+/// Maps an arbitrary-length libp2p peer id down to Sphinx's fixed
+/// 32-byte node address. This module is already a stateless peeling
+/// function, not wired into a live relay dispatcher (see CLAUDE.md) —
+/// resolving this 32-byte circuit address back to a real transport
+/// address (peer id / `Multiaddr`) is exactly the kind of dispatch-loop
+/// work already flagged as a separate follow-up, not a regression
+/// introduced here.
+fn circuit_address(peer_id: &[u8]) -> NodeAddressBytes {
+    let hash: [u8; 32] = Sha256::digest(peer_id).into();
+    NodeAddressBytes::from_bytes(hash)
 }
 
 /// One hop of a route the caller has already chosen (see
@@ -203,12 +134,13 @@ pub struct RouteHop {
     pub public_key: X25519PublicKey,
 }
 
-/// Builds the onion-encrypted packet to hand to `route[0]` (the entry
-/// hop). Each hop can only decrypt its own layer, learning nothing but the
-/// previous hop it received from and the next hop to forward to — never
-/// the full route, and never the payload unless it's the exit. `now` (unix
-/// seconds) is stamped into every layer so [`peel_layer`] can reject the
-/// packet once it's stale — see [`MAX_PACKET_AGE_SECONDS`].
+/// Builds the Sphinx packet to hand to `route[0]` (the entry hop). Each
+/// hop can only decrypt its own layer, learning nothing but the previous
+/// hop it received from and the next hop to forward to — never the full
+/// route, and never the payload unless it's the exit. `now` (unix
+/// seconds) is stamped as an 8-byte prefix on `final_payload` so
+/// [`peel_layer`] can reject the packet once it's stale at the exit hop
+/// — see the module doc on why only there.
 pub fn build_circuit_packet(
     route: &[RouteHop],
     final_payload: &[u8],
@@ -220,33 +152,40 @@ pub fn build_circuit_packet(
             route.len()
         )));
     }
-
-    let mut next_hop_id: Option<Vec<u8>> = None;
-    let mut inner_payload: Vec<u8> = final_payload.to_vec();
-
-    for hop in route.iter().rev() {
-        let layer = OnionLayer {
-            created_at: now,
-            next_hop: next_hop_id.clone(),
-            payload: inner_payload,
-        };
-        let plaintext = layer.encode();
-
-        let ephemeral_secret = X25519Secret::random();
-        let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
-        let shared = ephemeral_secret.diffie_hellman(&hop.public_key);
-        let key = derive_layer_key(shared.as_bytes());
-        let ciphertext = aead_encrypt(&key, &plaintext);
-
-        inner_payload = OnionPacket {
-            ephemeral_public: ephemeral_public.to_bytes(),
-            ciphertext,
-        }
-        .encode();
-        next_hop_id = Some(hop.peer_id.clone());
+    if route.len() > MAX_HOPS {
+        return Err(NetworkError::Setup(format!(
+            "onion circuit supports at most {MAX_HOPS} hops, got {}",
+            route.len()
+        )));
     }
 
-    Ok(inner_payload)
+    let sphinx_route: Vec<SphinxNode> = route
+        .iter()
+        .map(|hop| SphinxNode::new(circuit_address(&hop.peer_id), to_v2_public(&hop.public_key)))
+        .collect();
+
+    // Blackhole has no SURB/reply-block concept and delivery is implicit
+    // ("this hop is the exit, hand the payload to the caller") — a fixed,
+    // unused placeholder destination, identical across every packet this
+    // module ever builds, so it can't leak anything by varying.
+    let destination = Destination::new(DestinationAddressBytes::from_bytes([0u8; 32]), [0u8; 16]);
+
+    // Zero mix-net timing delay at every hop: this module's job is
+    // hiding *position and content*, not adding Loopix-style timing
+    // obfuscation — a separate mitigation this codebase doesn't attempt
+    // (see `cover_traffic.rs` for the dummy-traffic angle it does take).
+    let delays = vec![Delay::new_from_millis(0); route.len()];
+
+    let mut message = Vec::with_capacity(TIMESTAMP_LEN + final_payload.len());
+    message.extend_from_slice(&now.to_be_bytes());
+    message.extend_from_slice(final_payload);
+
+    let packet = SphinxPacketBuilder::default()
+        .with_payload_size(PAYLOAD_SIZE)
+        .build_packet(message, &sphinx_route, &destination, &delays)
+        .map_err(|e| NetworkError::Setup(format!("onion: failed to build packet: {e}")))?;
+
+    Ok(packet.to_bytes())
 }
 
 /// What a relay does with a packet it just received: either forward the
@@ -258,39 +197,53 @@ pub enum PeelResult {
 }
 
 /// A relay's side: peel exactly one layer using its own static X25519
-/// secret. `now` (unix seconds) is compared against the layer's
-/// authenticated `created_at` and the packet is rejected if it falls
-/// outside `[now - MAX_PACKET_AGE_SECONDS, now + MAX_CLOCK_SKEW_SECONDS]`
-/// — see the module-level doc on why this bounds, rather than eliminates,
-/// replay.
+/// secret. At the exit hop, the authenticated `created_at` prefix is
+/// checked against `[now - MAX_PACKET_AGE_SECONDS, now + MAX_CLOCK_SKEW_SECONDS]`
+/// — see the module doc on why only the exit hop can check this.
 pub fn peel_layer(
     my_secret: &X25519Secret,
     packet_bytes: &[u8],
     now: i64,
 ) -> Result<PeelResult, NetworkError> {
-    let packet = OnionPacket::decode(packet_bytes)?;
-    let their_ephemeral = X25519PublicKey::from(packet.ephemeral_public);
-    let shared = my_secret.diffie_hellman(&their_ephemeral);
-    let key = derive_layer_key(shared.as_bytes());
-    let plaintext = aead_decrypt(&key, &packet.ciphertext)?;
-    let layer = OnionLayer::decode(&plaintext)?;
+    let packet = SphinxPacket::from_bytes(packet_bytes)
+        .map_err(|e| NetworkError::Query(format!("onion: malformed packet: {e}")))?;
+    let processed = packet
+        .process(&to_v2_secret(my_secret))
+        .map_err(|e| NetworkError::Query(format!("onion: failed to peel layer: {e}")))?;
 
-    let age = now.saturating_sub(layer.created_at);
-    if !(-MAX_CLOCK_SKEW_SECONDS..=MAX_PACKET_AGE_SECONDS).contains(&age) {
-        return Err(NetworkError::Query(format!(
-            "onion: packet is outside the acceptable freshness window (age {age}s)"
-        )));
+    match processed.data {
+        ProcessedPacketData::ForwardHop {
+            next_hop_packet,
+            next_hop_address,
+            ..
+        } => Ok(PeelResult::Forward {
+            next_hop: next_hop_address.as_bytes().to_vec(),
+            packet: next_hop_packet.to_bytes(),
+        }),
+        ProcessedPacketData::FinalHop { payload, .. } => {
+            let plaintext = payload.recover_plaintext().map_err(|e| {
+                NetworkError::Query(format!("onion: failed to recover payload: {e}"))
+            })?;
+            if plaintext.len() < TIMESTAMP_LEN {
+                return Err(NetworkError::Query(
+                    "onion: payload too short to contain a timestamp".to_string(),
+                ));
+            }
+            let (ts_bytes, payload_bytes) = plaintext.split_at(TIMESTAMP_LEN);
+            let created_at = i64::from_be_bytes(ts_bytes.try_into().expect("split at 8 bytes"));
+
+            let age = now.saturating_sub(created_at);
+            if !(-MAX_CLOCK_SKEW_SECONDS..=MAX_PACKET_AGE_SECONDS).contains(&age) {
+                return Err(NetworkError::Query(format!(
+                    "onion: packet is outside the acceptable freshness window (age {age}s)"
+                )));
+            }
+
+            Ok(PeelResult::Deliver {
+                payload: payload_bytes.to_vec(),
+            })
+        }
     }
-
-    Ok(match layer.next_hop {
-        Some(next_hop) => PeelResult::Forward {
-            next_hop,
-            packet: layer.payload,
-        },
-        None => PeelResult::Deliver {
-            payload: layer.payload,
-        },
-    })
 }
 
 #[cfg(test)]
@@ -318,13 +271,13 @@ mod tests {
         }
     }
 
+    fn relays(n: usize) -> Vec<Relay> {
+        (0..n).map(|i| Relay::new(&format!("relay-{i}"))).collect()
+    }
+
     #[test]
     fn three_hop_circuit_delivers_payload_to_exit() {
-        let relays = [
-            Relay::new("relay-1"),
-            Relay::new("relay-2"),
-            Relay::new("relay-3"),
-        ];
+        let relays = relays(3);
         let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
 
         let mut packet = build_circuit_packet(&route, b"hello via onion", 1_000).unwrap();
@@ -336,7 +289,7 @@ mod tests {
                     packet: forwarded,
                 } => {
                     assert!(i < relays.len() - 1, "only non-exit hops should forward");
-                    assert_eq!(next_hop, relays[i + 1].peer_id);
+                    assert_eq!(next_hop, circuit_address(&relays[i + 1].peer_id).as_bytes());
                     packet = forwarded;
                 }
                 PeelResult::Deliver { payload } => {
@@ -349,16 +302,10 @@ mod tests {
 
     #[test]
     fn intermediate_hops_cannot_read_final_payload() {
-        let relays = [
-            Relay::new("relay-1"),
-            Relay::new("relay-2"),
-            Relay::new("relay-3"),
-        ];
+        let relays = relays(3);
         let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
         let packet = build_circuit_packet(&route, b"secret payload", 1_000).unwrap();
 
-        // Relay 1 only ever sees the outer ciphertext, never the plaintext
-        // final payload.
         assert!(!packet
             .windows(b"secret payload".len())
             .any(|w| w == b"secret payload"));
@@ -377,11 +324,7 @@ mod tests {
 
     #[test]
     fn wrong_relay_key_fails_to_peel() {
-        let relays = [
-            Relay::new("relay-1"),
-            Relay::new("relay-2"),
-            Relay::new("relay-3"),
-        ];
+        let relays = relays(3);
         let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
         let packet = build_circuit_packet(&route, b"payload", 1_000).unwrap();
 
@@ -389,60 +332,61 @@ mod tests {
         assert!(peel_layer(&impostor.secret, &packet, 1_000).is_err());
     }
 
-    /// Regression test bounding the replay window: `peel_layer` must
+    /// Regression test bounding the replay window: the exit hop must
     /// reject a packet whose authenticated `created_at` is further in the
     /// past than `MAX_PACKET_AGE_SECONDS`, or further in the future than
-    /// `MAX_CLOCK_SKEW_SECONDS` — otherwise a captured packet stays
-    /// forever replayable.
+    /// `MAX_CLOCK_SKEW_SECONDS` — see the module doc on why only the exit
+    /// hop can check this with the Sphinx payload format.
     #[test]
-    fn peel_layer_rejects_a_stale_or_implausibly_future_packet() {
-        let relays = [
-            Relay::new("relay-1"),
-            Relay::new("relay-2"),
-            Relay::new("relay-3"),
-        ];
+    fn peel_layer_rejects_a_stale_or_implausibly_future_packet_at_the_exit() {
+        let relays = relays(3);
         let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
-        let packet = build_circuit_packet(&route, b"payload", 1_000).unwrap();
 
-        // Fresh at the time it was built.
-        assert!(peel_layer(&relays[0].secret, &packet, 1_000).is_ok());
-        // Still fresh well within the window.
-        assert!(peel_layer(&relays[0].secret, &packet, 1_000 + MAX_PACKET_AGE_SECONDS).is_ok());
-        // Too old.
+        let fresh_ok = |built_at: i64, checked_at: i64| {
+            let mut packet = build_circuit_packet(&route, b"payload", built_at).unwrap();
+            for relay in &relays {
+                match peel_layer(&relay.secret, &packet, checked_at) {
+                    Ok(PeelResult::Forward {
+                        packet: forwarded, ..
+                    }) => packet = forwarded,
+                    Ok(PeelResult::Deliver { .. }) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+            }
+            unreachable!("3-hop route must deliver by the third peel")
+        };
+
+        assert!(fresh_ok(1_000, 1_000).is_ok());
+        assert!(fresh_ok(1_000, 1_000 + MAX_PACKET_AGE_SECONDS).is_ok());
         assert!(
-            peel_layer(
-                &relays[0].secret,
-                &packet,
-                1_000 + MAX_PACKET_AGE_SECONDS + 1
-            )
-            .is_err(),
+            fresh_ok(1_000, 1_000 + MAX_PACKET_AGE_SECONDS + 1).is_err(),
             "a packet older than MAX_PACKET_AGE_SECONDS must be rejected"
         );
-        // Implausibly far in the future relative to the peer's clock.
         assert!(
-            peel_layer(&relays[0].secret, &packet, 1_000 - MAX_CLOCK_SKEW_SECONDS - 1).is_err(),
+            fresh_ok(1_000, 1_000 - MAX_CLOCK_SKEW_SECONDS - 1).is_err(),
             "a packet claiming to be from further in the future than clock skew allows must be rejected"
         );
     }
 
     #[test]
     fn rejects_routes_shorter_than_minimum_hops() {
-        let relays = [Relay::new("relay-1"), Relay::new("relay-2")];
+        let relays = relays(2);
         let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
         assert!(build_circuit_packet(&route, b"payload", 1_000).is_err());
     }
 
     #[test]
-    fn works_with_more_than_the_minimum_hops() {
-        let relays = [
-            Relay::new("relay-1"),
-            Relay::new("relay-2"),
-            Relay::new("relay-3"),
-            Relay::new("relay-4"),
-            Relay::new("relay-5"),
-        ];
+    fn rejects_routes_longer_than_max_hops() {
+        let relays = relays(MAX_HOPS + 1);
         let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
-        let mut packet = build_circuit_packet(&route, b"five hop payload", 1_000).unwrap();
+        assert!(build_circuit_packet(&route, b"payload", 1_000).is_err());
+    }
+
+    #[test]
+    fn works_at_the_maximum_supported_hop_count() {
+        let relays = relays(MAX_HOPS);
+        let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
+        let mut packet = build_circuit_packet(&route, b"max hop payload", 1_000).unwrap();
 
         for relay in &relays {
             match peel_layer(&relay.secret, &packet, 1_000).unwrap() {
@@ -450,92 +394,56 @@ mod tests {
                     packet: forwarded, ..
                 } => packet = forwarded,
                 PeelResult::Deliver { payload } => {
-                    assert_eq!(payload, b"five hop payload");
+                    assert_eq!(payload, b"max hop payload");
                 }
             }
         }
     }
 
-    /// The core anti-leak property: packets for a short message and a much
-    /// longer one, at every hop of the same-length circuit, land in
-    /// exactly the same size bucket — an observer watching only lengths
-    /// can't tell hop position (or even distinguish these two circuits)
-    /// from packet size alone, as long as both payloads round up to the
-    /// same bucket.
+    /// The actual property this whole rewrite is about: every hop of
+    /// every supported route length, for payloads from tiny up to the
+    /// fixed budget, produces a wire packet of *exactly* the same length
+    /// — not "usually the same bucket" the way the old AEAD design's
+    /// bucket-padding scheme only approximated.
     #[test]
-    fn same_bucket_payloads_produce_identically_sized_packets_at_every_hop() {
-        let relays = [
-            Relay::new("relay-1"),
-            Relay::new("relay-2"),
-            Relay::new("relay-3"),
-        ];
-        let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
+    fn every_hop_of_every_route_length_produces_an_identically_sized_packet() {
+        let mut sizes = std::collections::HashSet::new();
 
-        let short = build_circuit_packet(&route, b"hi", 1_000).unwrap();
-        let longer = build_circuit_packet(&route, &vec![b'x'; 300], 1_000).unwrap();
-        assert_eq!(
-            short.len(),
-            longer.len(),
-            "a 2-byte and a 300-byte payload both fit in the first bucket, so the \
-             entry-hop packets must be indistinguishable by size"
-        );
+        for hop_count in MIN_HOPS..=MAX_HOPS {
+            let relays = relays(hop_count);
+            let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
 
-        let mut short_packet = short;
-        let mut longer_packet = longer;
-        for relay in &relays {
-            let short_next = match peel_layer(&relay.secret, &short_packet, 1_000).unwrap() {
-                PeelResult::Forward { packet, .. } => packet,
-                PeelResult::Deliver { .. } => break,
-            };
-            let longer_next = match peel_layer(&relay.secret, &longer_packet, 1_000).unwrap() {
-                PeelResult::Forward { packet, .. } => packet,
-                PeelResult::Deliver { .. } => break,
-            };
-            assert_eq!(short_next.len(), longer_next.len());
-            short_packet = short_next;
-            longer_packet = longer_next;
-        }
-    }
-
-    #[test]
-    fn packet_sizes_are_bucketed_not_exact() {
-        let relays = [
-            Relay::new("relay-1"),
-            Relay::new("relay-2"),
-            Relay::new("relay-3"),
-        ];
-        let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
-
-        let packet = build_circuit_packet(&route, b"tiny", 1_000).unwrap();
-        // Smallest bucket (512) plus the fixed per-layer AEAD/ephemeral-key
-        // overhead for 3 layers of wrapping — well short of naively
-        // encoding just a few bytes of real payload, proving padding
-        // actually happened rather than the format staying byte-exact.
-        assert!(
-            packet.len() >= 512,
-            "expected bucket-padded size, got {}",
-            packet.len()
-        );
-    }
-
-    #[test]
-    fn oversized_payload_still_encodes_and_round_trips() {
-        let relays = [
-            Relay::new("relay-1"),
-            Relay::new("relay-2"),
-            Relay::new("relay-3"),
-        ];
-        let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
-        let big_payload = vec![b'z'; 100_000]; // bigger than the largest bucket
-
-        let mut packet = build_circuit_packet(&route, &big_payload, 1_000).unwrap();
-        for relay in &relays {
-            match peel_layer(&relay.secret, &packet, 1_000).unwrap() {
-                PeelResult::Forward {
-                    packet: forwarded, ..
-                } => packet = forwarded,
-                PeelResult::Deliver { payload } => assert_eq!(payload, big_payload),
+            for payload in [b"hi".to_vec(), vec![b'x'; 300], vec![b'y'; 40_000]] {
+                let mut packet = build_circuit_packet(&route, &payload, 1_000).unwrap();
+                sizes.insert(packet.len());
+                for relay in &relays {
+                    match peel_layer(&relay.secret, &packet, 1_000).unwrap() {
+                        PeelResult::Forward {
+                            packet: forwarded, ..
+                        } => {
+                            sizes.insert(forwarded.len());
+                            packet = forwarded;
+                        }
+                        PeelResult::Deliver { .. } => break,
+                    }
+                }
             }
         }
+
+        assert_eq!(
+            sizes.len(),
+            1,
+            "every packet at every hop of every route length/payload size must be the same length, got {sizes:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_payload_is_rejected_not_truncated_or_panicked_on() {
+        let relays = relays(3);
+        let route: Vec<RouteHop> = relays.iter().map(Relay::route_hop).collect();
+        // Past the fixed payload budget — must be a clean error, not a
+        // panic or silent truncation.
+        let too_big = vec![b'z'; PAYLOAD_SIZE * 2];
+        assert!(build_circuit_packet(&route, &too_big, 1_000).is_err());
     }
 }

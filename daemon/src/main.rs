@@ -4,12 +4,15 @@
 //!
 //! `bh-network` (DHT/onion/mailbox) is spawned below via
 //! `bh_network::supervised::SupervisedNetwork`, which self-heals if the
-//! swarm event loop dies (e.g. the yamux CVE panic — `docs/THREAT_MODEL.md`
-//! §3.10) rather than leaving networking silently dead until a manual
-//! restart. It's reachable through `AppState::network` and, today, only
-//! exposed read-only via `GET /network/status` — nothing yet rewires
-//! `bh-api::conversations`' message send/list handlers to actually go over
-//! it instead of the local database directly; that's a separate follow-up.
+//! swarm event loop dies for any reason (not the yamux CVE this comment
+//! used to cite — docs/THREAT_MODEL.md §3.10 now records that it isn't
+//! actually reachable through the yamux core this node runs) rather than
+//! leaving networking silently dead until a manual restart. It's
+//! reachable through `AppState::network` and exposed read-only via
+//! `GET /network/status`; `bh-api::conversations::send_message` also
+//! uses it directly for `Direct` conversations (`message_crypto.rs`),
+//! falling back to local-storage-only behavior when no network is
+//! attached — `Group` conversations aren't wired to it yet.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +39,11 @@ const DEFAULT_PROFILE_NAME: &str = "Default";
 /// interfaces isn't appropriate.
 const DEFAULT_NETWORK_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
 const NETWORK_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How often this daemon re-publishes its own Key Transparency tree head
+/// (`docs/THREAT_MODEL.md` §3.1) — Kademlia records expire, so a
+/// long-lived daemon needs to periodically republish the same way
+/// `prekey_directory`'s own doc comment already notes for prekey bundles.
+const TREE_HEAD_PUBLISH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 fn data_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("BLACKHOLE_DATA_DIR") {
@@ -44,6 +52,32 @@ fn data_dir() -> std::path::PathBuf {
     dirs::data_dir()
         .expect("no platform data directory available")
         .join("blackhole")
+}
+
+/// The file name the Tauri client reads to learn `AppState::api_token`
+/// (`client/desktop/src-tauri/src/lib.rs`'s own `data_dir()`, kept in
+/// sync with this one).
+const API_TOKEN_FILE_NAME: &str = "api_token";
+
+/// Persists the running daemon's bearer token so the Tauri client can
+/// read it back and attach it to every request (`server.rs`'s
+/// `require_bearer_token`). Regenerated (and rewritten) fresh on every
+/// daemon start, matching the token's own lifetime in `AppState` — a
+/// client mid-request against a since-restarted daemon just gets a fresh
+/// `401` and re-reads the file, same as any other "daemon restarted"
+/// case it already has to handle.
+fn write_api_token_file(data_dir: &std::path::Path, token: &str) {
+    let path = data_dir.join(API_TOKEN_FILE_NAME);
+    std::fs::write(&path, token).expect("failed to write API token file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("failed to restrict API token file permissions");
+    }
+    // Windows: relies on the per-user data directory's own default NTFS
+    // ACL (owner-only), same assumption `keystore.rs` already makes for
+    // this platform rather than this file needing its own extra ACL call.
 }
 
 fn now() -> i64 {
@@ -200,7 +234,30 @@ async fn main() {
     if let Some(network) = network {
         state = state.with_network(network);
     }
+    write_api_token_file(&data_dir, &state.api_token);
     let state = Arc::new(state);
+
+    // Key Transparency tree-head gossip (docs/THREAT_MODEL.md §3.1):
+    // periodically (re-)publishes whichever profile is active *at daemon
+    // startup*'s tree head — unlike the expiry sweeper, this doesn't yet
+    // follow `POST /profiles/:id/activate` switching the active profile
+    // mid-run (`bh_api::tree_head::publish_own_tree_head` always reads
+    // `state.db()`, i.e. whatever's active *when this tick fires* — so it
+    // does track a switch, it just isn't restarted/resynced immediately
+    // the way the expiry sweeper explicitly is). Only actually publishes
+    // anything if `state.network` is `Some`; a no-op tick otherwise, same
+    // "no live network" posture the rest of this module already has.
+    if let Some(network) = state.network.clone() {
+        let state_for_tree_head = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(TREE_HEAD_PUBLISH_INTERVAL);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                bh_api::tree_head::publish_own_tree_head(&state_for_tree_head, &network).await;
+            }
+        });
+    }
 
     tracing::info!("blackhole daemon starting (see docs/SPEC.md §6)");
 

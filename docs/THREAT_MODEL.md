@@ -56,18 +56,40 @@ guarantee.
 - **Spoofing**: an identity key is just a keypair; anyone can generate one
   claiming any display name. Mitigated the same way Signal is: safety
   number / QR verification between contacts (SPEC.md §3) is the actual
-  trust anchor, not the display name. **Partially mitigated — Key
-  Transparency primitive now exists, not yet deployed**: `bh_crypto::
-  key_transparency` implements RFC 6962's Merkle tree hash, inclusion
-  proofs, and consistency proofs from scratch (domain-separated leaf/node
-  hashing, exhaustively tested across tree sizes 1-32 and all valid
-  leaf/size-pair combinations, plus negative cases for tampered proofs,
-  wrong leaves, wrong roots, and rewritten/reordered history). What's
-  still missing is the network side: a service that actually gossips
-  signed tree heads and lets a client fetch/verify a contact's current key
-  against them. Until that exists, this module is a tested building block,
-  not a deployed defense — MITM detection in practice is still
-  manual-verification-only.
+  trust anchor, not the display name. **Mitigated — Key Transparency
+  gossip is now deployed, not just the client-side primitive**:
+  `bh_crypto::key_transparency` still implements RFC 6962's Merkle tree
+  hash, inclusion, and consistency proofs (exhaustively tested as
+  before), now extended with `SignedTreeHead`/`sign_tree_head`/
+  `verify_tree_head` — an identity signs its own tree head with the same
+  long-term signing key that already signs prekeys/safety-number
+  attestations. `bh_network::tree_head` publishes/fetches it over the DHT
+  under a well-known key derived from the signer's public key (same
+  publish/fetch shape as `prekey_directory.rs`, no read-merge-write retry
+  needed since only the owning identity ever writes to its own key).
+  Since identities don't rotate their signing key today (SPEC.md — one
+  long-term key, generated once), any identity's "log" is always exactly
+  one leaf, computed on the fly from `OwnIdentity` rather than a
+  separately persisted leaf log (`bh-api::tree_head::publish_own_tree_head`).
+  `daemon/src/main.rs` republishes every 10 minutes (Kademlia records
+  expire); `create_identity` also fires a best-effort publish immediately
+  on bootstrap. `safety_number.rs::get_safety_number` now returns
+  `key_transparency_corroborated` alongside the digits: best-effort
+  fetch-and-verify of the contact's own published tree head, additional
+  corroborating evidence *alongside*, never a replacement for, the manual
+  out-of-band comparison — `None` (no network, or the contact never
+  published) is treated as "can't check," not a red flag; `Some(false)`
+  (a validly-signed tree head that doesn't match the key on file) is a
+  genuine signal worth surfacing. **Residual gap**: this only detects a
+  contact silently getting handed a *different* key over the network — if
+  the caller and the contact end up talking to disjoint, partitioned
+  network views (an attacker controlling *both* sides' DHT lookups),
+  gossip alone can't detect that; a real Certificate-Transparency-style
+  design would need independent, cross-checked monitors, which is
+  explicitly out of scope for a per-identity self-published log. Tested
+  in `bh-crypto::key_transparency`'s own unit tests (valid/tampered-field/
+  wrong-signer cases) and `bh-network::tree_head`'s two-node integration
+  tests (publish/fetch/verify round trip, republish-replaces-old-value).
 - **Tampering**: X3DH's signed prekey is Ed25519-signed by the identity key
   and verified before use (`ratchet.rs::PreKeyBundle::verify_signed_prekey`,
   tested). Double Ratchet messages are AEAD-authenticated
@@ -174,12 +196,19 @@ guarantee.
   payloads of different real sizes become indistinguishable on the wire —
   confirmed by
   `same_bucket_payloads_produce_identically_sized_packets_at_every_hop` and
-  `packet_sizes_are_bucketed_not_exact`. This is a real, tested
-  improvement, but **not** full Sphinx-style constant-size padding: two
-  payloads straddling a bucket boundary (or one payload larger than every
-  bucket) are still distinguishable by size, and the module doc comment
-  says so explicitly. Position-in-circuit inference from packet size is
-  reduced, not eliminated.
+  `packet_sizes_are_bucketed_not_exact`. The bucket ladder was later refined
+  from a coarse 2x-doubling table topping out at 64KiB to a finer ~1.5x
+  progression extended up to 1MiB, and the fallback stride for anything
+  still bigger dropped from a full extra bucket (a 1MiB jump) to a quarter
+  of one (`bucket_len_uses_a_quarter_stride_fallback_beyond_the_largest_bucket`)
+  — real, tested reductions in both average padding overhead and how coarse
+  the size categories are for large (e.g. file-chunk-sized) payloads. This
+  is a real, tested improvement, but **not** full Sphinx-style
+  constant-size padding: two payloads straddling a bucket boundary (or one
+  payload larger than every bucket) are still distinguishable by size, and
+  the module doc comment says so explicitly. Position-in-circuit inference
+  from packet size is reduced, not eliminated — refining the bucket table
+  narrows the gaps without changing that fundamental trade-off.
 - **Spoofing/tampering between hops**: each layer is authenticated
   (ChaCha20-Poly1305, per-layer key from one-time ECDH) — a relay cannot
   forge or modify a layer without detection, confirmed by
@@ -199,14 +228,26 @@ guarantee.
   HMAC-keyed score (not DHT closeness, which is gameable) and enforces
   subnet diversity, tested against a scenario with 3 Sybil nodes on one
   subnet plus 2 honest nodes.
-- **Known gap**: this only covers *circuit hop selection*. It does not
-  cover Kademlia routing-table poisoning in general (an attacker flooding
-  the DHT with nodes to bias ordinary `get_record`/`put_record` lookups)
-  — that's a broader S/Kademlia-style hardening effort not undertaken here.
-  Also, "subnet diversity" here is whatever grouping key the caller
-  supplies; there's no real IP→ASN database wired in (that's closer to
-  infrastructure than code — see the project's earlier scoping decision to
-  defer anything requiring deployed infrastructure).
+- **Mitigated (not eliminated) — routing-table admission control**:
+  `transport.rs`'s `handle_swarm_event` used to call `kad.add_address`
+  unconditionally for every peer that connects and responds to Identify —
+  the actual (and only) point new peers enter the routing table, with no
+  bound at all. `routing_admission::RoutingAdmission` now gates that call:
+  no more than `DEFAULT_MAX_PEERS_PER_SUBNET` (4) distinct peer ids from
+  the same IP-prefix "subnet" (/24 for IPv4, /48 for IPv6) are admitted,
+  reusing the same subnet-diversity principle `eclipse_resistance.rs`
+  already applies to circuit-hop selection specifically — this closes the
+  "unlimited Sybil peers from one address block flood the whole table"
+  version of the gap below, tested in `routing_admission.rs`. **Still not
+  a full S/Kademlia rewrite**: no proof-of-work cost to admission, and
+  "subnet" is only as meaningful as the peer's *observed* connection
+  address — an attacker with genuine IP diversity (a real /24, or many
+  different cloud providers/regions) isn't slowed down by this at all,
+  and general Kademlia routing-table poisoning by an attacker who isn't
+  subnet-concentrated remains open. Also, "subnet diversity" here is a
+  coarse IP-prefix grouping, not a real IP→ASN database (that's closer to
+  infrastructure than code — see the project's earlier scoping decision
+  to defer anything requiring deployed infrastructure).
 - **Denial of service**: Kademlia's own protocol-level bounds (bucket
   sizes, query concurrency limits) apply as shipped by `rust-libp2p`;
   nothing Blackhole-specific has been added or reviewed here.
@@ -235,12 +276,19 @@ guarantee.
   confirm the write actually landed (not clobbered by a racing writer) —
   retrying the whole cycle on mismatch. Confirmed with a real concurrency
   test (`two_concurrent_pushes_to_the_same_recipient_both_survive`, using
-  `tokio::join!` on two genuinely simultaneous pushes, not a mocked race).
-  Still not a CRDT — it's retry-based conflict *avoidance*, not
+  `tokio::join!` on two genuinely simultaneous pushes, not a mocked race),
+  and a heavier five-writer version
+  (`five_concurrent_pushes_to_the_same_recipient_all_survive`). Retries now
+  also wait a short, jittered backoff (`manifest_retry_backoff`, roughly
+  `5ms * attempt` plus up to that much jitter) instead of retrying
+  immediately — writers that would otherwise keep clobbering each other's
+  write in lockstep spread out in time instead, converging faster under
+  contention. Still not a CRDT — it's retry-based conflict *avoidance*, not
   conflict-free merging — so it doesn't scale to many simultaneous writers
   as gracefully as a real mergeable structure would, but the specific
   "two sends race, one silently disappears" failure this section used to
-  describe is now closed.
+  describe is now closed, and backoff narrows the window where heavier
+  contention could still exhaust the retry budget.
 - **Mitigated — denial of service**: PoW is now verified server-side.
   `Mailbox::push`/`fan_out` take a `pow_solution: &Solution` parameter and
   reject the push if it doesn't verify
@@ -288,6 +336,38 @@ guarantee.
   remain a separate, client-UX-only unlock screen (§3.11) — this entry is
   specifically about the DB key itself, which is what's now actually
   gated.
+- **FIXED (passkey path only) — the client-UX-only gate above now has a
+  real hardware-backed alternative**: `client/desktop/src-tauri/src/
+  daemon_lifecycle.rs` + `prf_unlock.rs`, wired up in `main.ts`'s
+  `enrollDatabaseUnlockGate`/`derivePrfSecret`/`ensureDaemonBeforeBoot`.
+  The Tauri shell no longer assumes the daemon is already running (it
+  wasn't spawning it at all before this): `boot()` now calls
+  `ensure_daemon_running` itself, and — if a WebAuthn PRF-capable passkey
+  has been enrolled specifically for this (`POST /security/db-pin` sealed
+  under `hex(prf_secret)`, reusing the mechanism directly above rather
+  than inventing a second one) — waits on a passkey assertion *first*,
+  deriving the PRF secret and passing it as `BLACKHOLE_DB_PIN` to the
+  spawned process. The daemon genuinely does not exist as a process,
+  let alone have an open database, until that assertion succeeds. This
+  is sound specifically *because* PRF is hardware-derived (secure
+  enclave/TPM/security key) rather than something that has to sit
+  readable in OS storage the way the local unlock screen's TOTP path
+  would — see `prf_unlock.rs`'s module doc for why TOTP was
+  investigated and deliberately **not** used for this: a TOTP secret has
+  to be readable by the client to verify a live code without the
+  database open, which makes it exactly as exposed as the raw DB key it
+  would be protecting, i.e. not a real second factor against this
+  section's attacker model (OS-keystore/device access). The
+  local-unlock screen's TOTP option — and its passkey option when *not*
+  specifically enrolled through this PRF flow — remain client-UX-only,
+  per §3.11. **Scope note**: production packaging (bundling the daemon
+  as a proper Tauri sidecar with code signing, instead of this module's
+  dev-mode `BLACKHOLE_DAEMON_BIN`/monorepo-relative fallback) is a
+  separate follow-up, not attempted here; and the PRF extension itself
+  needs an authenticator/browser that supports it (most modern platform
+  authenticators do, but this can't be verified headlessly — same
+  existing limitation as the rest of this repo's WebAuthn surface, see
+  §3.11).
 
 ### 3.8 Anti-spam PoW (`bh-network::pow`)
 
@@ -301,14 +381,27 @@ guarantee.
 
 ### 3.9 Daemon API surface (`bh-api`)
 
-- **Elevation of privilege**: the API binds to `127.0.0.1` only
-  (`ApiServer::new`/`server.rs`) — never reachable from the network, so
-  the UI/daemon boundary can't be attacked remotely as designed. This
-  isn't yet defended by an additional auth token between the local UI
-  process and the daemon (SPEC.md §6 doesn't call for one, since both are
-  meant to run as the same local user, but a second local process could
-  currently also reach it — no worse than the general trust level of
-  "this device's other processes," which is out of scope per §2).
+- **Elevation of privilege — mitigated**: the API binds to `127.0.0.1`
+  only (`ApiServer::new`/`server.rs`) — never reachable from the network,
+  so the UI/daemon boundary can't be attacked remotely as designed. It is
+  now also defended against *another local process* on the same machine
+  (the gap this entry used to name as out of scope): `require_bearer_
+  token` (`server.rs`) requires `Authorization: Bearer <state.api_token>`
+  on every request, checked against a fresh random token generated per
+  daemon process (`AppState::api_token`) and written to a `0600`-
+  permissioned file (`daemon/src/main.rs`'s `write_api_token_file`) the
+  Tauri client reads back (`client/desktop/src-tauri/src/lib.rs`'s
+  `read_api_token`/`data_dir`, kept in sync with the daemon's own
+  `data_dir()` by construction — same directory, same file name). This
+  narrows "this device's other processes" from "can freely read/write
+  this identity's messages" down to "would need read access to a
+  `0600` file under the user's own data directory" — still within the
+  general trust level of "this device's other local processes as the
+  same user" that's out of scope per §2, but no longer a bare unauthenticated
+  TCP port. This is independent of, and composed with,
+  `reject_browser_origin` (rejects any request carrying a browser-set
+  `Origin` header, defending against a malicious web page rather than
+  another local process) — a request needs to pass both middlewares.
 - **Repudiation**: `POST /identity` refuses to overwrite an existing
   identity (`409 Conflict`, verified live in the smoke test) — an
   accidental or malicious re-init can't silently replace a user's identity
@@ -322,45 +415,37 @@ package is actually reachable from compiled code, so each alert below was
 individually checked with `cargo tree` (and `cargo tree --target all`,
 since some entries are target-gated) to see whether it's live or dormant.
 
-- **`yamux` 0.12.1 — GHSA-vxx9-2994-q338 / CVE-2026-32314, high, LIVE, and
-  now actually running.** A crafted inbound Yamux `Data` frame with `SYN`
-  set and an oversized body (> `DEFAULT_CREDIT`) panics the connection
-  state machine (`remove(...).expect("stream not found")`) — remotely
-  triggerable by any peer that can open a Yamux stream, no authentication
-  required. This *is* compiled into `bh-network`'s transport
-  (`libp2p-yamux` depends on it directly, confirmed via `cargo tree -i
-  yamux@0.12.1` with no `--target`/feature gate needed). Fixed upstream in
-  `yamux` 0.13.10 — but `libp2p-yamux` 0.47.0 (the version pulled by
-  `libp2p` 0.56.0, currently latest) depends on *both* 0.12.1 and 0.13.10
-  for what looks like wire-protocol-version negotiation between two yamux
-  generations, and hasn't bumped the 0.12 slot yet. No fix is available by
-  changing anything in this repo — it's blocked on a `rust-libp2p` release.
-  **Exposure changed**: `daemon/src/main.rs` now spawns and listens with
-  `bh_network::supervised::SupervisedNetwork`, binding
-  `BLACKHOLE_NETWORK_LISTEN_ADDR` (default `/ip4/0.0.0.0/tcp/0` — all
-  interfaces, unlike the HTTP API's loopback-only bind) — so this is no
-  longer a theoretical "once it's wired in" concern, it's live in a
-  process actually accepting inbound connections. **Blast radius is now
-  contained, not eliminated**: the event loop already ran as its own
-  `tokio::spawn`ed task, so a panic there was never able to crash the
-  whole daemon process (no `panic = "abort"` set anywhere in this
-  workspace, confirmed) — but until now it *did* silently and permanently
-  kill that node's networking, with no automatic recovery.
-  `bh_network::supervised::SupervisedNetwork` closes that: it polls
-  `Node::is_alive()` (cheap, checks whether the event loop's command
-  channel receiver is still there) every `NETWORK_HEALTH_CHECK_INTERVAL`
-  and respawns a fresh `Node` on death, tested by directly constructing a
-  dead handle and confirming the supervisor detects and replaces it with a
-  working one (`supervisor_detects_a_dead_node_and_respawns_a_working_one`).
-  A successful attack is now "networking blips and self-heals" rather than
-  "networking silently dies until someone notices and restarts the whole
-  daemon" — real containment, but **not a fix for the underlying bug**: an
-  attacker who can keep reconnecting can keep re-triggering it, and a
-  respawned node gets a fresh random libp2p identity each time (peer
-  identity isn't persisted across respawns — noted in `supervised.rs`'s
-  own doc comment), so this is not free from the rest of the network's
-  point of view. Genuinely fixing this still requires the upstream
-  `rust-libp2p` release; that dependency hasn't changed.
+- **`yamux` 0.12.1 — GHSA-vxx9-2994-q338 / CVE-2026-32314, high,
+  CORRECTED: not actually live.** A crafted inbound Yamux `Data` frame
+  with `SYN` set and an oversized body panics the connection state
+  machine (`remove(...).expect("stream not found")`) in the *vulnerable*
+  yamux core — remotely triggerable, no authentication required, fixed
+  upstream in yamux 0.13.10 (commit `ac71745`, confirmed against the real
+  advisory and changelog). This entry previously said that bug was "LIVE
+  and now actually running" in `bh-network`'s transport; that was wrong.
+  `libp2p-yamux` 0.47.0 does depend on *both* yamux 0.12.1 and 0.13.10
+  (renamed `yamux012`/`yamux013` internally, confirmed via `cargo
+  metadata`) — but only for API-compatibility reasons: `libp2p_yamux::
+  Config` is `Either<Config012, Config013>`, and `impl Default for
+  Config` (`libp2p-yamux-0.47.0/src/lib.rs`) resolves to `Config013`, the
+  *fixed* core. `crates/bh-network/src/transport.rs` calls
+  `yamux::Config::default` with no other yamux configuration anywhere in
+  the repo (confirmed via grep) — so every real connection this daemon
+  makes or accepts uses the fixed 0.13.10 core. The vulnerable 0.12.1
+  copy is compiled into the binary (which is why `cargo tree -i
+  yamux@0.12.1` finds it, and why GitHub's static Dependabot scan flags
+  it) but is never instantiated: reaching it would require explicitly
+  constructing the deprecated `Config012`-only API
+  (`yamux::WindowUpdateMode`, marked `#[deprecated]` upstream), which
+  nothing in this codebase does — and CI's `cargo clippy --workspace
+  --all-targets -- -D warnings` already fails the build on any use of a
+  `#[deprecated]` item, so this is structurally guarded against
+  regressing, not just documented. `bh_network::supervised::
+  SupervisedNetwork`'s auto-restart (polls `Node::is_alive()`, respawns a
+  fresh `Node` on death) remains valuable defense-in-depth against *any*
+  future panic in the swarm event loop — it just isn't mitigating an
+  active exploit of this specific CVE, contrary to what this entry used
+  to imply.
 - **`hickory-proto` ≤0.25.2 / ≤0.26.0 — GHSA-3v94-mw7p-v465,
   GHSA-q2qq-hmj6-3wpp, dormant.** Pulled transitively via
   `libp2p-mdns → hickory-resolver → hickory-proto`. `libp2p`'s `mdns`
@@ -375,6 +460,31 @@ since some entries are target-gated) to see whether it's live or dormant.
   (the backend this repo actually uses — see `bh-crypto::mls`) does not
   request. `cargo tree -i hpke-rs-libcrux --target all` resolves to
   nothing.
+- **`libcrux-secrets` 0.0.5 (RUSTSEC-2026-0212) and `libcrux-sha3` 0.0.8
+  (RUSTSEC-2026-0207, RUSTSEC-2026-0208) — LIVE, found 2026-07-22 by
+  wiring up `cargo deny check advisories` (item 4 of the security
+  hardening pass; see `deny.toml`).** Unlike the optional libcrux AEAD
+  backend above, these are pulled *unconditionally*: `hpke-rs` 0.6.1
+  depends directly on `libcrux-sha3` for its own hashing (not gated
+  behind the optional `hpke-rs-libcrux` backend), which in turn depends
+  on `libcrux-secrets` — both live in the same `openmls_rust_crypto`
+  path every MLS group operation goes through. `libcrux-secrets`
+  0.0.5's constant-time swap/select on aarch64 (Apple Silicon included)
+  could return incorrect results due to an inline-`cmp`-instruction bug
+  reading unspecified high bits — a potential timing/correctness side
+  channel, fixed in 0.0.6. `libcrux-sha3` 0.0.8 has two separate bugs:
+  incorrect output from the incremental SHAKE XOF API across multiple
+  `squeeze` calls, and a potential panic in AVX2 SHAKE-256 for certain
+  output lengths — the panic path is explicitly relevant to ML-KEM/ML-DSA
+  usage, i.e. `bh-crypto::pq_hybrid`. Both fixed upstream (`libcrux-secrets`
+  ≥0.0.6, `libcrux-sha3` ≥0.0.10) but blocked in this repo the same way
+  yamux is: `hpke-rs` 0.6.1 hard-pins `libcrux-sha3 = "^0.0.8"` and
+  `libcrux-aead` 0.0.7 hard-pins `libcrux-secrets = "=0.0.5"` — both are
+  0.0.x versions, where Cargo's caret matching treats every patch bump as
+  incompatible, confirmed by `cargo update -p libcrux-sha3 --precise
+  0.0.10` / `cargo update -p libcrux-secrets --precise 0.0.6` both
+  failing to resolve. No fix available from this repo; needs an upstream
+  `hpke-rs`/`openmls_rust_crypto` release.
 - **`glib` <0.20.0 — GHSA-wrw7-89jp-8q8g, dormant on the platforms built/tested
   so far.** Part of Tauri's Linux GTK backend (`gtk`/`webkit2gtk` →
   `glib`), gated to `target_os = "linux"`. Doesn't appear in `cargo tree`
@@ -489,8 +599,17 @@ Reviewed 2026-07-20, covering everything added in SPEC.md §15.
   cross-process behavior. The client UI must keep labeling this a local
   simulation rather than implying real multi-device support exists.
 - **Local unlock is client-UX-only, not a DB-key gate
-  (`bh-api::local_auth`)**: see §3.7 — repeating here because it's easy to
-  misread "passkey/TOTP enrollment" as closing that gap when it doesn't.
+  (`bh-api::local_auth`)** — with one exception, see §3.7: the *ordinary*
+  passkey/TOTP enrollment through `bh-api::local_auth` (the
+  "Local unlock" settings section) is still purely a client-UI screen
+  shown after the daemon has already opened the database, and does not
+  gate anything. TOTP specifically never can (§3.7 explains why). A
+  *separate*, dedicated enrollment ("Database lock" in settings,
+  `enrollDatabaseUnlockGate` in `main.ts`) that requests WebAuthn's PRF
+  extension on a passkey **does** gate the database key for real, by
+  having the Tauri shell itself withhold spawning the daemon until a PRF
+  assertion succeeds — see §3.7 for the full mechanism and why it needed
+  a passkey specifically, not TOTP.
 - **File attachments — no resumability (expiry sweep now closed)
   (`bh-api::files`, `bh-files`)**: uploads are fully synchronous today (no
   real network fetch to interrupt), so `bh_files::download::DownloadState`/
@@ -529,15 +648,22 @@ Reviewed 2026-07-21, covering everything added in SPEC.md §16.
   signing key from `device_link.rs`. This proves the ratchet machinery
   works end to end; it does not prove any real second device has actually
   received anything. Must be reworked once `bh-network` delivery exists.
-- **Elevation of privilege (broadcast channels are a policy check, not a
-  crypto one)**: `groups.broadcast_only` gates posting entirely in
-  `bh-api::conversations::send_message` (rejects a non-owner
-  `sender_contact_id` with `403`) — the underlying MLS group has no
-  concept of read-only members, so any code path that reaches
-  `insert_message` directly (bypassing the HTTP handler) would not be
-  stopped by anything at the crypto layer. This mirrors invite tokens
-  (§3.11): the enforcement point is a single, specific function, not a
-  structural guarantee.
+- **Mitigated — broadcast channels are still a policy check, not a crypto
+  one, but now enforced at two independent layers**: `groups.broadcast_only`
+  gates posting in `bh-api::conversations::send_message` (rejects a
+  non-owner `sender_contact_id` with `403` — cheap, avoids a query for the
+  common non-group case) *and*, independently, in
+  `bh_storage::Database::insert_group_message` (re-derives the same
+  broadcast-only/owner check from `conversation_id` and
+  `sender_contact_id` alone, before the actual `INSERT`). The underlying
+  MLS group still has no crypto-level concept of read-only members — that
+  part is unchanged — but a future code path that reaches storage
+  directly, bypassing the one HTTP handler, is no longer unstopped: it
+  would still go through `insert_group_message`'s own check rather than
+  the bare `insert_message`. Confirmed by a storage-level test
+  (`insert_group_message_rejects_a_non_owner_sender_in_a_broadcast_only_group`,
+  `crates/bh-storage/src/messages.rs`) that calls the storage function
+  directly with no HTTP layer involved at all.
 - **Spoofing (message-sender attribution more broadly)**: `send_message`'s
   `sender_contact_id` field is honored *only* for `Group`-kind
   conversations (needed for the broadcast-channel non-owner-post test and
@@ -657,6 +783,65 @@ Reviewed 2026-07-21, covering everything added in SPEC.md §16.
   self-note is exactly as exposed as, say, a contact's display name — not
   independently hardened the way a real 1:1 message is.
 
+### 3.13 Network-wired direct messages and call streaming (`bh-api::{message_crypto,message_receive}`, `bh-api::{call_stream,call_audio}`, `client/desktop/src-tauri/src/call_stream_bridge.rs`)
+
+Everything in §3.1-3.8 describes what `bh-crypto`/`bh-network` are capable
+of; this covers the specific point where `Direct`-conversation message
+send/receive and call-state/video streaming actually started running
+against a live `SupervisedNetwork`/WebSocket instead of only local
+storage or synthetic tests.
+
+- **Spoofing/tampering (message send/receive is genuinely end-to-end,
+  not a same-process shadow)**: `message_crypto::send_encrypted_over_
+  network` runs a real X3DH handshake (or continues an existing Double
+  Ratchet session), wraps the ciphertext with sealed sender
+  (`bh_network::sealed_sender`), solves the mailbox's anti-spam PoW, and
+  pushes it to the recipient's real Kademlia-addressed mailbox;
+  `message_receive::spawn_receive_loop` polls this identity's own
+  mailbox, unseals, decrypts, and inserts. Proven by a genuine
+  two-daemon integration test
+  (`direct_message_travels_a_real_network_between_two_daemons_and_
+  decrypts`) — two independent `AppState`s, two independent identities,
+  no shared process state — not a same-process shadow-session test the
+  way device sync/groups still are (§3.11, §3.12). `Group` conversations
+  are **not** wired to this yet — `send_message`'s `Group` arm still
+  only writes locally, so everything in §3.2 about MLS group state
+  remaining process-local still applies there specifically.
+- **Elevation of privilege (call state/video streaming needs the same
+  auth `require_bearer_token` provides everywhere else)**: `GET
+  /calls/:call_id/ws` sits behind the same `require_bearer_token`
+  middleware as every other route (§3.9) — a WebSocket handshake can
+  carry a custom `Authorization` header exactly like a normal HTTP
+  request, *unless* the client is a browser's own `WebSocket()` API,
+  which cannot set one. This daemon's only real caller
+  (`call_stream_bridge.rs`, a `tokio-tungstenite` client running in the
+  Tauri process, not the webview) isn't subject to that browser
+  restriction, so it attaches the token like any other request rather
+  than needing a weaker fallback (e.g. the token as a query string,
+  which would leak into process listings/logs) — see that module's own
+  doc comment. If a future client ever needs the webview to open this
+  socket directly, that fallback question becomes live again; it isn't
+  today.
+- **Information disclosure (call video/screen frames are already
+  decrypted before this channel, by design)**: `call_stream.rs` forwards
+  the SFrame-decrypted VP8 bitstream from `bh-calls` to the Tauri client
+  as base64-encoded binary WebSocket frames — this is the same
+  daemon-to-trusted-local-client boundary every other route already
+  crosses in plaintext-after-decryption (e.g. `GET
+  /conversations/:id/messages`), not a new exposure: anything able to
+  read this WebSocket already had `require_bearer_token`-gated access to
+  the plaintext conversation anyway. Audio never crosses this boundary
+  at all (see `call_stream.rs`'s own module doc) — it's decoded and
+  played on this machine's speakers entirely inside the daemon process,
+  so there's nothing here for a WebSocket observer to intercept.
+- **Denial of service (mailbox push failure is now surfaced, not
+  swallowed)**: a `Direct` send that can't complete its mailbox push
+  (e.g. `MAX_MANIFEST_MERGE_ATTEMPTS` exhausted despite §3.6's jittered
+  backoff, under sustained contention) returns a real error to the
+  caller rather than silently degrading to "looks sent, isn't" — the
+  same "surface it now, not just in logs" precedent already used for
+  camera/screen-capture failures (§3.11, §3.12).
+
 
 
 Numbering is kept stable across revisions (rather than renumbered as items
@@ -667,22 +852,28 @@ now describes what closed it, not that the number was removed.
 1. **MITIGATED — onion routing packet-size leak** (§3.4). Bucket-size
    padding closes the "exact size leaks hop position" version of this;
    still not full Sphinx constant-size (see §3.4).
-2. **PARTIALLY MITIGATED — `yamux` remote panic, CVE-2026-32314** (§3.10).
-   The underlying bug is still open and upstream-blocked, and `bh-network`
-   is now actually wired into the daemon and listening — but a panic there
-   no longer permanently kills the node's networking:
-   `bh_network::supervised::SupervisedNetwork` detects the dead event loop
-   and respawns automatically. Contained, not fixed; still requires an
-   upstream `rust-libp2p` release for the actual panic to stop happening.
+2. **CORRECTED — `yamux` remote panic, CVE-2026-32314, not actually live**
+   (§3.10). Previously ranked here as "partially mitigated"; re-verified
+   against the actual dependency resolution and found not exploitable as
+   described. `crates/bh-network/src/transport.rs` uses
+   `yamux::Config::default()`, which `libp2p-yamux` 0.47.0 resolves to
+   its fixed 0.13.10 core, not the vulnerable 0.12.1 one it also bundles
+   for legacy API compatibility. `bh_network::supervised::
+   SupervisedNetwork`'s auto-restart remains in place as general
+   defense-in-depth against any future event-loop panic, just not as a
+   mitigation for this specific (non-live) CVE.
 3. **MITIGATED — mailbox manifest race condition under concurrent
    writers** (§3.6). Read-merge-write-verify retry, confirmed with a real
    concurrent-`tokio::join!` test; not a full CRDT, but the specific
    silent-loss failure is closed.
-4. **PARTIALLY MITIGATED — no Key Transparency deployment** (§3.1). The
-   RFC 6962 client-side primitive (tree hash, inclusion/consistency
-   proofs) now exists and is exhaustively tested, but nothing gossips
-   signed tree heads yet — MITM detection in practice is still
-   manual-verification-only.
+4. **MITIGATED — Key Transparency gossip now deployed** (§3.1). The RFC
+   6962 client-side primitive is now paired with a signed-tree-head
+   gossip layer over the DHT (`bh_network::tree_head`) and a best-effort
+   corroboration check surfaced in `GET /contacts/:id/safety-number`.
+   Not a full third-party-monitored Certificate Transparency deployment
+   (each identity self-publishes its own single-leaf log) — closes the
+   "nothing gossips signed tree heads" gap specifically, not the broader
+   "independent monitors could catch a network-wide partition" property.
 5. **FIXED — PQ hybrid integrated into the live X3DH flow** (§3.3). Real
    1:1 sessions now derive their shared secret from both the X25519 and
    ML-KEM-768 legs via HKDF, tested including tamper-detection on each leg
@@ -691,7 +882,12 @@ now describes what closed it, not that the number was removed.
    server-side before accepting a push.
 7. **FIXED — PIN/passphrase layer in front of the DB key** (§3.7). Opt-in,
    per profile; `POST /security/db-pin` sets/clears it, daemon startup and
-   profile-switch enforce it.
+   profile-switch enforce it. Now also reachable via a real
+   hardware-backed passkey (WebAuthn PRF extension) instead of a typed
+   PIN — the Tauri shell withholds spawning the daemon until the
+   assertion succeeds, closing the "local unlock is UI-only" gap for
+   that specific enrollment path (TOTP deliberately excluded — see §3.7
+   for why it can't provide the same guarantee).
 8. **FIXED — MLS group state now survives a daemon restart** (§3.2).
    `mls_storage::PersistentMlsProvider` + generic `MlsMember<P>` are wired
    all the way through `bh-api::groups.rs`: the own member's signer key is
@@ -769,14 +965,17 @@ now describes what closed it, not that the number was removed.
     the "linked device" side is a locally-generated shadow identity, not
     the real device's own signing key. Must be reworked once `bh-network`
     delivery and real cross-process device sync exist.
-19. **Broadcast-channel posting restriction is enforced at exactly one
-    function, not structurally** (§3.12) — same pattern already accepted
-    for invite-token consumption (#14's neighbor in §3.11): the MLS group
-    backing a broadcast channel has no crypto-level concept of read-only
-    membership, so `bh-api::conversations::send_message`'s `403` check is
-    the entire enforcement. Any future code path that reaches
-    `insert_message` directly bypasses it. Low severity today (there is
-    exactly one way to send a message, through this one function) but
+19. **MITIGATED — broadcast-channel posting restriction now enforced at
+    two independent layers, not just one** (§3.12). The MLS group backing
+    a broadcast channel still has no crypto-level concept of read-only
+    membership — that's unchanged, and the same pattern already accepted
+    for invite-token consumption (#14's neighbor in §3.11) — but
+    `bh_storage::Database::insert_group_message` now re-derives and
+    enforces the same owner-only check independently of
+    `bh-api::conversations::send_message`'s existing `403`, so a future
+    code path that reaches storage directly no longer bypasses it. Low
+    severity even before this (there was exactly one way to send a
+    message, through this one function) but
     worth tracking before this code is refactored.
 20. **Group calls and screen sharing inherit calls' no-STUN/TURN and
     no-anonymity gaps** (§3.12, same underlying issue as #10) — now also
@@ -785,6 +984,17 @@ now describes what closed it, not that the number was removed.
     technical stops a user from screen-sharing something they didn't mean
     to show. That's a client UX/consent responsibility, not something
     transport or media encryption can address.
+21. **`libcrux-secrets`/`libcrux-sha3` vulnerabilities, live, blocked
+    upstream** (§3.10) — found 2026-07-22 by wiring up `cargo deny check
+    advisories` in CI. A constant-time correctness bug on aarch64
+    (`libcrux-secrets`, RUSTSEC-2026-0212) and two SHAKE/SHA3 bugs
+    (`libcrux-sha3`, RUSTSEC-2026-0207/0208, one of which is explicitly
+    relevant to ML-KEM/ML-DSA) sit unconditionally in the
+    `openmls_rust_crypto` dependency chain every MLS group operation
+    uses. Fixed upstream; blocked in this repo because `hpke-rs`/
+    `libcrux-aead` hard-pin exact 0.0.x versions. Same shape as #2 used to
+    be before correction: real, live, needs an upstream release, not
+    fixable by editing this repo.
 
 Two entries deliberately excluded from this list: the `hickory-proto`
 alerts (§3.10) are dormant with no path to becoming live short of

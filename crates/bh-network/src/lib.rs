@@ -8,9 +8,12 @@ pub mod eclipse_resistance;
 pub mod mailbox;
 pub mod onion;
 pub mod pow;
+pub mod prekey_directory;
+pub mod routing_admission;
 pub mod sealed_sender;
 pub mod supervised;
 pub mod transport;
+pub mod tree_head;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkError {

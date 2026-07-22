@@ -1,0 +1,112 @@
+# cargo-deny configuration — CVE/advisory scanning for the workspace.
+# Run locally with `cargo deny check advisories`. See
+# docs/THREAT_MODEL.md §3.10 for the manual review this automates.
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Actual vulnerabilities (RUSTSEC "vulnerability" category) still hard-fail
+# CI. "unmaintained" is downgraded to a warning: Tauri's Linux webview
+# stack pulls in a long tail of individually-unmaintained gtk-rs GTK3
+# sub-crates (atk, atk-sys, gdk, gdk-sys, gtk-sys, ...) and audiopus_sys —
+# none of them chosen by Blackhole's own code, none of them exploitable
+# vulnerabilities, and each would otherwise need its own `ignore` entry
+# here purely for being unmaintained. Real CVEs are what this gate exists
+# to catch (see docs/THREAT_MODEL.md §3.10); maintenance status is a
+# separate, non-blocking signal worth seeing in CI output, not gating on.
+unmaintained = "workspace"
+
+ignore = [
+    # hickory-proto — GHSA-3v94-mw7p-v465 / GHSA-q2qq-hmj6-3wpp. Dormant:
+    # pulled transitively via libp2p-mdns -> hickory-resolver, but the
+    # `mdns` libp2p feature is never enabled anywhere in this workspace
+    # (confirmed via `cargo tree -i libp2p-mdns`, resolves to nothing).
+    # docs/THREAT_MODEL.md §3.10.
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+
+    # libcrux-chacha20poly1305 — GHSA-hc3c-63hc-2r9f. Dormant: pulled via
+    # hpke-rs's optional `libcrux` backend, which openmls_rust_crypto (the
+    # backend bh-crypto::mls actually uses) does not request.
+    # docs/THREAT_MODEL.md §3.10.
+    "RUSTSEC-2026-0124",
+
+    # glib — GHSA-wrw7-89jp-8q8g. Dormant on the platforms built/tested so
+    # far (part of Tauri's Linux GTK backend, target_os = "linux" only;
+    # doesn't appear in `cargo tree` for the macOS/CI host targets used
+    # today). Will need a real fix before a Linux build ships — tracked in
+    # docs/THREAT_MODEL.md §3.10/§4, not ignorable indefinitely.
+    "RUSTSEC-2024-0429",
+
+    # gtk-rs GTK3 bindings (atk/gtk/gdk/etc.) — RUSTSEC-2024-0413,
+    # unmaintained, same family/cause as the glib entry above (Tauri's
+    # Linux GTK backend). `cargo deny` reasons about every target the
+    # lockfile could resolve for, not just the host running the check, so
+    # this and the glib entry both show up even on a macOS run.
+    "RUSTSEC-2024-0413",
+
+    # unic-ucd-version — RUSTSEC-2025-0098 (unmaintained, not a
+    # vulnerability; "no safe upgrade is available" per the advisory).
+    # Pulled transitively via Tauri itself
+    # (tauri -> tauri-utils -> urlpattern -> unic-ucd-ident ->
+    # unic-ucd-version), not a dependency Blackhole's own code chose or
+    # can swap out independently — re-evaluate if/when Tauri drops it.
+    "RUSTSEC-2025-0098",
+
+    # libcrux-secrets 0.0.5 — RUSTSEC-2026-0212. New finding from wiring
+    # up this scanner (not previously in docs/THREAT_MODEL.md — added
+    # there too). Live, not dormant: `libcrux-sha3` (used unconditionally
+    # by `hpke-rs`, which `openmls_rust_crypto` — bh-crypto::mls's actual
+    # backend — depends on) pulls this in directly. Fixed upstream in
+    # 0.0.6, but `libcrux-aead` 0.0.7 (via `hpke-rs-libcrux`) hard-pins
+    # `libcrux-secrets = "=0.0.5"` — confirmed via `cargo update -p
+    # libcrux-secrets --precise 0.0.6`, which fails to resolve. Same shape
+    # as the yamux entry below: blocked on an upstream release, not
+    # fixable from this repo. See docs/THREAT_MODEL.md §3.10.
+    "RUSTSEC-2026-0212",
+
+    # libcrux-sha3 0.0.8 — RUSTSEC-2026-0207 (incorrect output from the
+    # incremental portable SHAKE XOF API across multiple `squeeze` calls)
+    # and RUSTSEC-2026-0208 (AVX2 SHAKE-256 can panic on certain output
+    # buffer lengths — explicitly relevant to ML-KEM/ML-DSA use). Same
+    # dependency chain and same live/blocked-upstream shape as the
+    # libcrux-secrets entry above: `hpke-rs` 0.6.1 hard-pins
+    # `libcrux-sha3 = "^0.0.8"` (0.0.x, so semver-exact), fix is >=0.0.10,
+    # confirmed via `cargo update -p libcrux-sha3 --precise 0.0.10` failing
+    # to resolve. New findings from wiring up this scanner — added to
+    # docs/THREAT_MODEL.md §3.10.
+    "RUSTSEC-2026-0207",
+    "RUSTSEC-2026-0208",
+
+    # Note: yamux 0.12.1's GHSA-vxx9-2994-q338 / CVE-2026-32314 has no
+    # RUSTSEC-* id yet (not in rustsec/advisory-db as of this writing, so
+    # `cargo deny` can't flag it by id) — nothing to ignore here. See
+    # docs/THREAT_MODEL.md §3.10 regardless: it's compiled in but never
+    # instantiated (`yamux::Config::default()` resolves to the fixed
+    # 0.13.10 core), so there is no live exposure either way.
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "AGPL-3.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"

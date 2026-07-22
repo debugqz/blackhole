@@ -66,6 +66,38 @@ struct StoredMessage {
     expires_at: i64,
 }
 
+/// Exposed only for `crates/bh-network/fuzz/fuzz_targets/
+/// fuzz_mailbox_manifest.rs` — exercises the exact `serde_json::from_slice`
+/// deserialization `fetch_manifest` runs on a DHT record's bytes, which is
+/// attacker-influenceable content (any node can publish a record under a
+/// guessed/derived key). Must never panic on malformed input; deliberately
+/// not part of this crate's real public API otherwise.
+#[doc(hidden)]
+pub fn fuzz_only_parse_manifest_bytes(bytes: &[u8]) -> Result<(), NetworkError> {
+    let _manifest: Manifest = serde_json::from_slice(bytes)?;
+    Ok(())
+}
+
+/// Sleeps a short, randomized delay before the next manifest
+/// read-merge-write-verify retry. Two writers racing on the same
+/// recipient who both retry *immediately* (no delay at all) tend to keep
+/// colliding in lockstep — each one's write clobbers the other's right
+/// before it can verify, attempt after attempt. Growing, jittered backoff
+/// (roughly `5ms * attempt`, plus up to that much random jitter) spreads
+/// retries out in time so concurrent writers converge faster in the
+/// common case, without adding a compare-and-swap primitive this module
+/// still doesn't have (`docs/THREAT_MODEL.md` §3.6's long-term fix).
+async fn manifest_retry_backoff(attempt: usize) {
+    let base_ms = 5u64 * (attempt as u64 + 1);
+    let mut jitter_byte = [0u8; 1];
+    // A failed `getrandom` here would only make backoff slightly less
+    // jittery, never break correctness — falling back to no extra jitter
+    // (0) rather than propagating an error keeps this a pure timing nicety.
+    let _ = getrandom::fill(&mut jitter_byte);
+    let jitter_ms = u64::from(jitter_byte[0]) % (base_ms + 1);
+    tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)).await;
+}
+
 fn manifest_key(recipient_key_hash: &[u8]) -> Vec<u8> {
     let mut k = b"bh-mailbox:manifest:".to_vec();
     k.extend_from_slice(recipient_key_hash);
@@ -198,6 +230,7 @@ impl Mailbox {
                      discoverable via the manifest"
                 )));
             }
+            manifest_retry_backoff(attempt).await;
         }
         unreachable!("loop above always returns before exhausting its bound")
     }
@@ -277,6 +310,7 @@ impl Mailbox {
                     "mailbox: manifest deletion did not stick after {MAX_MANIFEST_MERGE_ATTEMPTS} attempts"
                 )));
             }
+            manifest_retry_backoff(attempt).await;
         }
         unreachable!("loop above always returns before exhausting its bound")
     }
@@ -526,6 +560,50 @@ mod tests {
         assert_eq!(
             messages, expected,
             "both concurrent pushes must survive in the manifest, not just the last writer"
+        );
+    }
+
+    /// Heavier contention than the two-writer test above — five senders
+    /// racing on the same recipient's manifest at once, the kind of burst
+    /// `manifest_retry_backoff`'s jitter exists to help converge instead of
+    /// every writer retrying in lockstep. All five entries must survive,
+    /// not just however many the retry budget happens to favor.
+    #[tokio::test]
+    async fn five_concurrent_pushes_to_the_same_recipient_all_survive() {
+        let (sender_dht, recipient_dht) = connected_pair().await;
+        let recipient_mailbox = Mailbox::new(recipient_dht);
+        let recipient_key = b"recipient-key-hash-heavy-race";
+
+        let pushes = (0..5).map(|i| {
+            let mailbox = Mailbox::new(sender_dht.clone());
+            let message_id = format!("from-{i}").into_bytes();
+            let ciphertext = format!("hello from {i}").into_bytes();
+            async move {
+                let solution = Mailbox::solve_pow(recipient_key, &message_id, &ciphertext, 1_000);
+                mailbox
+                    .push(
+                        recipient_key,
+                        &message_id,
+                        ciphertext.clone(),
+                        86_400,
+                        1_000,
+                        &solution,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("push {i} should eventually succeed via retry: {e}")
+                    });
+                (message_id, ciphertext)
+            }
+        });
+        let mut expected: Vec<(Vec<u8>, Vec<u8>)> = futures::future::join_all(pushes).await;
+        expected.sort();
+
+        let mut messages = recipient_mailbox.pull(recipient_key, 1_000).await.unwrap();
+        messages.sort();
+        assert_eq!(
+            messages, expected,
+            "every one of 5 concurrent pushes must survive in the manifest"
         );
     }
 

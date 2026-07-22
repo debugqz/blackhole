@@ -110,6 +110,31 @@ impl Database {
         Ok(())
     }
 
+    /// As [`insert_message`](Self::insert_message), but re-validates the
+    /// broadcast-only posting restriction itself before inserting, rather
+    /// than trusting the caller to have already checked it.
+    ///
+    /// `bh-api::conversations::send_message` already has its own `403`
+    /// check for this (cheap, avoids a query for the common non-group
+    /// case) — this is defense in depth so that check isn't the *only*
+    /// thing standing between a non-owner sender and a broadcast channel:
+    /// any future code path that reaches storage directly (bypassing that
+    /// one HTTP handler) is still stopped here, at the actual insert.
+    /// Mirrors [`edit_message`](Self::edit_message)'s existing
+    /// read-then-guard pattern rather than trusting the caller.
+    pub fn insert_group_message(&self, message: &Message) -> Result<(), StorageError> {
+        if message.sender_contact_id.is_some() {
+            if let Some(group) = self.get_group_for_conversation(&message.conversation_id)? {
+                if group.broadcast_only {
+                    return Err(StorageError::Forbidden(
+                        "only the broadcast channel's owner may post".to_string(),
+                    ));
+                }
+            }
+        }
+        self.insert_message(message)
+    }
+
     /// Archives the current body into `message_edits` (tagged with when
     /// that version became current — the *previous* `edited_at`, or
     /// `sent_at` if this is the first edit) before overwriting the live
@@ -295,4 +320,94 @@ impl Database {
 pub struct ExpirySweepResult {
     pub message_ids: Vec<String>,
     pub orphaned_content_hashes: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Contact, Group};
+
+    fn broadcast_group_conversation(db: &Database) -> String {
+        db.create_group(&Group {
+            group_id: "g1".into(),
+            name: Some("Announcements".into()),
+            mls_state: b"placeholder".to_vec(),
+            epoch: 0,
+            created_at: 100,
+            broadcast_only: true,
+        })
+        .unwrap();
+        db.create_group_conversation("c1", "g1", 100).unwrap();
+        "c1".to_string()
+    }
+
+    fn message(conversation_id: &str, sender_contact_id: Option<&str>) -> Message {
+        Message {
+            message_id: uuid_like(sender_contact_id),
+            conversation_id: conversation_id.to_string(),
+            sender_contact_id: sender_contact_id.map(str::to_string),
+            body: Some("hello".to_string()),
+            sent_at: 100,
+            received_at: None,
+            expires_at: None,
+            deleted_at: None,
+            reply_to_message_id: None,
+            edited_at: None,
+        }
+    }
+
+    fn uuid_like(seed: Option<&str>) -> String {
+        format!("m-{}", seed.unwrap_or("owner"))
+    }
+
+    /// Storage-level proof that the broadcast-only restriction is
+    /// enforced *here*, not only in `bh-api::conversations::send_message`'s
+    /// `403` check — calls `insert_group_message` directly, with no HTTP
+    /// layer involved at all, exactly the bypass path
+    /// `docs/THREAT_MODEL.md` flags as a residual gap for the API-layer-only
+    /// check.
+    #[test]
+    fn insert_group_message_rejects_a_non_owner_sender_in_a_broadcast_only_group() {
+        let db = Database::open_in_memory(&[1u8; 32]).unwrap();
+        let conversation_id = broadcast_group_conversation(&db);
+
+        let result = db.insert_group_message(&message(&conversation_id, Some("someone-else")));
+        assert!(matches!(result, Err(StorageError::Forbidden(_))));
+    }
+
+    #[test]
+    fn insert_group_message_allows_the_owner_local_user_in_a_broadcast_only_group() {
+        let db = Database::open_in_memory(&[1u8; 32]).unwrap();
+        let conversation_id = broadcast_group_conversation(&db);
+
+        db.insert_group_message(&message(&conversation_id, None))
+            .unwrap();
+    }
+
+    #[test]
+    fn insert_group_message_allows_non_owner_senders_in_an_ordinary_group() {
+        let db = Database::open_in_memory(&[1u8; 32]).unwrap();
+        db.create_group(&Group {
+            group_id: "g2".into(),
+            name: Some("Friends".into()),
+            mls_state: b"placeholder".to_vec(),
+            epoch: 0,
+            created_at: 100,
+            broadcast_only: false,
+        })
+        .unwrap();
+        db.create_group_conversation("c2", "g2", 100).unwrap();
+        db.upsert_contact(&Contact {
+            contact_id: "a-member".to_string(),
+            identity_public_key: vec![0u8; 32],
+            display_name: Some("A Member".to_string()),
+            verified: false,
+            blocked: false,
+            added_at: 100,
+        })
+        .unwrap();
+
+        db.insert_group_message(&message("c2", Some("a-member")))
+            .unwrap();
+    }
 }

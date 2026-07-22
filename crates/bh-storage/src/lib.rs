@@ -21,6 +21,7 @@ pub mod message_stickers;
 pub mod messages;
 pub mod models;
 pub mod own_identity;
+pub mod own_prekey;
 pub mod payment_requests;
 pub mod payments;
 pub mod payments_db;
@@ -52,4 +53,6 @@ pub enum StorageError {
     NotFound,
     #[error("incorrect PIN or corrupted key material")]
     InvalidPin,
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }

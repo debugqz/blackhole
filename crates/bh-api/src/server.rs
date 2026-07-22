@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -10,10 +10,10 @@ use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::{
-    calls, contacts, conversations, cosmetics, device_link, device_sync, export, files, groups,
-    identity, invites, local_auth, moderation, network, panic_wipe, payment_requests, presence,
-    profiles, push, reactions, receipts, safety_number, search, security, stickers, ApiError,
-    AppState,
+    call_stream, calls, contacts, conversations, cosmetics, device_link, device_sync, export,
+    files, groups, identity, invites, local_auth, moderation, network, panic_wipe,
+    payment_requests, presence, profiles, push, reactions, receipts, safety_number, search,
+    security, stickers, ApiError, AppState,
 };
 
 /// Rejects any request carrying a browser-set `Origin` header.
@@ -32,6 +32,28 @@ async fn reject_browser_origin(req: Request, next: Next) -> Result<Response, Sta
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(next.run(req).await)
+}
+
+/// Requires `Authorization: Bearer <state.api_token>` on every request.
+/// `reject_browser_origin` defends against a browser tab reaching this
+/// loopback API; this defends against any *other* local process — the gap
+/// that middleware's own doc comment names as out of scope for it
+/// specifically. See `AppState::api_token`'s doc comment for how the
+/// token is generated/distributed.
+async fn require_bearer_token(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(token) if token == state.api_token => Ok(next.run(req).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
 }
 
 #[derive(Serialize)]
@@ -290,7 +312,20 @@ impl ApiServer {
                 "/calls/group/:call_id/hangup",
                 post(calls::hangup_group_call),
             )
+            .route("/calls/:call_id/camera/start", post(calls::start_camera))
+            .route("/calls/:call_id/camera/stop", post(calls::stop_camera))
+            // `/calls/:call_id/ws` is a WebSocket upgrade, but its only
+            // real caller (`client/desktop/src-tauri/src/
+            // call_stream_bridge.rs`) is a Rust-side `tokio-tungstenite`
+            // client, not the webview's own `WebSocket()` — so it can (and
+            // does) attach `Authorization` on the handshake request same
+            // as every other route, no exemption needed here.
+            .route("/calls/:call_id/ws", get(call_stream::call_ws))
             .layer(middleware::from_fn(reject_browser_origin))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            ))
             .with_state(state)
     }
 

@@ -140,6 +140,15 @@
               <span id="thread-verify" class="verify-chip"></span>
             </div>
             <div id="thread-toolbar" class="thread-toolbar">
+              <button id="call-audio" class="chip-btn" type="button" title="Start a local test call">
+                📞 Call
+              </button>
+              <button id="call-video" class="chip-btn" type="button" title="Start a local test video call">
+                🎥 Video
+              </button>
+              <button id="call-group" class="chip-btn" type="button" hidden title="Start a local test group call">
+                👥 Group call
+              </button>
               <button id="toggle-block" class="chip-btn" type="button"></button>
               <select id="timer-select" class="chip-select" title="Disappearing messages">
                 <option value="">No timer</option>
@@ -326,6 +335,27 @@
               <p class="trust-note">
                 Gates this app's unlock screen only — it does not change how
                 the local database itself is encrypted.
+              </p>
+            </section>
+            <section>
+              <h3>Database lock</h3>
+              <p id="db-lock-status" class="trust-note">Loading…</p>
+              <div class="actions">
+                <button id="enable-db-lock" class="chip-btn" type="button">
+                  Enable with passkey
+                </button>
+                <button id="disable-db-lock" class="chip-btn" type="button" hidden>
+                  Disable
+                </button>
+              </div>
+              <p class="trust-note">
+                Unlike the local unlock screen above, this genuinely gates
+                the database's encryption key using your passkey's
+                hardware-derived secret (WebAuthn's PRF extension) — the
+                daemon does not open the database at all until you unlock
+                with the passkey at startup. Needs an authenticator that
+                supports PRF (most modern platform authenticators — Touch
+                ID, Windows Hello, recent security keys).
               </p>
             </section>
             <section>
@@ -586,6 +616,38 @@
               </button>
               <p id="import-status" class="trust-note"></p>
             </section>
+          </div>
+        </div>
+      </div>
+
+      <div id="screen-call" class="overlay" hidden>
+        <div class="panel-window call-window">
+          <div class="panel-bar">
+            <span id="call-title">Call</span>
+            <button id="close-call" class="icon-btn" type="button" aria-label="Close">
+              ×
+            </button>
+          </div>
+          <div class="panel call-panel">
+            <p id="call-status" class="trust-note"></p>
+            <div id="call-videos" class="call-videos">
+              <canvas id="call-remote-video" class="call-video-canvas"></canvas>
+              <canvas id="call-local-video" class="call-video-canvas call-video-local"></canvas>
+            </div>
+            <div id="call-participants" class="call-participants" hidden></div>
+            <div class="actions call-controls">
+              <button id="call-toggle-camera" class="chip-btn" type="button">Start camera</button>
+              <button id="call-toggle-screen" class="chip-btn" type="button">Share screen</button>
+              <button id="call-hangup" class="wipe-btn" type="button">Hang up</button>
+            </div>
+            <p class="trust-note">
+              Local loopback test call — this daemon plays both the caller
+              and callee roles against itself. Real call-signal delivery
+              between two separate devices isn't wired into the P2P
+              network yet (see CLAUDE.md), but the WebRTC connection,
+              media capture/encode, SFrame end-to-end encryption, and
+              video decode below are all genuine, not simulated.
+            </p>
           </div>
         </div>
       </div>

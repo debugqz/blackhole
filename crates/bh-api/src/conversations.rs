@@ -142,6 +142,8 @@ pub async fn send_message(
         }
     }
 
+    let message_id = uuid::Uuid::new_v4().to_string();
+
     match conversation.kind {
         // No counterparty for a self-conversation, so there is no
         // encryption session/ratchet to establish or advance before
@@ -154,15 +156,42 @@ pub async fn send_message(
         ConversationKind::SelfNotes => {
             tracing::trace!(%conversation_id, "storing self-note, no crypto session needed");
         }
-        // Real per-message encryption-session path (X3DH/Double Ratchet
-        // for `Direct`, MLS for `Group`) lands here once `bh-network` is
-        // wired into send/receive (see CLAUDE.md repo layout) — today this
-        // also just stores directly, since live delivery isn't wired in
-        // yet, but this is the seam that will need a session/ratchet call
-        // *before* `insert_message` below, unlike the `SelfNotes` arm
-        // above which must never grow one.
-        ConversationKind::Direct | ConversationKind::Group => {
-            tracing::trace!(%conversation_id, kind = ?conversation.kind, "storing message");
+        // Real X3DH/Double Ratchet encryption + mailbox push
+        // (`message_crypto::send_encrypted_over_network`) — but only when
+        // `bh-network` is actually attached (`state.network`); every
+        // caller that never attaches one (including this crate's own
+        // integration test suite) keeps today's local-storage-only
+        // behavior, matching `network.rs`'s `GET /network/status`
+        // reporting `enabled: false` rather than erroring in that case.
+        ConversationKind::Direct => {
+            if let Some(network) = &state.network {
+                let contact_id = conversation
+                    .contact_id
+                    .as_deref()
+                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                let contact = state
+                    .db()
+                    .get_contact(contact_id)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                crate::message_crypto::send_encrypted_over_network(
+                    &state,
+                    network,
+                    &contact,
+                    &message_id,
+                    req.body.as_bytes(),
+                )
+                .await?;
+            } else {
+                tracing::trace!(%conversation_id, "storing message (no live network attached)");
+            }
+        }
+        // Real MLS ciphertext fan-out over the network is a separate
+        // follow-up from the Direct/X3DH wiring above — see
+        // `message_crypto`'s module doc for why this pass scoped to
+        // `Direct` only.
+        ConversationKind::Group => {
+            tracing::trace!(%conversation_id, "storing group message");
         }
     }
 
@@ -173,7 +202,7 @@ pub async fn send_message(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let message = Message {
-        message_id: uuid::Uuid::new_v4().to_string(),
+        message_id,
         conversation_id,
         sender_contact_id,
         body: Some(req.body),
@@ -184,10 +213,18 @@ pub async fn send_message(
         reply_to_message_id: req.reply_to_message_id,
         edited_at: None,
     };
+    // `insert_group_message` re-checks the broadcast-only restriction
+    // itself (defense in depth on top of the `403` check above — see its
+    // own doc comment) for every conversation, not just groups; the
+    // check is a no-op for `Direct`/`SelfNotes` since those always have
+    // `sender_contact_id: None` by this point.
     state
         .db()
-        .insert_message(&message)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .insert_group_message(&message)
+        .map_err(|e| match e {
+            bh_storage::StorageError::Forbidden(_) => StatusCode::FORBIDDEN,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
 
     Ok(Json(SendMessageResponse { message }))
 }
