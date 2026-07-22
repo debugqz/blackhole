@@ -1643,8 +1643,15 @@ async function renderStore() {
         buy.addEventListener("click", async () => {
           buy.disabled = true;
           try {
-            await api.purchaseCosmetic(item.item_id, `local-${item.item_id}-${Date.now()}`);
-            window.alert("Purchase recorded — it's granted once payment is confirmed.");
+            const purchase = await api.purchaseCosmetic(item.item_id);
+            if (purchase.checkout_url) {
+              window.open(purchase.checkout_url, "_blank", "noopener,noreferrer");
+              window.alert("Invoice created. The cosmetic is granted once BTCPay confirms payment.");
+            } else {
+              window.alert(
+                "Purchase draft recorded, but BTCPay is not configured yet. No payment can complete until the operator enables BTCPay.",
+              );
+            }
           } catch (err) {
             window.alert(errorMessage(err));
           } finally {

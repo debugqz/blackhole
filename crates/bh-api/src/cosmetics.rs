@@ -4,10 +4,11 @@
 //! (`bh_storage::cosmetics::grant_cosmetic`). See `bh_storage::payments`
 //! and `bh_storage::cosmetics` for the storage layer this wraps.
 //!
-//! What's still missing: the actual BTCPay/Monero-plugin HTTP integration
-//! — invoice creation. `create_purchase` records an invoice id the caller
-//! supplies, because nothing here talks to BTCPay yet; a real integration
-//! would create that invoice itself instead of trusting one handed to it.
+//! What's still missing: the actual BTCPay/Monero-plugin HTTP integration.
+//! `create_purchase` now owns invoice identity server-side, but without
+//! BTCPay configuration it creates an explicit local placeholder invoice
+//! (`provider = local_placeholder`, `provider_status =
+//! btcpay_not_configured`) rather than pretending payment can complete.
 //!
 //! `mark_purchase_paid` is a stand-in for BTCPay's payment-confirmed
 //! webhook. It's gated behind an HMAC-SHA256 signature
@@ -36,6 +37,9 @@ use crate::AppState;
 /// Header carrying the hex-encoded HMAC-SHA256 signature over the
 /// `purchase_id` path segment — see the module doc and [`verify_webhook_signature`].
 const WEBHOOK_SIGNATURE_HEADER: &str = "x-blackhole-webhook-signature";
+const LOCAL_PLACEHOLDER_PROVIDER: &str = "local_placeholder";
+const LOCAL_PLACEHOLDER_STATUS: &str = "btcpay_not_configured";
+const LOCAL_PLACEHOLDER_TTL_SECS: i64 = 60 * 60;
 
 /// Loads this profile's cosmetics-webhook HMAC secret, generating and
 /// storing a fresh 32-byte one in the platform keystore on first use.
@@ -296,17 +300,18 @@ pub async fn unequip(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatePurchaseRequest {
     pub item_id: String,
-    /// The invoice BTCPay issued for this purchase — supplied by the
-    /// caller today only because the BTCPay HTTP client isn't wired in
-    /// yet; see the module doc.
-    pub invoice_id: String,
 }
 
-/// Price/asset are always read from the catalog, never trusted from the
-/// request — the caller only gets to say *what* it wants to buy and *which*
-/// invoice it's paying against, not *how much* that costs.
+fn create_local_placeholder_invoice_id() -> String {
+    format!("local-btcpay-placeholder-{}", uuid::Uuid::new_v4())
+}
+
+/// Price/asset are always read from the catalog, never trusted from the request.
+/// The caller only gets to say *what* it wants to buy; the daemon owns invoice
+/// identity and provider state so a future BTCPay client can slot in here.
 pub async fn create_purchase(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreatePurchaseRequest>,
@@ -318,13 +323,19 @@ pub async fn create_purchase(
         .filter(|item| item.active)
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    let created_at = now();
+    let invoice_id = create_local_placeholder_invoice_id();
     payments_db
         .create_purchase(
             &item.item_id,
-            &req.invoice_id,
+            &invoice_id,
             item.price_asset,
             &item.price_amount,
-            now(),
+            created_at,
+            None,
+            Some(created_at + LOCAL_PLACEHOLDER_TTL_SECS),
+            LOCAL_PLACEHOLDER_PROVIDER,
+            LOCAL_PLACEHOLDER_STATUS,
         )
         .map(Json)
         .map_err(status_for)

@@ -1693,8 +1693,9 @@ async fn expired_attachment_is_swept_from_disk() {
 }
 
 /// Exercises the cosmetic store end to end: browse the (seeded) catalog,
-/// record a purchase against a stand-in invoice, confirm it as BTCPay's
-/// webhook eventually would, and equip what was granted — checking along
+/// record a purchase against a server-created invoice placeholder, confirm
+/// it as BTCPay's webhook eventually would, and equip what was granted —
+/// checking along
 /// the way that equipping something never-purchased is rejected and that
 /// re-confirming the same purchase doesn't grant a duplicate inventory row
 /// (SPEC.md §12 isolation: nothing here ever queries `db` and `payments_db`
@@ -1744,13 +1745,34 @@ async fn cosmetics_catalog_purchase_and_equip_round_trip() {
         .oneshot(json_request(
             "POST",
             "/cosmetics/purchases",
-            json!({"item_id": banner_id, "invoice_id": "invoice-stand-in-1"}),
+            json!({"item_id": banner_id, "invoice_id": "client-supplied-id"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/cosmetics/purchases",
+            json!({"item_id": banner_id}),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let purchase = body_json(response).await;
     assert_eq!(purchase["status"], json!("pending"));
+    assert!(
+        purchase["invoice_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("local-btcpay-placeholder-")
+    );
+    assert_eq!(purchase["checkout_url"], Value::Null);
+    assert_eq!(purchase["provider"], json!("local_placeholder"));
+    assert_eq!(purchase["provider_status"], json!("btcpay_not_configured"));
+    assert!(purchase["expires_at"].as_i64().unwrap() > purchase["created_at"].as_i64().unwrap());
     let purchase_id = purchase["purchase_id"].as_str().unwrap().to_string();
 
     // No signature, or the wrong one, is rejected — localhost access alone
@@ -2410,7 +2432,7 @@ async fn sticker_packs_are_gated_by_ownership_and_send_correctly() {
         .oneshot(json_request(
             "POST",
             "/cosmetics/purchases",
-            json!({"item_id": "sticker-pack-nebula", "invoice_id": "invoice-sticker-1"}),
+            json!({"item_id": "sticker-pack-nebula"}),
         ))
         .await
         .unwrap();

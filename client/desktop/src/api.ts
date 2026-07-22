@@ -299,7 +299,7 @@ export interface CosmeticCatalogItem {
   name: string;
   description: string | null;
   asset_ref: string;
-  price_asset: "XMR" | "BTC";
+  price_asset: "XMR" | "BTC" | "ETH";
   price_amount: string;
   active: boolean;
 }
@@ -321,12 +321,16 @@ export interface Purchase {
   purchase_id: string;
   item_id: string;
   invoice_id: string;
-  asset: "XMR" | "BTC";
+  asset: "XMR" | "BTC" | "ETH";
   amount: string;
   status: "pending" | "paid" | "expired";
   entitlement_token: string | null;
   created_at: number;
   paid_at: number | null;
+  checkout_url: string | null;
+  expires_at: number | null;
+  provider: string;
+  provider_status: string;
 }
 
 // ---------------- sticker packs (SPEC.md §12/§15) ----------------
@@ -628,8 +632,8 @@ export const api = {
     call<void>("POST", "/cosmetics/equip", { kind, item_id: itemId }),
   unequipCosmetic: (kind: CosmeticKind) =>
     call<void>("DELETE", `/cosmetics/equipped/${encodeURIComponent(kind)}`),
-  purchaseCosmetic: (itemId: string, invoiceId: string) =>
-    call<Purchase>("POST", "/cosmetics/purchases", { item_id: itemId, invoice_id: invoiceId }),
+  purchaseCosmetic: (itemId: string) =>
+    call<Purchase>("POST", "/cosmetics/purchases", { item_id: itemId }),
 
   // ---------------- sticker packs ----------------
   listStickerPacks: () => call<StickerPackDef[]>("GET", "/cosmetics/sticker-packs"),

@@ -49,7 +49,7 @@ Concretely:
 | Client-side link previews | ✅ Implemented — opt-in (off by default), deliberately bypasses the daemon entirely |
 | Local full-text message search (FTS5) | ✅ Implemented, tested — pure local query, nothing leaves the daemon |
 | Deployed infrastructure (relay/mailbox nodes, TURN, KT log) | ❌ Not deployed |
-| Payments (Monero/BTC/ETH via BTCPay) | ❌ Not implemented — only the cosmetics-store data model + isolation boundary exist |
+| Payments (Monero/BTC/ETH via BTCPay) | 🟡 BTCPay-ready local contract implemented — daemon owns invoice IDs, payment DB has provider/checkout/expiry fields, client no longer fabricates invoices; real BTCPay infrastructure/client/webhook still pending |
 | Mobile / web clients | ❌ Not started — desktop-only for now |
 
 `cargo fmt` / `cargo clippy -D warnings` clean, CI green on every push/PR
@@ -646,12 +646,40 @@ strictly cosmetic — profile gifts, banners, themes, badges, sticker packs
 **The cosmetics store's data model, isolation boundary, and client UI are
 implemented and tested** (catalog, purchase records, entitlement-token
 grant, inventory/equip, sticker packs usable in chat — `bh-api::cosmetics`/
-`stickers`, `client/desktop`'s Store panel). **What's not implemented yet**
-is the real BTCPay HTTP integration: `create_purchase` records an invoice
-id the *caller* supplies rather than the daemon creating one itself, and
-`mark_purchase_paid` is a stand-in for BTCPay's payment-confirmed webhook —
-gated behind an HMAC-SHA256 signature only a real webhook (or someone
-reading the keystore directly) could produce, so the client deliberately
+`stickers`, `client/desktop`'s Store panel). Purchase creation is now
+owned by the daemon: the client sends only `item_id`, the daemon generates
+the invoice id, and the payments database records provider metadata
+(`checkout_url`, `expires_at`, `provider`, `provider_status`) without
+copying any of it into the messaging database. Until BTCPay is configured,
+new purchases are explicit local placeholders
+(`provider = local_placeholder`, `provider_status = btcpay_not_configured`,
+no `checkout_url`) and therefore cannot complete payment.
+
+**Still pending for complete BTCPay payments:**
+
+- Implement the daemon-side BTCPay HTTP client: config for BTCPay URL,
+  store id, API key, invoice creation, checkout URL capture, expiration,
+  and asset/method mapping.
+- Replace local placeholder invoice creation in `bh-api::cosmetics` with
+  real BTCPay invoice creation when config is present, while preserving a
+  clear "BTCPay not configured" failure/placeholder path in development.
+- Expose a real BTCPay webhook endpoint reachable by the BTCPay server,
+  validate BTCPay's webhook secret/signature, map invoice events to
+  `pending`/`paid`/`expired`, and keep replay handling idempotent.
+- Add reconciliation for missed webhooks by querying BTCPay for unsettled
+  invoice status and expiring stale local purchases.
+- Deploy and operate BTCPay Server with BTC on-chain/Lightning enabled.
+- Install and configure `BTCPayServer.Plugins.Monero` for XMR checkout.
+- Decide the ETH path before enabling ETH catalog items: BTCPay does not
+  provide the same native ETH path as BTC, so ETH needs either a vetted
+  plugin/exchange integration, a custom integration, or continued deferral.
+- Add end-to-end tests against a BTCPay mock/container for invoice create,
+  webhook settled, webhook replay, expired invoice, wrong amount/asset, and
+  no leakage of invoice/payment metadata into the messaging database.
+
+`mark_purchase_paid` remains a stand-in for BTCPay's payment-confirmed
+webhook — gated behind an HMAC-SHA256 signature only a real webhook (or
+someone reading the keystore directly) could produce, so the client still
 has **no button that can complete a purchase today**, by design rather
 than oversight. This describes the target design from `SPEC.md` §12.
 
@@ -784,6 +812,16 @@ On Linux, screen sharing's `scap` dependency additionally needs
 screencast backend) — see `.github/workflows/ci.yml` for the exact
 `apt-get` line. macOS/Windows use native platform capture APIs and need
 nothing extra.
+
+`scripts/bootstrap.sh` automates all of the above for macOS (Homebrew),
+Debian/Ubuntu (apt), Arch (pacman), and Fedora (dnf): it installs the
+missing system packages, adds the `rustfmt`/`clippy` components, resolves
+`OPENSSL_DIR` on Apple Silicon, and warms the Cargo/pnpm caches with
+`cargo fetch --locked` + `pnpm install --frozen-lockfile`. Safe to re-run.
+
+```sh
+./scripts/bootstrap.sh
+```
 
 ```sh
 # daemon + all library crates + the push relay + the Tauri client's Rust side

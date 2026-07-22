@@ -9,6 +9,7 @@ use crate::models::CosmeticKind;
 pub enum CryptoAsset {
     Xmr,
     Btc,
+    Eth,
 }
 
 impl CryptoAsset {
@@ -16,12 +17,14 @@ impl CryptoAsset {
         match self {
             CryptoAsset::Xmr => "XMR",
             CryptoAsset::Btc => "BTC",
+            CryptoAsset::Eth => "ETH",
         }
     }
 
     pub fn from_db_str(s: &str) -> Self {
         match s {
             "BTC" => CryptoAsset::Btc,
+            "ETH" => CryptoAsset::Eth,
             _ => CryptoAsset::Xmr,
         }
     }
@@ -84,4 +87,8 @@ pub struct Purchase {
     pub entitlement_token: Option<String>,
     pub created_at: i64,
     pub paid_at: Option<i64>,
+    pub checkout_url: Option<String>,
+    pub expires_at: Option<i64>,
+    pub provider: String,
+    pub provider_status: String,
 }

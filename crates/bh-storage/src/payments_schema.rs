@@ -8,7 +8,7 @@ use rusqlite::Connection;
 
 use crate::StorageError;
 
-pub const CURRENT_VERSION: i64 = 2;
+pub const CURRENT_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS cosmetic_catalog (
@@ -65,8 +65,61 @@ DROP TABLE cosmetic_catalog;
 ALTER TABLE cosmetic_catalog_v2 RENAME TO cosmetic_catalog;
 "#;
 
+// v3 prepares the payments database for real BTCPay invoice creation while
+// preserving the isolation boundary: payment-provider metadata stays only
+// in this database, and the messaging database still receives only an
+// opaque entitlement token after confirmation. The asset checks are widened
+// for ETH so the API/client contracts can represent it explicitly, even
+// though ETH checkout remains deferred until a BTCPay-compatible integration
+// is chosen.
+const SCHEMA_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS cosmetic_catalog_v3 (
+    item_id       TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL CHECK (kind IN ('banner','theme','badge','sticker_pack')),
+    name          TEXT NOT NULL,
+    description   TEXT,
+    asset_ref     TEXT NOT NULL,
+    price_asset   TEXT NOT NULL CHECK (price_asset IN ('XMR','BTC','ETH')),
+    price_amount  TEXT NOT NULL,
+    active        INTEGER NOT NULL DEFAULT 1
+);
+INSERT OR IGNORE INTO cosmetic_catalog_v3
+    SELECT item_id, kind, name, description, asset_ref, price_asset, price_amount, active
+    FROM cosmetic_catalog;
+
+CREATE TABLE IF NOT EXISTS purchases_v3 (
+    purchase_id        TEXT PRIMARY KEY,
+    item_id             TEXT NOT NULL REFERENCES cosmetic_catalog_v3(item_id),
+    invoice_id          TEXT NOT NULL,
+    asset                TEXT NOT NULL CHECK (asset IN ('XMR','BTC','ETH')),
+    amount                TEXT NOT NULL,
+    status                TEXT NOT NULL CHECK (status IN ('pending','paid','expired')) DEFAULT 'pending',
+    entitlement_token    TEXT UNIQUE,
+    created_at            INTEGER NOT NULL,
+    paid_at               INTEGER,
+    checkout_url          TEXT,
+    expires_at            INTEGER,
+    provider              TEXT NOT NULL DEFAULT 'legacy_placeholder',
+    provider_status       TEXT NOT NULL DEFAULT 'unknown'
+);
+INSERT OR IGNORE INTO purchases_v3
+    SELECT purchase_id, item_id, invoice_id, asset, amount, status,
+           entitlement_token, created_at, paid_at, NULL, NULL,
+           'legacy_placeholder', 'unknown'
+    FROM purchases;
+
+DROP TABLE purchases;
+DROP TABLE cosmetic_catalog;
+ALTER TABLE cosmetic_catalog_v3 RENAME TO cosmetic_catalog;
+ALTER TABLE purchases_v3 RENAME TO purchases;
+"#;
+
 /// `(target_version, ddl, needs_foreign_keys_toggle)`.
-const STEPS: &[(i64, &str, bool)] = &[(1, SCHEMA_V1, false), (2, SCHEMA_V2, true)];
+const STEPS: &[(i64, &str, bool)] = &[
+    (1, SCHEMA_V1, false),
+    (2, SCHEMA_V2, true),
+    (3, SCHEMA_V3, true),
+];
 
 pub fn migrate(conn: &Connection) -> Result<(), StorageError> {
     debug_assert_eq!(STEPS.last().map(|(v, _, _)| *v), Some(CURRENT_VERSION));
