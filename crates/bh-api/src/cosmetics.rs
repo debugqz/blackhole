@@ -28,6 +28,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use bh_storage::keystore::COSMETICS_WEBHOOK_SECRET_LABEL;
 use bh_storage::models::{CosmeticInventoryItem, CosmeticKind, EquippedCosmetic};
+use bh_storage::payments::NewPurchase;
 use bh_storage::payments_models::{CosmeticCatalogItem, CryptoAsset, Purchase};
 use bh_storage::{PaymentsDatabase, StorageError};
 use serde::{Deserialize, Serialize};
@@ -326,17 +327,17 @@ pub async fn create_purchase(
     let created_at = now();
     let invoice_id = create_local_placeholder_invoice_id();
     payments_db
-        .create_purchase(
-            &item.item_id,
-            &invoice_id,
-            item.price_asset,
-            &item.price_amount,
+        .create_purchase(NewPurchase {
+            item_id: &item.item_id,
+            invoice_id: &invoice_id,
+            asset: item.price_asset,
+            amount: &item.price_amount,
             created_at,
-            None,
-            Some(created_at + LOCAL_PLACEHOLDER_TTL_SECS),
-            LOCAL_PLACEHOLDER_PROVIDER,
-            LOCAL_PLACEHOLDER_STATUS,
-        )
+            checkout_url: None,
+            expires_at: Some(created_at + LOCAL_PLACEHOLDER_TTL_SECS),
+            provider: LOCAL_PLACEHOLDER_PROVIDER,
+            provider_status: LOCAL_PLACEHOLDER_STATUS,
+        })
         .map(Json)
         .map_err(status_for)
 }

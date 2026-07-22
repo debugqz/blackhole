@@ -13,6 +13,24 @@ use crate::models::CosmeticKind;
 use crate::payments_models::{CosmeticCatalogItem, CryptoAsset, Purchase, PurchaseStatus};
 use crate::{PaymentsDatabase, StorageError};
 
+/// Everything [`PaymentsDatabase::create_purchase`] needs, grouped into one
+/// struct rather than a long positional argument list (clippy's
+/// `too_many_arguments` — `provider`/`checkout_url`/`expires_at`/
+/// `provider_status` were added for the BTCPay-ready invoice-ownership
+/// change on top of the original `item_id`/`invoice_id`/`asset`/`amount`/
+/// `created_at`).
+pub struct NewPurchase<'a> {
+    pub item_id: &'a str,
+    pub invoice_id: &'a str,
+    pub asset: CryptoAsset,
+    pub amount: &'a str,
+    pub created_at: i64,
+    pub checkout_url: Option<&'a str>,
+    pub expires_at: Option<i64>,
+    pub provider: &'a str,
+    pub provider_status: &'a str,
+}
+
 fn row_to_catalog_item(row: &rusqlite::Row) -> rusqlite::Result<CosmeticCatalogItem> {
     let kind: String = row.get(1)?;
     let price_asset: String = row.get(5)?;
@@ -115,32 +133,21 @@ impl PaymentsDatabase {
 
     /// Records a purchase against a provider invoice. Starts life
     /// `pending`; call `mark_purchase_paid` once BTCPay confirms it.
-    pub fn create_purchase(
-        &self,
-        item_id: &str,
-        invoice_id: &str,
-        asset: CryptoAsset,
-        amount: &str,
-        created_at: i64,
-        checkout_url: Option<&str>,
-        expires_at: Option<i64>,
-        provider: &str,
-        provider_status: &str,
-    ) -> Result<Purchase, StorageError> {
+    pub fn create_purchase(&self, new: NewPurchase) -> Result<Purchase, StorageError> {
         let purchase = Purchase {
             purchase_id: Uuid::new_v4().to_string(),
-            item_id: item_id.to_string(),
-            invoice_id: invoice_id.to_string(),
-            asset,
-            amount: amount.to_string(),
+            item_id: new.item_id.to_string(),
+            invoice_id: new.invoice_id.to_string(),
+            asset: new.asset,
+            amount: new.amount.to_string(),
             status: PurchaseStatus::Pending,
             entitlement_token: None,
-            created_at,
+            created_at: new.created_at,
             paid_at: None,
-            checkout_url: checkout_url.map(ToOwned::to_owned),
-            expires_at,
-            provider: provider.to_string(),
-            provider_status: provider_status.to_string(),
+            checkout_url: new.checkout_url.map(ToOwned::to_owned),
+            expires_at: new.expires_at,
+            provider: new.provider.to_string(),
+            provider_status: new.provider_status.to_string(),
         };
         self.conn()?.execute(
             "INSERT INTO purchases
@@ -271,17 +278,17 @@ mod tests {
         db.upsert_catalog_item(&item("banner-1")).unwrap();
 
         let purchase = db
-            .create_purchase(
-                "banner-1",
-                "invoice-abc",
-                CryptoAsset::Xmr,
-                "0.01",
-                100,
-                None,
-                Some(3700),
-                "local_placeholder",
-                "btcpay_not_configured",
-            )
+            .create_purchase(NewPurchase {
+                item_id: "banner-1",
+                invoice_id: "invoice-abc",
+                asset: CryptoAsset::Xmr,
+                amount: "0.01",
+                created_at: 100,
+                checkout_url: None,
+                expires_at: Some(3700),
+                provider: "local_placeholder",
+                provider_status: "btcpay_not_configured",
+            })
             .unwrap();
         assert_eq!(purchase.status, PurchaseStatus::Pending);
         assert!(purchase.entitlement_token.is_none());
@@ -310,17 +317,17 @@ mod tests {
         let db = PaymentsDatabase::open_in_memory(&[1u8; 32]).unwrap();
         db.upsert_catalog_item(&item("banner-1")).unwrap();
         let purchase = db
-            .create_purchase(
-                "banner-1",
-                "invoice-abc",
-                CryptoAsset::Xmr,
-                "0.01",
-                100,
-                None,
-                None,
-                "local_placeholder",
-                "btcpay_not_configured",
-            )
+            .create_purchase(NewPurchase {
+                item_id: "banner-1",
+                invoice_id: "invoice-abc",
+                asset: CryptoAsset::Xmr,
+                amount: "0.01",
+                created_at: 100,
+                checkout_url: None,
+                expires_at: None,
+                provider: "local_placeholder",
+                provider_status: "btcpay_not_configured",
+            })
             .unwrap();
         db.mark_purchase_paid(&purchase.purchase_id, 200).unwrap();
 
@@ -332,42 +339,42 @@ mod tests {
     fn list_purchases_returns_all_regardless_of_status() {
         let db = PaymentsDatabase::open_in_memory(&[1u8; 32]).unwrap();
         db.upsert_catalog_item(&item("banner-1")).unwrap();
-        db.create_purchase(
-            "banner-1",
-            "invoice-a",
-            CryptoAsset::Xmr,
-            "0.01",
-            1,
-            None,
-            None,
-            "local_placeholder",
-            "btcpay_not_configured",
-        )
+        db.create_purchase(NewPurchase {
+            item_id: "banner-1",
+            invoice_id: "invoice-a",
+            asset: CryptoAsset::Xmr,
+            amount: "0.01",
+            created_at: 1,
+            checkout_url: None,
+            expires_at: None,
+            provider: "local_placeholder",
+            provider_status: "btcpay_not_configured",
+        })
         .unwrap();
         let p2 = db
-            .create_purchase(
-                "banner-1",
-                "invoice-b",
-                CryptoAsset::Btc,
-                "0.0005",
-                2,
-                Some("https://btcpay.example/i/invoice-b"),
-                Some(3602),
-                "btcpay",
-                "new",
-            )
+            .create_purchase(NewPurchase {
+                item_id: "banner-1",
+                invoice_id: "invoice-b",
+                asset: CryptoAsset::Btc,
+                amount: "0.0005",
+                created_at: 2,
+                checkout_url: Some("https://btcpay.example/i/invoice-b"),
+                expires_at: Some(3602),
+                provider: "btcpay",
+                provider_status: "new",
+            })
             .unwrap();
-        db.create_purchase(
-            "banner-1",
-            "invoice-c",
-            CryptoAsset::Eth,
-            "0.002",
-            4,
-            None,
-            None,
-            "local_placeholder",
-            "eth_deferred",
-        )
+        db.create_purchase(NewPurchase {
+            item_id: "banner-1",
+            invoice_id: "invoice-c",
+            asset: CryptoAsset::Eth,
+            amount: "0.002",
+            created_at: 4,
+            checkout_url: None,
+            expires_at: None,
+            provider: "local_placeholder",
+            provider_status: "eth_deferred",
+        })
         .unwrap();
         db.mark_purchase_paid(&p2.purchase_id, 3).unwrap();
 

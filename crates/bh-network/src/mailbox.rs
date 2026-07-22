@@ -60,10 +60,40 @@ struct Manifest {
     message_ids: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 struct StoredMessage {
     ciphertext: Vec<u8>,
     expires_at: i64,
+}
+
+impl StoredMessage {
+    /// Hand-rolled binary framing (8-byte big-endian `expires_at` followed
+    /// by the raw ciphertext), not `serde_json` — the same lesson
+    /// `sealed_sender.rs`'s own `SealedSenderEnvelope::to_bytes` doc
+    /// comment already draws for a `Vec<u8>` this size: `serde_json`
+    /// encodes bytes as a JSON array of decimal numbers, roughly
+    /// quadrupling the payload before it ever reaches the DHT record size
+    /// cap (`MemoryStoreConfig::max_value_bytes`, 64KiB by default). A real
+    /// call-signal offer's SDP-heavy ciphertext is easily tens of KB —
+    /// comfortably under that cap raw, but not once JSON-inflated.
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.ciphertext.len());
+        out.extend_from_slice(&self.expires_at.to_be_bytes());
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, NetworkError> {
+        let expires_bytes: [u8; 8] = bytes
+            .get(..8)
+            .ok_or_else(|| NetworkError::Setup("mailbox: stored message truncated".to_string()))?
+            .try_into()
+            .expect("slice of length 8 always converts to [u8; 8]");
+        Ok(Self {
+            expires_at: i64::from_be_bytes(expires_bytes),
+            ciphertext: bytes[8..].to_vec(),
+        })
+    }
 }
 
 /// Exposed only for `crates/bh-network/fuzz/fuzz_targets/
@@ -198,7 +228,7 @@ impl Mailbox {
         self.dht
             .publish(
                 &message_key(recipient_key_hash, message_id),
-                serde_json::to_vec(&stored)?,
+                stored.to_bytes(),
             )
             .await?;
 
@@ -257,7 +287,7 @@ impl Mailbox {
                 .await?
             {
                 Some(bytes) => {
-                    let stored: StoredMessage = serde_json::from_slice(&bytes)?;
+                    let stored = StoredMessage::from_bytes(&bytes)?;
                     if stored.expires_at > now {
                         out.push((id.clone(), stored.ciphertext));
                     } else {

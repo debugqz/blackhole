@@ -1763,12 +1763,10 @@ async fn cosmetics_catalog_purchase_and_equip_round_trip() {
     assert_eq!(response.status(), StatusCode::OK);
     let purchase = body_json(response).await;
     assert_eq!(purchase["status"], json!("pending"));
-    assert!(
-        purchase["invoice_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("local-btcpay-placeholder-")
-    );
+    assert!(purchase["invoice_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("local-btcpay-placeholder-"));
     assert_eq!(purchase["checkout_url"], Value::Null);
     assert_eq!(purchase["provider"], json!("local_placeholder"));
     assert_eq!(purchase["provider_status"], json!("btcpay_not_configured"));
@@ -3835,6 +3833,231 @@ async fn direct_message_travels_a_real_network_between_two_daemons_and_decrypts(
         found_body,
         Some("hello over the real network".to_string()),
         "B's receive loop must have decrypted and stored A's real message within the poll window"
+    );
+}
+
+/// The capstone test for real network call signaling (`calls.rs`'s
+/// `send_call_signal`/`handle_incoming_call_signal`): the same two
+/// genuinely independent `SupervisedNetwork`/`AppState` pair the message
+/// test above uses, but A places a call to B by passing `contact_id` to
+/// `POST /calls` instead of manually ferrying the offer/answer JSON
+/// itself. The `Offer` travels as real `Envelope::Call` ciphertext through
+/// the same X3DH/Double-Ratchet mailbox path a text message would, B's
+/// receive loop decrypts and auto-answers it (a real WebRTC handshake,
+/// including real ICE gathering over UDP loopback), the `Answer` travels
+/// back the same way, and A's own receive loop completes the handshake
+/// from it — neither daemon ever calls `/calls/incoming` or `/calls/:id/
+/// complete` directly. `GET /calls/:call_id` (a plain status poll, added
+/// alongside this wiring) is used instead of opening the `/ws` stream,
+/// since this test only needs "is it active yet," not the event stream
+/// itself. Finally, A's hangup is confirmed to reach B over the network
+/// too, tearing down B's side without B ever calling `/calls/:id/hangup`
+/// itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_signaling_travels_a_real_network_between_two_daemons_and_connects() {
+    use_mock_keychain();
+
+    let dir_a = test_dir("e2e-call-network-a");
+    let manager_a = ProfileManager::new(&dir_a, "bh-api-smoke-e2e-call-a");
+    let profile_a = manager_a.create_profile("A", 0).unwrap();
+    let session_a = open_profile_session(&manager_a, &profile_a.id, true);
+    let network_a = bh_network::supervised::SupervisedNetwork::spawn(
+        "/ip4/127.0.0.1/tcp/0",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let state_a = Arc::new(AppState::new(manager_a, session_a).with_network(network_a));
+    let app_a = ApiServer::router(state_a.clone());
+
+    let dir_b = test_dir("e2e-call-network-b");
+    let manager_b = ProfileManager::new(&dir_b, "bh-api-smoke-e2e-call-b");
+    let profile_b = manager_b.create_profile("B", 0).unwrap();
+    let session_b = open_profile_session(&manager_b, &profile_b.id, true);
+    let network_b = bh_network::supervised::SupervisedNetwork::spawn(
+        "/ip4/127.0.0.1/tcp/0",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let state_b = Arc::new(AppState::new(manager_b, session_b).with_network(network_b));
+    let app_b = ApiServer::router(state_b.clone());
+
+    let a_addr = state_a
+        .network
+        .as_ref()
+        .unwrap()
+        .listen_addrs()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .with_p2p(state_a.network.as_ref().unwrap().peer_id())
+        .unwrap();
+    state_b
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(a_addr)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let identity_a: Value = body_json(
+        app_a
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let identity_b: Value = body_json(
+        app_b
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let signing_a = identity_a["public_signing_key"].as_str().unwrap();
+    let agreement_a = identity_a["public_agreement_key"].as_str().unwrap();
+    let signing_b = identity_b["public_signing_key"].as_str().unwrap();
+    let agreement_b = identity_b["public_agreement_key"].as_str().unwrap();
+
+    // Both sides' receive loops must run here (unlike the message test
+    // above, which only needs B's): B has to receive A's offer, and A has
+    // to receive B's answer back.
+    bh_api::message_receive::spawn_receive_loop(state_a.clone(), Duration::from_millis(150));
+    bh_api::message_receive::spawn_receive_loop(state_b.clone(), Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let response = app_a
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/contacts",
+            json!({
+                "contact_id": signing_b,
+                "identity_public_key": format!("{signing_b}{agreement_b}"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = app_b
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/contacts",
+            json!({
+                "contact_id": signing_a,
+                "identity_public_key": format!("{signing_a}{agreement_a}"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let call_id = "e2e-call-1";
+    // Same DHT-convergence shortcut the message test above takes: a
+    // freshly-dialed routing table can take a few round trips to settle.
+    let mut start_status = StatusCode::SERVICE_UNAVAILABLE;
+    for attempt in 0..30 {
+        let response = app_a
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/calls",
+                json!({"call_id": call_id, "video": false, "contact_id": signing_b}),
+            ))
+            .await
+            .unwrap();
+        start_status = response.status();
+        if start_status == StatusCode::OK {
+            break;
+        }
+        assert!(attempt < 29, "start_call never succeeded after retries");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        start_status,
+        StatusCode::OK,
+        "starting a call over a live network must succeed"
+    );
+
+    let mut b_active = false;
+    for _ in 0..150 {
+        let status: Value = body_json(
+            app_b
+                .clone()
+                .oneshot(get_request(&format!("/calls/{call_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if status["status"] == json!("active") {
+            b_active = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        b_active,
+        "B must have received and auto-answered A's real network call offer"
+    );
+
+    let mut a_active = false;
+    for _ in 0..150 {
+        let status: Value = body_json(
+            app_a
+                .clone()
+                .oneshot(get_request(&format!("/calls/{call_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if status["status"] == json!("active") {
+            a_active = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        a_active,
+        "A must have completed the WebRTC handshake from B's real network answer"
+    );
+
+    let response = app_a
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/calls/{call_id}/hangup"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut b_gone = false;
+    for _ in 0..150 {
+        let status: Value = body_json(
+            app_b
+                .clone()
+                .oneshot(get_request(&format!("/calls/{call_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if status["status"] == json!("unknown") {
+            b_gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        b_gone,
+        "B's call must be torn down once A's hangup signal arrives over the real network, \
+         without B ever calling /calls/:id/hangup itself"
     );
 }
 

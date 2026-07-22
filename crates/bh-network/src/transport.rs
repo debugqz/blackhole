@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::StreamExt;
-use libp2p::kad::{self, store::MemoryStore};
+use libp2p::kad;
+use libp2p::kad::store::{MemoryStore, MemoryStoreConfig};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use tokio::sync::{mpsc, oneshot};
@@ -26,6 +27,19 @@ use crate::routing_admission::RoutingAdmission;
 use crate::NetworkError;
 
 const PROTOCOL_VERSION: &str = "/blackhole/0.1.0";
+
+/// Ceiling for a single DHT record's wire size (both `kad::Config`'s
+/// packet-size limit and `MemoryStoreConfig`'s value-size limit are set to
+/// this). `libp2p-kad`'s own default packet-size cap
+/// (`protocol::DEFAULT_MAX_PACKET_SIZE`) is only 16KiB — far below its
+/// *store's* own default 64KiB value cap, so the packet limit was the one
+/// that actually bound in practice. A real call-signal `Offer`'s SDP (many
+/// ICE host candidates) plus a first-contact X3DH `InitialMessage`
+/// comfortably clears 16KiB but stays well under this; `envelope.rs`'s own
+/// largest size bucket (64KiB) plus sealed-sender/ratchet framing overhead
+/// is the actual worst case this needs to fit, hence the headroom above a
+/// plain 64KiB round number.
+const MAX_DHT_RECORD_BYTES: usize = 128 * 1024;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -86,7 +100,16 @@ impl Node {
             .map_err(|e| NetworkError::Setup(e.to_string()))?
             .with_behaviour(|key| {
                 let peer_id = key.public().to_peer_id();
-                let mut kad = kad::Behaviour::new(peer_id, MemoryStore::new(peer_id));
+                let store = MemoryStore::with_config(
+                    peer_id,
+                    MemoryStoreConfig {
+                        max_value_bytes: MAX_DHT_RECORD_BYTES,
+                        ..MemoryStoreConfig::default()
+                    },
+                );
+                let mut kad_config = kad::Config::default();
+                kad_config.set_max_packet_size(MAX_DHT_RECORD_BYTES);
+                let mut kad = kad::Behaviour::with_config(peer_id, store, kad_config);
                 // Kademlia starts in Client mode and only auto-promotes to
                 // Server once it has a *confirmed external* address, which
                 // never happens on loopback. Every Blackhole node should

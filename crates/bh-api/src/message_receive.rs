@@ -18,10 +18,23 @@
 //! first," `bh-storage::message_requests`, but wiring first-contact
 //! delivery through it is a follow-up — this pass only delivers messages
 //! from *already-added* contacts) — see [`process_one`] for exactly where.
+//!
+//! **Also the delivery path for real call signaling** (`calls.rs`'s
+//! `send_call_signal`/`handle_incoming_call_signal`): a decrypted
+//! plaintext is decoded as a `bh_crypto::envelope::Envelope`, not assumed
+//! to be raw message-body text, and dispatched by variant —
+//! `Envelope::Text` down the existing message-insert path,
+//! `Envelope::Call` into `CallRegistry` — precisely so an offer/answer/
+//! hangup looks identical, from a mailbox operator's point of view, to an
+//! ordinary chat message (see `envelope.rs`'s module doc on why that
+//! matters). Reaction/receipt/typing envelopes aren't sent over the
+//! network by any caller yet, so they're accepted-and-ignored here rather
+//! than treated as malformed.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bh_crypto::envelope::Envelope;
 use bh_crypto::identity::{recipient_key_hash, IdentityKeyPair};
 use bh_crypto::ratchet::{self, session_associated_data, RatchetMessage, Session, SignedPreKey};
 use bh_network::sealed_sender::{self, SealedSenderEnvelope};
@@ -84,7 +97,7 @@ async fn receive_tick(state: &AppState) {
     };
 
     for (message_id_bytes, ciphertext) in pulled {
-        let outcome = process_one(state, &identity, &signed_prekey, &ciphertext);
+        let outcome = process_one(state, &identity, &signed_prekey, &ciphertext).await;
         match outcome {
             ProcessOutcome::Delivered | ProcessOutcome::Unprocessable => {
                 if let Err(err) = network
@@ -121,7 +134,7 @@ fn find_contact_by_signing_key(state: &AppState, signing_key: &[u8; 32]) -> Opti
     })
 }
 
-fn process_one(
+async fn process_one(
     state: &AppState,
     identity: &IdentityKeyPair,
     signed_prekey: &SignedPreKey,
@@ -180,9 +193,10 @@ fn process_one(
         &envelope.ratchet_message,
         unsealed.timestamp,
     )
+    .await
 }
 
-fn deliver_decrypted(
+async fn deliver_decrypted(
     state: &AppState,
     contact: &Contact,
     mut session: Session,
@@ -209,6 +223,26 @@ fn deliver_decrypted(
         return ProcessOutcome::Unprocessable;
     };
 
+    match Envelope::decode(&plaintext) {
+        Ok(Envelope::Text { body, .. }) => deliver_text_message(state, contact, &body, sent_at),
+        Ok(Envelope::Call(signal)) => {
+            crate::calls::handle_incoming_call_signal(state, contact, signal).await;
+            ProcessOutcome::Delivered
+        }
+        // Reaction/Receipt/DisappearingTimerChanged/Typing envelopes
+        // aren't produced by any network sender yet (see module doc) —
+        // accepted and dropped rather than retried forever.
+        Ok(_) => ProcessOutcome::Delivered,
+        Err(_) => ProcessOutcome::Unprocessable,
+    }
+}
+
+fn deliver_text_message(
+    state: &AppState,
+    contact: &Contact,
+    body: &str,
+    sent_at: i64,
+) -> ProcessOutcome {
     let Ok(conversation) = state
         .db()
         .ensure_direct_conversation(&contact.contact_id, now())
@@ -229,7 +263,7 @@ fn deliver_decrypted(
         message_id: uuid::Uuid::new_v4().to_string(),
         conversation_id: conversation.conversation_id,
         sender_contact_id: Some(contact.contact_id.clone()),
-        body: Some(String::from_utf8_lossy(&plaintext).into_owned()),
+        body: Some(body.to_string()),
         sent_at,
         received_at: Some(received_at),
         expires_at,

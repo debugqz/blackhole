@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use bh_crypto::envelope::Envelope;
 use bh_storage::models::{Conversation, ConversationKind, Message};
 use serde::{Deserialize, Serialize};
 
@@ -174,12 +175,31 @@ pub async fn send_message(
                     .get_contact(contact_id)
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                     .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                // Wrapped in `Envelope::Text` (rather than sent as raw
+                // body bytes) so the mailbox/receive loop can tell a chat
+                // message apart from a `Envelope::Call` call-signal
+                // sharing the same session/mailbox — see
+                // `message_receive.rs`'s `deliver_decrypted` and
+                // `calls.rs`'s module doc for why signaling deliberately
+                // rides the same already-authenticated channel instead of
+                // a separate one.
+                // `reply_to_message_id` deliberately isn't forwarded here:
+                // it's a locally-generated id on this side, meaningless on
+                // the recipient's own `messages` table (whose FK would
+                // just reject it) — quote-reply over the real network is
+                // out of scope for this pass, same as reactions/receipts.
+                let envelope_bytes = Envelope::Text {
+                    body: req.body.clone(),
+                    reply_to_message_id: None,
+                }
+                .encode()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 crate::message_crypto::send_encrypted_over_network(
                     &state,
                     network,
                     &contact,
                     &message_id,
-                    req.body.as_bytes(),
+                    &envelope_bytes,
                 )
                 .await?;
             } else {

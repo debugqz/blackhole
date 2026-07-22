@@ -1,12 +1,34 @@
 //! Voice/video call endpoints, backed by `bh-calls` (real WebRTC transport
-//! plus SFrame end-to-end media encryption — see that crate's docs). As
-//! with messages (`conversations.rs`), actual delivery of the signaling
-//! payloads this produces (`bh_crypto::envelope::CallSignal`, serialized
-//! as JSON here) over the network waits on `bh-network` being wired into
-//! calls specifically (message send/receive already is — see
-//! `message_crypto.rs`) — a client today gets a real offer/answer/
-//! SFrame-context call session out of this API, but is responsible for
-//! ferrying the signal JSON to the other party itself.
+//! plus SFrame end-to-end media encryption — see that crate's docs).
+//!
+//! **1:1 call signaling now travels over the real network** the same way
+//! `Direct` messages do (`message_crypto.rs`/`message_receive.rs`):
+//! [`start_call`] with a `contact_id` pushes the resulting
+//! `CallSignal::Offer` straight to that contact's mailbox
+//! (`send_call_signal`), wrapped in `Envelope::Call` inside the same
+//! authenticated X3DH/Double Ratchet session text messages use — a
+//! mailbox operator sees identical-looking ciphertext either way (see
+//! `envelope.rs`'s module doc). The receiving daemon's own
+//! `message_receive.rs` loop decrypts it and dispatches into
+//! [`handle_incoming_call_signal`], which answers automatically and
+//! pushes the `Answer` back the same way; a `Hangup` signal travels the
+//! same path from either side. `POST /calls`'s `contact_id` is optional —
+//! omitting it (or no live `state.network`) keeps the older
+//! same-daemon/manual-ferry behavior (`accept_call`/`complete_call`
+//! consuming a signal a client copied over HTTP itself), which the
+//! existing same-daemon test still exercises unchanged.
+//!
+//! **Deliberately out of scope for this pass** (same spirit as
+//! `message_crypto.rs`'s v1 scoping): group-call signaling
+//! (`GroupOffer`/`GroupAnswer`) and `IceCandidate`/`KeyUpdate` — today's
+//! WebRTC transport gathers ICE fully before returning an SDP blob (no
+//! separate trickle-ICE messages exist to route yet), so `Offer`/
+//! `Answer`/`Hangup` are sufficient for full 1:1 feature parity with what
+//! this API already did locally. The desktop client (`client/desktop`)
+//! doesn't pass `contact_id` yet either — it still exercises the
+//! same-daemon demo path; wiring the UI to place a real call to a real
+//! contact (including handling an unprompted incoming offer, which has no
+//! client-side notification affordance today) is a separate follow-up.
 //!
 //! Call state lives in `AppState` only for the lifetime of the daemon
 //! process (in-memory, keyed by call id) — calls aren't persisted, unlike
@@ -54,8 +76,10 @@ use bh_calls::audio::{AudioDecoder, AudioEncoder};
 use bh_calls::group::{GroupCallSession, ParticipantTag, MAX_GROUP_CALL_PARTICIPANTS};
 use bh_calls::session::{self, CallSession, PendingOutgoingCall, DEFAULT_CAMERA_FPS};
 use bh_crypto::call_keys::SframeContext;
-use bh_crypto::envelope::CallSignal;
+use bh_crypto::envelope::{CallSignal, Envelope};
 use bh_crypto::mls::{Group as MlsGroup, MlsMember};
+use bh_network::supervised::SupervisedNetwork;
+use bh_storage::models::Contact;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
@@ -110,6 +134,14 @@ pub struct CallRegistry {
     /// replays this cached value as each new subscriber's first message.
     call_streams: Mutex<HashMap<String, CallStreamEntry>>,
     audio_handles: Mutex<HashMap<String, AudioHandle>>,
+    /// The remote contact a given 1:1 call's signaling is exchanged with
+    /// over `bh-network`'s mailbox (`send_call_signal`/
+    /// `handle_incoming_call_signal`) — absent for calls only ever
+    /// ferried locally (no `contact_id` given to [`start_call`], or
+    /// accepted via `POST /calls/incoming` directly). [`hangup_call`]
+    /// uses this to know who to notify, without threading a `Contact`
+    /// through every handler.
+    network_peers: Mutex<HashMap<String, Contact>>,
 }
 
 impl CallRegistry {
@@ -301,6 +333,14 @@ fn wire_live_media(
 pub struct StartCallRequest {
     pub call_id: String,
     pub video: bool,
+    /// When present and a live network is attached, the resulting offer
+    /// is also pushed straight to this contact's mailbox
+    /// (`send_call_signal`) instead of leaving delivery entirely to the
+    /// caller — see module doc. `None` keeps the older manual-ferry
+    /// behavior (client copies the returned `signal` itself), which the
+    /// same-daemon test still exercises.
+    #[serde(default)]
+    pub contact_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -308,8 +348,35 @@ pub struct CallSignalResponse {
     pub signal: CallSignal,
 }
 
+/// Wraps `signal` in `Envelope::Call` and pushes it through `contact`'s
+/// real X3DH/Double-Ratchet-encrypted mailbox — the same channel
+/// `message_crypto::send_encrypted_over_network` uses for chat text, just
+/// with a different envelope variant on top (see module doc for why that
+/// matters for metadata resistance).
+async fn send_call_signal(
+    state: &AppState,
+    network: &SupervisedNetwork,
+    contact: &Contact,
+    signal: CallSignal,
+) -> Result<(), StatusCode> {
+    let plaintext = Envelope::Call(signal)
+        .encode()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let message_id = uuid::Uuid::new_v4().to_string();
+    crate::message_crypto::send_encrypted_over_network(
+        state,
+        network,
+        contact,
+        &message_id,
+        &plaintext,
+    )
+    .await
+}
+
 /// Places an outgoing call: sets up local WebRTC transport and returns the
-/// offer signal for the client to deliver to the callee.
+/// offer signal. When `contact_id` is given and a live network is
+/// attached, also pushes that offer to the contact's mailbox — see module
+/// doc.
 pub async fn start_call(
     State(state): State<Arc<AppState>>,
     Json(req): Json<StartCallRequest>,
@@ -317,6 +384,26 @@ pub async fn start_call(
     let (pending, offer) = PendingOutgoingCall::start(req.call_id.clone(), req.video)
         .await
         .map_err(to_status)?;
+
+    if let Some(contact_id) = &req.contact_id {
+        let network = state
+            .network
+            .as_ref()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let contact = state
+            .db()
+            .get_contact(contact_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        send_call_signal(&state, network, &contact, offer.clone()).await?;
+        state
+            .calls
+            .network_peers
+            .lock()
+            .await
+            .insert(req.call_id.clone(), contact);
+    }
+
     state
         .calls
         .pending_outgoing
@@ -324,6 +411,154 @@ pub async fn start_call(
         .await
         .insert(req.call_id, pending);
     Ok(Json(CallSignalResponse { signal: offer }))
+}
+
+/// Dispatches a `CallSignal` that arrived over `bh-network`'s mailbox
+/// (`message_receive.rs`, once the enclosing `Envelope::Call` has been
+/// decrypted) — the receive-side counterpart to [`start_call`]/
+/// [`hangup_call`] pushing signals out. `contact` is whoever the
+/// mailbox's sealed-sender unsealing already proved sent this signal, so
+/// an `Offer` here is answered without any additional trust decision: the
+/// underlying session it travelled inside already gates that (see
+/// `bh_crypto::call_keys`'s doc comment on why call setup is implicitly
+/// authenticated by riding an already-trusted session).
+pub(crate) async fn handle_incoming_call_signal(
+    state: &AppState,
+    contact: &Contact,
+    signal: CallSignal,
+) {
+    match &signal {
+        CallSignal::Offer { .. } => {
+            let (session, sframe, answer) = match session::accept_incoming_call(&signal).await {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::warn!(%err, "failed to accept an incoming network call offer");
+                    return;
+                }
+            };
+            let session = Arc::new(session);
+            let call_id = session.call_id.clone();
+
+            let tx = state.calls.create_stream(&call_id).await;
+            let audio_handle =
+                wire_live_media(&session, sframe, bh_calls::signaling::CALLER_SENDER_TAG, tx);
+            if let Some(audio_handle) = audio_handle {
+                state
+                    .calls
+                    .audio_handles
+                    .lock()
+                    .await
+                    .insert(call_id.clone(), audio_handle);
+            }
+            state
+                .calls
+                .record_event(&call_id, call_stream::CallEvent::Connected)
+                .await;
+            state
+                .calls
+                .active
+                .lock()
+                .await
+                .insert(call_id.clone(), session);
+            state
+                .calls
+                .network_peers
+                .lock()
+                .await
+                .insert(call_id, contact.clone());
+
+            if let Some(network) = state.network.as_ref() {
+                if let Err(err) = send_call_signal(state, network, contact, answer).await {
+                    tracing::warn!(?err, "failed to send call answer back over the network");
+                }
+            }
+        }
+        CallSignal::Answer { call_id, .. } => {
+            let call_id = call_id.clone();
+            let Some(pending) = state.calls.pending_outgoing.lock().await.remove(&call_id) else {
+                tracing::warn!(%call_id, "received a network call answer for a call we didn't start");
+                return;
+            };
+            let (session, sframe) = match pending.complete(&signal).await {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::warn!(%err, "failed to complete an outgoing call from a network answer");
+                    return;
+                }
+            };
+            let session = Arc::new(session);
+
+            let tx = state.calls.create_stream(&call_id).await;
+            let audio_handle =
+                wire_live_media(&session, sframe, bh_calls::signaling::CALLEE_SENDER_TAG, tx);
+            if let Some(audio_handle) = audio_handle {
+                state
+                    .calls
+                    .audio_handles
+                    .lock()
+                    .await
+                    .insert(call_id.clone(), audio_handle);
+            }
+            state
+                .calls
+                .record_event(&call_id, call_stream::CallEvent::Connected)
+                .await;
+            state.calls.active.lock().await.insert(call_id, session);
+        }
+        CallSignal::Hangup { call_id } => {
+            let call_id = call_id.clone();
+            if let Some(session) = state.calls.active.lock().await.remove(&call_id) {
+                state
+                    .calls
+                    .record_event(&call_id, call_stream::CallEvent::Hangup)
+                    .await;
+                state.calls.teardown_call(&call_id).await;
+                if let Err(err) = session.hangup().await {
+                    tracing::warn!(%err, "failed to tear down call after a network hangup signal");
+                }
+            }
+            state.calls.pending_outgoing.lock().await.remove(&call_id);
+            state.calls.network_peers.lock().await.remove(&call_id);
+        }
+        CallSignal::GroupOffer { .. }
+        | CallSignal::GroupAnswer { .. }
+        | CallSignal::IceCandidate { .. }
+        | CallSignal::KeyUpdate { .. } => {
+            tracing::debug!(
+                "ignoring group/ICE/key-update call signal over the network — not wired \
+                 for 1:1 calls in this pass (see module doc)"
+            );
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct CallStatusResponse {
+    pub status: &'static str,
+}
+
+/// Cheap polling alternative to `GET /calls/:call_id/ws` for "has this
+/// call connected yet" — used by real-network callers on either side
+/// (including this crate's own two-daemon integration test) that just
+/// need a yes/no rather than a live event stream.
+pub async fn call_status(
+    State(state): State<Arc<AppState>>,
+    Path(call_id): Path<String>,
+) -> Json<CallStatusResponse> {
+    let status = if state.calls.active.lock().await.contains_key(&call_id) {
+        "active"
+    } else if state
+        .calls
+        .pending_outgoing
+        .lock()
+        .await
+        .contains_key(&call_id)
+    {
+        "pending"
+    } else {
+        "unknown"
+    };
+    Json(CallStatusResponse { status })
 }
 
 #[derive(Deserialize)]
@@ -416,23 +651,55 @@ pub async fn complete_call(
     Ok(StatusCode::OK)
 }
 
+/// Hangs up a 1:1 call, whether it's already `active` or still
+/// `pending_outgoing` (rung but not yet answered). If this call's
+/// signaling was exchanged over the real network (`network_peers` has an
+/// entry), also pushes a `CallSignal::Hangup` to that contact so the
+/// other daemon tears its own side down too, rather than waiting to
+/// notice a dead connection.
 pub async fn hangup_call(
     State(state): State<Arc<AppState>>,
     Path(call_id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let session = state.calls.active.lock().await.remove(&call_id);
-    match session {
-        Some(session) => {
-            state
-                .calls
-                .record_event(&call_id, call_stream::CallEvent::Hangup)
-                .await;
-            state.calls.teardown_call(&call_id).await;
-            session.hangup().await.map_err(to_status)?;
-            Ok(StatusCode::OK)
-        }
-        None => Err(StatusCode::NOT_FOUND),
+    let was_pending = state
+        .calls
+        .pending_outgoing
+        .lock()
+        .await
+        .remove(&call_id)
+        .is_some();
+    let peer = state.calls.network_peers.lock().await.remove(&call_id);
+
+    if session.is_none() && !was_pending {
+        return Err(StatusCode::NOT_FOUND);
     }
+
+    if let Some(session) = session {
+        state
+            .calls
+            .record_event(&call_id, call_stream::CallEvent::Hangup)
+            .await;
+        state.calls.teardown_call(&call_id).await;
+        session.hangup().await.map_err(to_status)?;
+    }
+
+    if let (Some(contact), Some(network)) = (peer, state.network.as_ref()) {
+        if let Err(err) = send_call_signal(
+            &state,
+            network,
+            &contact,
+            CallSignal::Hangup {
+                call_id: call_id.clone(),
+            },
+        )
+        .await
+        {
+            tracing::warn!(?err, "failed to notify peer of hangup over the network");
+        }
+    }
+
+    Ok(StatusCode::OK)
 }
 
 fn default_camera_fps() -> u32 {

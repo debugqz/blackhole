@@ -296,6 +296,7 @@ impl ApiServer {
             )
             .route("/search", get(search::search_messages))
             .route("/calls", post(calls::start_call))
+            .route("/calls/:call_id", get(calls::call_status))
             .route("/calls/incoming", post(calls::accept_call))
             .route("/calls/:call_id/complete", post(calls::complete_call))
             .route("/calls/:call_id/hangup", post(calls::hangup_call))

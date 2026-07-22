@@ -12,7 +12,13 @@
 //! `GET /network/status`; `bh-api::conversations::send_message` also
 //! uses it directly for `Direct` conversations (`message_crypto.rs`),
 //! falling back to local-storage-only behavior when no network is
-//! attached — `Group` conversations aren't wired to it yet.
+//! attached — `Group` conversations aren't wired to it yet. The receive
+//! side of that same wiring (`bh_api::message_receive::spawn_receive_loop`)
+//! is spawned below, once the network/state are set up — it previously
+//! existed only as code this crate's own integration test exercised
+//! directly, never actually started by this binary, so a real running
+//! daemon never delivered an incoming `Direct` message or call signal
+//! until this pass.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +45,16 @@ const DEFAULT_PROFILE_NAME: &str = "Default";
 /// interfaces isn't appropriate.
 const DEFAULT_NETWORK_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
 const NETWORK_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the background mailbox receive loop
+/// (`bh_api::message_receive::spawn_receive_loop`) ticks. This is also the
+/// loop that now delivers real-network call signaling
+/// (`bh_api::calls`'s `send_call_signal`/`handle_incoming_call_signal`),
+/// so it directly bounds "how long until an incoming message or call
+/// offer is noticed." A fixed 1s poll is a pragmatic first-pass value —
+/// call setup latency would benefit from a faster (or configurable)
+/// interval more than chat does, but that's a follow-up tuning pass, not
+/// a correctness concern.
+const MESSAGE_RECEIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// How often this daemon re-publishes its own Key Transparency tree head
 /// (`docs/THREAT_MODEL.md` §3.1) — Kademlia records expire, so a
 /// long-lived daemon needs to periodically republish the same way
@@ -236,6 +252,15 @@ async fn main() {
     }
     write_api_token_file(&data_dir, &state.api_token);
     let state = Arc::new(state);
+
+    // Real `Direct`-message and call-signal delivery (SPEC.md §17,
+    // `bh_api::message_crypto`/`message_receive`/`calls`): pulls this
+    // identity's mailbox, decrypts, and dispatches by envelope variant —
+    // a no-op tick when `state.network` is `None`, so it's safe to spawn
+    // unconditionally rather than gating it like the tree-head loop below
+    // does (this loop's own per-tick check already covers "no live
+    // network").
+    bh_api::message_receive::spawn_receive_loop(state.clone(), MESSAGE_RECEIVE_INTERVAL);
 
     // Key Transparency tree-head gossip (docs/THREAT_MODEL.md §3.1):
     // periodically (re-)publishes whichever profile is active *at daemon
