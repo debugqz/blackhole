@@ -100,6 +100,18 @@ pub async fn create_identity(
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Every profile gets exactly one local-only "Notes to self"
+    // conversation — create it eagerly right here at bootstrap so it's
+    // already there the first time this profile's conversation list is
+    // fetched. `ensure_self_conversation` is idempotent (`GET
+    // /conversations` also calls it, as a lazy fallback for profiles that
+    // predate this call), so calling it here too is just
+    // belt-and-suspenders, not a source of duplicates.
+    state
+        .db()
+        .ensure_self_conversation(now())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     let (signing_pub, agreement_pub) =
         split_public(&public_bytes).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(CreateIdentityResponse {

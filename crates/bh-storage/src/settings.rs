@@ -28,4 +28,23 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Opt-in "typing…" presence indicator toggle (see `bh-api::presence`).
+    /// Absent key == off: this must default to OFF without requiring a
+    /// migration or an explicit row, so a fresh/existing database with no
+    /// opinion on the setting behaves as "never send typing signals."
+    /// Only the on/off *preference* lives here — the ephemeral typing
+    /// signal itself never touches this table or any other durable store.
+    pub fn typing_indicators_enabled(&self) -> Result<bool, StorageError> {
+        Ok(self.get_setting(TYPING_INDICATORS_SETTING_KEY)?.as_deref() == Some("1"))
+    }
+
+    pub fn set_typing_indicators_enabled(&self, enabled: bool) -> Result<(), StorageError> {
+        self.set_setting(
+            TYPING_INDICATORS_SETTING_KEY,
+            if enabled { "1" } else { "0" },
+        )
+    }
 }
+
+const TYPING_INDICATORS_SETTING_KEY: &str = "typing_indicators_enabled";

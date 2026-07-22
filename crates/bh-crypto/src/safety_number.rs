@@ -99,14 +99,7 @@ pub fn format_grouped(digits: &str) -> String {
 /// SVG QR code of the raw 60-digit safety number, for scan-to-compare
 /// verification instead of manually reading digits aloud.
 pub fn to_qr_svg(digits: &str) -> Result<String, CryptoError> {
-    let code = qrcode::QrCode::new(digits.as_bytes())
-        .map_err(|_| CryptoError::NotImplemented("safety_number: QR encoding failed"))?;
-    Ok(code
-        .render()
-        .min_dimensions(256, 256)
-        .dark_color(qrcode::render::svg::Color("#000000"))
-        .light_color(qrcode::render::svg::Color("#ffffff"))
-        .build())
+    crate::qr::to_svg(digits)
 }
 
 #[cfg(test)]

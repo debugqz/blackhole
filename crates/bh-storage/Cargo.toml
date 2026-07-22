@@ -22,5 +22,23 @@ tracing = { workspace = true }
 #   Secure Enclave (iOS), Keystore/StrongBox (Android) — mobile, out of
 #   scope until a mobile client exists.
 #   Desktop fallback (Keychain/DPAPI/Secret Service) is implemented via the
-#   `keyring` crate, added below.
-keyring = "3"
+#   `keyring` crate. Without a platform feature enabled, `keyring` silently
+#   falls back to its in-memory mock store instead of erroring — which
+#   looks like it works right up until the process restarts and the "saved"
+#   key is gone. The per-target sections below are what actually wire it to
+#   the real OS credential store.
+
+# db_key_lock.rs: reuses bh-crypto's existing Argon2id+ChaCha20Poly1305
+# passphrase-sealing primitive (backup.rs) to wrap the SQLCipher database
+# key behind a user PIN (THREAT_MODEL.md §3.7). bh-crypto has no
+# dependency back on bh-storage, so this doesn't create a cycle.
+bh-crypto = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["linux-native-sync-persistent"] }

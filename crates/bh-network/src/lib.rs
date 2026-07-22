@@ -9,6 +9,7 @@ pub mod mailbox;
 pub mod onion;
 pub mod pow;
 pub mod sealed_sender;
+pub mod supervised;
 pub mod transport;
 
 #[derive(Debug, thiserror::Error)]

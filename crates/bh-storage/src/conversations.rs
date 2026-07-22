@@ -8,9 +8,19 @@ use crate::{
 fn kind_from_str(s: &str) -> ConversationKind {
     match s {
         "group" => ConversationKind::Group,
+        "self" => ConversationKind::SelfNotes,
         _ => ConversationKind::Direct,
     }
 }
+
+/// Fixed conversation id for the singleton local-only "Notes to self"
+/// conversation. Using a constant id rather than a random uuid means
+/// "exactly one per profile" falls out of the `conversation_id` primary key
+/// plus `ON CONFLICT DO NOTHING` in [`Database::ensure_self_conversation`]
+/// below, with no extra uniqueness bookkeeping — and since every profile
+/// has its own physically separate SQLCipher database file, the same fixed
+/// id in two different profiles never collides with anything.
+pub const SELF_CONVERSATION_ID: &str = "self-notes";
 
 fn row_to_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
     let kind: String = row.get(1)?;
@@ -107,5 +117,22 @@ impl Database {
             .get_conversation(conversation_id)?
             .and_then(|c| c.disappearing_timer_secs)
             .map(|timer| sent_at + timer))
+    }
+
+    /// Idempotently ensures this profile's singleton "Notes to self"
+    /// conversation exists, creating it on first call and returning the
+    /// (possibly pre-existing) row on every call after that. Safe to call
+    /// on every `GET /conversations` and again at identity bootstrap —
+    /// `ON CONFLICT DO NOTHING` against the fixed [`SELF_CONVERSATION_ID`]
+    /// makes repeat calls a no-op rather than an error or a duplicate row.
+    pub fn ensure_self_conversation(&self, created_at: i64) -> Result<Conversation, StorageError> {
+        self.conn()?.execute(
+            "INSERT INTO conversations (conversation_id, kind, contact_id, group_id, created_at)
+             VALUES (?1, 'self', NULL, NULL, ?2)
+             ON CONFLICT(conversation_id) DO NOTHING",
+            params![SELF_CONVERSATION_ID, created_at],
+        )?;
+        self.get_conversation(SELF_CONVERSATION_ID)?
+            .ok_or(StorageError::NotFound)
     }
 }

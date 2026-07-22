@@ -27,6 +27,8 @@ use crate::StorageError;
 
 const MANIFEST_FILE: &str = "profiles.json";
 const DB_FILE_NAME: &str = "blackhole.db";
+const PAYMENTS_DB_FILE_NAME: &str = "payments.db";
+const MLS_DB_FILE_NAME: &str = "mls.db";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProfileMeta {
@@ -73,13 +75,32 @@ impl ProfileManager {
         self.root_dir.join(MANIFEST_FILE)
     }
 
+    /// Loads the manifest, pruning any entry whose data directory has
+    /// vanished. The only way that can happen is [`delete_profile`]
+    /// crashing between `panic_wipe` removing a profile's directory and
+    /// the manifest write that removes its entry — without this
+    /// self-heal, `Database::open`/`PaymentsDatabase::open` would
+    /// silently create a fresh, empty database for what the user was told
+    /// was a deleted profile, since both `open` on a missing path just
+    /// creates one. Pruning here means a crash mid-delete can't resurrect
+    /// the profile; it just finishes disappearing on the next access.
+    ///
+    /// [`delete_profile`]: ProfileManager::delete_profile
     fn load_manifest(&self) -> Result<Manifest, StorageError> {
         let path = self.manifest_path();
         if !path.exists() {
             return Ok(Manifest::default());
         }
         let bytes = fs::read(&path)?;
-        serde_json::from_slice(&bytes).map_err(Into::into)
+        let mut manifest: Manifest = serde_json::from_slice(&bytes)?;
+        let before = manifest.profiles.len();
+        manifest
+            .profiles
+            .retain(|p| self.profile_data_dir(&p.id).exists());
+        if manifest.profiles.len() != before {
+            self.save_manifest(&manifest)?;
+        }
+        Ok(manifest)
     }
 
     fn save_manifest(&self, manifest: &Manifest) -> Result<(), StorageError> {
@@ -142,6 +163,28 @@ impl ProfileManager {
 
     pub fn profile_db_path(&self, profile_id: &str) -> PathBuf {
         self.profile_data_dir(profile_id).join(DB_FILE_NAME)
+    }
+
+    /// Path to this profile's *payments* database — a separate SQLCipher
+    /// file from [`ProfileManager::profile_db_path`], opened with a
+    /// separate key (see `keystore::PAYMENTS_DB_KEY_LABEL`). Same
+    /// per-profile isolation this module already gives identities, applied
+    /// a second time between a profile's messages and its purchases
+    /// (SPEC.md §12, CLAUDE.md non-negotiables).
+    pub fn payments_db_path(&self, profile_id: &str) -> PathBuf {
+        self.profile_data_dir(profile_id)
+            .join(PAYMENTS_DB_FILE_NAME)
+    }
+
+    /// Path to this profile's *MLS group storage* database — a separate
+    /// SQLCipher file from both [`ProfileManager::profile_db_path`] and
+    /// [`ProfileManager::payments_db_path`], opened with its own key (see
+    /// `keystore::MLS_DB_KEY_LABEL`) via
+    /// `bh_crypto::mls_storage::PersistentMlsProvider::open`. Nested under
+    /// [`ProfileManager::profile_data_dir`] like the other two, so
+    /// [`ProfileManager::delete_profile`] already cleans it up for free.
+    pub fn mls_db_path(&self, profile_id: &str) -> PathBuf {
+        self.profile_data_dir(profile_id).join(MLS_DB_FILE_NAME)
     }
 
     fn keystore_service_name(&self, profile_id: &str) -> String {
@@ -232,6 +275,28 @@ mod tests {
         assert!(mgr.get_profile(&work.id).unwrap().is_none());
         assert!(!mgr.profile_data_dir(&work.id).exists());
         assert_eq!(mgr.list_profiles().unwrap().len(), 1);
+    }
+
+    /// Regression test: simulates `delete_profile` crashing after
+    /// `panic_wipe` removes the profile's directory but before the
+    /// manifest write that removes its entry. `load_manifest` must
+    /// self-heal — otherwise the profile would keep showing up in
+    /// `list_profiles`/`get_profile` pointing at a directory that no
+    /// longer exists, and reopening it would silently create a fresh,
+    /// empty database instead of surfacing that it was deleted.
+    #[test]
+    fn a_manifest_entry_whose_directory_vanished_is_pruned_on_next_load() {
+        let (mgr, _dir) = test_manager("crash-mid-delete");
+        let a = mgr.create_profile("A", 0).unwrap();
+        let b = mgr.create_profile("B", 0).unwrap();
+
+        // Simulate the crash: directory gone, manifest entry still there.
+        fs::remove_dir_all(mgr.profile_data_dir(&a.id)).unwrap();
+
+        assert!(mgr.get_profile(&a.id).unwrap().is_none());
+        let listed = mgr.list_profiles().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, b.id);
     }
 
     #[test]

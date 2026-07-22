@@ -18,34 +18,44 @@ structural property of the protocol.
 
 ## Status
 
-**Core protocol logic is implemented and tested (93 tests across
-`bh-crypto`/`bh-network`/`bh-storage`/`bh-files`), but there is no live
-network deployment yet.** Concretely:
+**Core protocol logic is implemented and tested (285 tests across
+`bh-crypto`/`bh-network`/`bh-storage`/`bh-files`/`bh-api`/`bh-calls`/
+`bh-push-relay`), and the desktop client is now a real, end-to-end wired
+product UI — but there is still no live P2P network deployment.**
+Concretely:
 
 | Piece | State |
 |---|---|
-| Identity, X3DH + Double Ratchet (1:1 sessions) | ✅ Implemented, tested |
-| MLS groups (via `openmls`) | ✅ Implemented, tested — state not yet persisted across daemon restarts |
-| Post-quantum hybrid handshake (X25519 + ML-KEM-768) | ✅ Implemented, tested — **not yet wired into live X3DH sessions** |
-| Onion routing (3+ hop circuits) | ✅ Implemented, tested — **known packet-size metadata leak**, see below |
+| Identity, X3DH + Double Ratchet (1:1 sessions) | ✅ Implemented, tested — **PQ hybrid now integrated into live sessions** (see below) |
+| MLS groups (via `openmls`), incl. broadcast channels | ✅ Implemented, tested — state now **survives a daemon restart** |
+| Post-quantum hybrid handshake (X25519 + ML-KEM-768) | ✅ Implemented, tested, **and wired into every real X3DH session** — not just a standalone primitive anymore |
+| Key Transparency (RFC 6962 Merkle proofs) | 🟡 Client-side primitive implemented, tested — no gossiped log deployed yet, so MITM detection in practice is still manual-verification-only |
+| Onion routing (3+ hop circuits) | ✅ Implemented, tested — packet-size **bucketed/padded** (mitigated, not eliminated), see below |
 | Kademlia DHT, node selection, Sybil/Eclipse resistance | ✅ Implemented, tested against local multi-node scenarios |
-| Mailboxes (store-and-forward) + sealed sender | ✅ Implemented, tested — manifest has a known race condition under concurrent writers |
-| Cover traffic, anti-spam PoW | ✅ Implemented, tested — **PoW not yet enforced anywhere server-side** |
-| Local encrypted storage (SQLCipher), OS keystore, panic wipe | ✅ Implemented, tested |
+| Mailboxes (store-and-forward) + sealed sender | ✅ Implemented, tested — manifest race now closed (read-merge-write-verify retry); PoW now enforced server-side |
+| Cover traffic, anti-spam PoW | ✅ Implemented, tested, **PoW now verified server-side by mailbox nodes** |
+| `bh-network` spawned by the daemon | 🟡 Listening and supervised (auto-respawns on the live `yamux` CVE panic) — **still not wired into message send/receive**, `bh-api` talks to the local DB directly |
+| Local encrypted storage (SQLCipher), OS keystore, panic wipe | ✅ Implemented, tested — optional PIN layer in front of the DB key |
 | File chunking, per-chunk E2EE, resumable download | ✅ Implemented, tested |
-| Daemon localhost API (`bh-api`) | ✅ Real endpoints, verified via live HTTP smoke tests |
-| Desktop client (Tauri) | 🟡 Minimal dev shell — health check, panic wipe button, window-blur mitigation. Not product UI. |
-| **`bh-network` wired into the daemon / a live network** | ❌ Not connected yet — network layer is complete and tested standalone but daemon send/receive doesn't talk to it |
-| Key Transparency log | ❌ Not implemented — MITM detection is manual-verification-only today |
+| Daemon localhost API (`bh-api`) | ✅ ~90 real endpoints across 28 modules, verified via live HTTP smoke tests + an in-process integration suite |
+| Desktop client (Tauri) | ✅ Real product UI ("Event Horizon") — see [Feature set](#feature-set) below for the full list |
+| Voice/video calls, 1:1 (`bh-calls`) | ✅ Real WebRTC + SFrame media encryption, tested — no STUN/TURN yet, no client UI yet |
+| Group calls (full-mesh, MLS-exporter-keyed) | ✅ Implemented, tested — same STUN/TURN and client-UI gap as 1:1 |
+| Screen sharing (same VP8/SFrame pipeline as camera) | ✅ Implemented, tested — same STUN/TURN and client-UI gap |
+| Device sync (keep a linked device's history current) | ✅ Real X3DH/Double Ratchet round-trip — peer is a locally-simulated shadow device, not a real second process yet |
+| Cosmetics store, sticker packs | ✅ Implemented, tested — payment *confirmation* deliberately requires a real BTCPay webhook, not reachable from the client |
+| Opaque wake-push relay (`bh-push-relay`) | ✅ New, separate, internet-facing binary — real register/wake contract, tested; not yet wired to a real APNs/FCM/UnifiedPush backend or to the daemon's mailbox code |
+| Client-side link previews | ✅ Implemented — opt-in (off by default), deliberately bypasses the daemon entirely |
+| Local full-text message search (FTS5) | ✅ Implemented, tested — pure local query, nothing leaves the daemon |
 | Deployed infrastructure (relay/mailbox nodes, TURN, KT log) | ❌ Not deployed |
-| Payments (Monero/BTC/ETH via BTCPay) | ❌ Not implemented |
+| Payments (Monero/BTC/ETH via BTCPay) | ❌ Not implemented — only the cosmetics-store data model + isolation boundary exist |
 | Mobile / web clients | ❌ Not started — desktop-only for now |
 
 `cargo fmt` / `cargo clippy -D warnings` clean, CI green on every push/PR
 (`.github/workflows/ci.yml`). **Nothing here has been through independent
 security review.** Treat every claim below as "implements the intended
 design, unreviewed" — see `docs/THREAT_MODEL.md` for the honest per-module
-breakdown, especially the onion routing module.
+breakdown, especially the onion routing module and the calls media path.
 
 ---
 
@@ -53,8 +63,10 @@ breakdown, especially the onion routing module.
 
 - [Design pillars](#design-pillars)
 - [Architecture](#architecture)
+- [Feature set](#feature-set)
 - [Repo layout](#repo-layout)
 - [How a message travels](#how-a-message-travels-1-1-target-design)
+- [Group calls & screen sharing](#group-calls--screen-sharing)
 - [Cryptography](#cryptography)
 - [Network & anonymity](#network--anonymity)
 - [Local device security](#local-device-security)
@@ -63,6 +75,7 @@ breakdown, especially the onion routing module.
 - [Payments & monetization](#payments--monetization)
 - [Threat model summary](#threat-model-summary)
 - [Building & running](#building--running)
+- [Daemon API surface](#daemon-api-surface-localhost-only)
 - [Distribution plans](#distribution-plans)
 - [Governance](#governance)
 - [License](#license)
@@ -102,22 +115,27 @@ through a local daemon that owns key material, the encrypted database, and
 ```mermaid
 graph TB
     subgraph device["User's device"]
-        UI["Desktop client (Tauri + TypeScript)<br/>client/desktop"]
-        API["bh-api — localhost RPC surface<br/>127.0.0.1 only, JSON over HTTP"]
+        UI["Desktop client (Tauri + TypeScript)<br/>client/desktop — 'Event Horizon' UI"]
+        API["bh-api — localhost RPC surface<br/>127.0.0.1 only, JSON over HTTP<br/>~90 routes across 28 modules"]
         Daemon["bh-daemon binary<br/>daemon/"]
 
         UI <-->|"HTTP, loopback only<br/>never reaches the network directly"| API
         API --- Daemon
 
         subgraph libs["Library crates owned by the daemon"]
-            Crypto["bh-crypto<br/>identity, X3DH + Double Ratchet,<br/>MLS, PQ hybrid, invites,<br/>device linking, backups"]
-            Storage["bh-storage<br/>SQLCipher DB, OS keystore,<br/>self-destruct sweeper"]
+            Crypto["bh-crypto<br/>identity, X3DH + Double Ratchet,<br/>MLS, PQ hybrid, invites,<br/>device linking, backups,<br/>key transparency primitive"]
+            Storage["bh-storage<br/>SQLCipher DB, OS keystore,<br/>self-destruct sweeper,<br/>local FTS5 search"]
             Files["bh-files<br/>content-addressed chunking,<br/>per-chunk E2EE, resumable DL"]
+            Calls["bh-calls<br/>WebRTC + SFrame media crypto<br/>1:1, group (full-mesh), screen share"]
         end
 
         Daemon --> Crypto
         Daemon --> Storage
         Daemon --> Files
+        Daemon --> Calls
+
+        LinkPreview["link_preview.rs — Tauri command<br/>bypasses the daemon entirely, opt-in"]
+        UI -.->|"direct HTTP fetch,<br/>never through the daemon"| LinkPreview
     end
 
     subgraph net["bh-network — real & tested, not yet wired into the daemon"]
@@ -127,7 +145,7 @@ graph TB
         Mailbox["Encrypted mailboxes<br/>store-and-forward, TTL"]
         Sealed["Sealed sender"]
         Cover["Cover traffic"]
-        PoW["Anti-spam PoW"]
+        PoW["Anti-spam PoW, enforced"]
 
         Transport --> DHT
         DHT --> Onion
@@ -135,15 +153,68 @@ graph TB
         Mailbox --- Sealed
     end
 
-    Daemon -.->|"planned integration —<br/>not connected today"| Transport
+    Daemon -->|"spawned + supervised,<br/>listening — not yet on the<br/>send/receive path"| Transport
+
+    subgraph relay["Separate internet-facing service"]
+        PushRelay["bh-push-relay<br/>opaque wake-token relay only —<br/>no content, no identity, opt-in"]
+    end
+
+    Daemon -.->|"planned: mailbox arrival →<br/>opaque wake — not wired yet"| PushRelay
 
     style net fill:#1a1a2e,stroke:#666,stroke-dasharray: 4 4
+    style relay fill:#1a1a2e,stroke:#666,stroke-dasharray: 4 4
 ```
 
 Everything inside `bh-network` is real, tested, working code — it is just
 not yet the thing the daemon calls when you hit "send." That integration
 (daemon ⇄ network) is the biggest remaining piece of plumbing before
 Blackhole is a live network rather than a well-tested protocol stack.
+`bh-push-relay` is a new, separate, deliberately minimal service (not part
+of the loopback-only daemon) — its wake-only contract is real and tested,
+but nothing calls it yet either.
+
+---
+
+## Feature set
+
+Everything below is real, tested code living in the crates/modules named —
+not a roadmap. "Client UI" means it's reachable from the desktop app
+today; "backend only" means the daemon/API/crypto path is real and tested
+but there's no button for it yet (the same gap 1:1 calls already had
+before group calls/screen sharing were added — see
+[Status](#status)).
+
+| Feature | Client UI | Backend module(s) |
+|---|---|---|
+| Contacts, conversations, messages | ✅ | `bh-api::{contacts,conversations}` |
+| Message reactions, quote-reply | ✅ | `bh-api::reactions` |
+| **Message editing** (history preserved, never overwritten) | ✅ | `bh-api::conversations::edit_message` |
+| Disappearing-message timers | ✅ | `bh-storage::expiry` |
+| Delivery/read receipts | ✅ | `bh-api::receipts` |
+| Safety-number verification | ✅ | `bh-crypto::safety_number` |
+| Expiring / single-use invites | ✅ | `bh-crypto::invite`, `bh-storage::invites` |
+| Encrypted conversation export/import | ✅ | `bh-api::export` |
+| Multi-account profiles | ✅ | `bh-storage::profiles` |
+| Device linking (local simulation) | ✅ | `bh-api::device_link` |
+| **Device sync** (keep a linked device's history current) | ✅ | `bh-api::device_sync` |
+| Passkey/TOTP local unlock | ✅ | `bh-api::local_auth` |
+| Groups (MLS) | ✅ | `bh-api::groups`, `bh-crypto::mls` |
+| **Broadcast channels** (owner-only posting) | ✅ | `bh-api::groups`/`conversations` (`broadcast_only`) |
+| **Notes to self** (local-only, no session) | ✅ | `bh-storage::conversations::ensure_self_conversation` |
+| File/media attachments | ✅ | `bh-api::files`, `bh-files` |
+| **Voice messages** | ✅ | `bh-api::files` (`attachment_kind: voice`) |
+| **Local full-text message search** | ✅ | `bh-storage::search` (SQLite FTS5) |
+| **Cosmetics store** (banners/themes/badges/stickers) | ✅ | `bh-api::cosmetics` |
+| **Sticker packs in chat** | ✅ | `bh-api::stickers` |
+| **Opt-in "typing…" presence** | ✅ | `bh-api::presence` |
+| **Opt-in client-side link previews** | ✅ | `client/desktop/src-tauri/src/link_preview.rs` |
+| **Opt-in wake-push registration** | ✅ | `bh-api::push`, `crates/bh-push-relay` |
+| Panic wipe, PIN-locked DB key | ✅ | `bh-api::{panic_wipe,security}` |
+| Voice/video calls, 1:1 | ❌ backend only | `bh-calls::session` |
+| **Group calls** (full-mesh, MLS-exporter-keyed) | ❌ backend only | `bh-calls::group` |
+| **Screen sharing** | ❌ backend only | `bh-calls::screen` |
+| Crypto payment requests in chat | ✅ | `bh-api::payment_requests` |
+| Moderation (block, message requests, reports) | ✅ | `bh-api::moderation` |
 
 ---
 
@@ -152,20 +223,29 @@ Blackhole is a live network rather than a well-tested protocol stack.
 ```
 daemon/                bh-daemon binary — localhost daemon (SPEC.md §6)
                         owns the SQLCipher DB + platform keystore, runs the
-                        self-destruct sweeper, exposes the bh-api server.
+                        self-destruct sweeper, exposes the bh-api server,
+                        spawns + supervises bh-network.
 
 crates/
-  bh-crypto/            Identity, X3DH + Double Ratchet, MLS, PQ hybrid,
-                         passkeys/TOTP, invites, device linking, backups.
-                         (SPEC.md §2-4)
-      identity.rs         long-term identity keypair + safety-number verification
-      ratchet.rs           X3DH handshake + Double Ratchet session state
-      mls.rs                group messaging via openmls (RFC 9420)
-      pq_hybrid.rs          X25519 + ML-KEM-768 hybrid handshake (standalone)
-      auth.rs               passkeys/FIDO2 (webauthn-rs) + TOTP backup
-      invite.rs             QR/link contact invites
-      device_link.rs        multi-device linking
-      backup.rs             Argon2-derived encrypted backup keys
+  bh-crypto/            Identity, X3DH + Double Ratchet (PQ-hybrid by
+                         default), MLS, passkeys/TOTP, invites, device
+                         linking, backups, key transparency. (SPEC.md §2-4)
+      identity.rs          long-term identity keypair + safety-number verification
+      ratchet.rs            X3DH handshake (classical + ML-KEM-768 hybrid) + Double Ratchet
+      mls.rs                 group messaging via openmls (RFC 9420); export_call_base_key for group calls
+      mls_storage.rs          PersistentMlsProvider — SQLCipher-backed group state, survives restarts
+      pq_hybrid.rs             X25519 + ML-KEM-768 hybrid combiner (standalone primitive)
+      key_transparency.rs       RFC 6962 Merkle tree hash/inclusion/consistency proofs
+      auth.rs                    passkeys/FIDO2 (webauthn-rs) + TOTP backup
+      invite.rs                  QR/link contact invites
+      device_link.rs              multi-device linking
+      backup.rs                    Argon2-derived encrypted backup/PIN keys
+      call_keys.rs                  SFrame media key derivation for calls
+      envelope.rs                    size-bucketed wire envelope for every message/reaction/receipt/signal
+      safety_number.rs                 Signal-style iterated fingerprint
+      payment_address.rs                XMR/BTC/ETH address format validation
+      qr.rs                              shared QR rendering
+      webhook.rs                          HMAC-SHA256 signing for the cosmetics webhook
 
   bh-network/           libp2p transport, Kademlia DHT, onion routing,
                          Eclipse/Sybil-resistant node selection, cover
@@ -175,18 +255,26 @@ crates/
       transport.rs          libp2p transport + STUN/TURN
       dht.rs                Kademlia DHT
       eclipse_resistance.rs HMAC-scored node selection + subnet diversity
-      onion.rs              multi-hop onion circuits
-      mailbox.rs            store-and-forward encrypted mailboxes
+      onion.rs              multi-hop onion circuits, bucketed packet sizes
+      mailbox.rs            store-and-forward encrypted mailboxes, PoW-gated
       sealed_sender.rs      sender identity hidden from relay/mailbox nodes
       cover_traffic.rs      dummy traffic generation
-      pow.rs                proof-of-work anti-spam primitive
+      pow.rs                proof-of-work anti-spam primitive, enforced by mailboxes
+      supervised.rs         auto-respawns the node on a panicked event loop
 
   bh-storage/           SQLCipher-backed data model (contacts,
                          conversations, messages, groups, devices, sessions,
-                         files, settings), platform keystore (Keychain /
+                         files, settings, cosmetics, push registration,
+                         search index), platform keystore (Keychain /
                          Credential Manager / Secret Service via `keyring`),
                          panic wipe, self-destruct message sweeper.
                          (SPEC.md §7)
+      db_key_lock.rs        optional PIN layer sealing the SQLCipher key
+      local_auth.rs          passkey/TOTP credential storage
+      cosmetics.rs             inventory/equip state (banners/themes/badges/stickers)
+      message_stickers.rs       which sticker (if any) a message carries
+      push.rs                    this profile's own wake-relay registration
+      search.rs                   local FTS5 full-text search
 
   bh-files/             Content-addressed file chunking, per-chunk E2EE,
                          resumable download tracking. Storage/transport-
@@ -194,23 +282,59 @@ crates/
                          and the network separately. (SPEC.md §5.5)
 
   bh-api/               Localhost RPC surface between daemon and UI
-                         clients. Binds 127.0.0.1 only. Real endpoints for
-                         identity bootstrap, panic wipe, contacts,
-                         moderation (block / message-requests / reports),
-                         conversations/messages — all backed by
-                         `bh-storage`, verified end-to-end via live HTTP
-                         smoke tests. (SPEC.md §6)
+                         clients. Binds 127.0.0.1 only. ~90 real endpoints
+                         across 28 modules (identity, contacts, moderation,
+                         conversations/messages incl. editing, reactions,
+                         receipts, safety numbers, invites, export/import,
+                         profiles, device linking + sync, local-auth,
+                         groups incl. broadcast channels, file/voice
+                         attachments, cosmetics/stickers, presence, push,
+                         search, call signaling incl. group + screen-share,
+                         network status) — all backed by `bh-storage`/
+                         `bh-crypto`/`bh-calls`/`bh-files`, verified
+                         end-to-end via live HTTP smoke tests plus an
+                         in-process integration suite. (SPEC.md §6, §15-16)
+
+  bh-calls/             Voice/video calls: real WebRTC (ICE/DTLS/SRTP) +
+                         independent SFrame media encryption. (SPEC.md §15)
+      session.rs            1:1 call setup/signaling + screen-share control
+      group.rs               full-mesh group calls, MLS-exporter-keyed (§16)
+      screen.rs               cross-platform screen capture → same VP8/SFrame path (§16)
+      audio.rs                 Opus capture/encode/decode/playback
+      video.rs                  camera capture + VP8 encode (decode left to client)
+      media_crypto.rs            SFrame frame encrypt/decrypt
+      signaling.rs                offer/answer/candidate signal types
+      transport.rs                 WebRTC peer connection + track plumbing
+
+  bh-push-relay/        New, separate, internet-facing binary — relays only
+                         an opaque wake token, never content/identity/
+                         conversation id. Not part of the bh-api daemon.
+                         (SPEC.md §5.6, §16)
+      server.rs             POST /register, POST /wake/:token
+      state.rs               in-memory registered-token set, no database
 
 client/
-  desktop/              Tauri desktop client. Minimal dev shell (not
-                         product UI): daemon health check, panic wipe
-                         button, window-blur content mitigation.
+  desktop/              Tauri desktop client. Real product UI ("Event
+                         Horizon"): identity bootstrap, contacts/
+                         conversations/messages incl. editing, reactions,
+                         receipts, safety numbers, invites, export/import,
+                         multi-profile, device linking + sync, local-auth,
+                         groups incl. broadcast channels, notes to self,
+                         file/voice attachments, local search, cosmetics
+                         store + stickers, typing presence, link previews,
+                         wake-push toggle, panic wipe. Calls (1:1/group/
+                         screen-share) have real backend support but no UI
+                         yet — needs STUN/TURN first.
+      src/api.ts             typed request/response surface for daemon_call
+      src/link_preview.ts      client-side-only link preview fetch/parse/render
+      src-tauri/src/link_preview.rs  the Tauri command backing it (bypasses the daemon)
 
 docs/
   SPEC.md               Full technical specification (source of truth)
   THREAT_MODEL.md        Per-subsystem STRIDE analysis + ranked open risks
 
-.github/workflows/ci.yml  fmt + clippy -D warnings + build + test (Rust),
+.github/workflows/ci.yml  fmt + clippy -D warnings + build + test (Rust,
+                           incl. libpipewire/libdbus for screen-capture),
                            typecheck + build (desktop client), on every push/PR
 ```
 
@@ -252,6 +376,57 @@ there rather than the sender pushing N individual copies (`SPEC.md` §5.4).
 
 ---
 
+## Group calls & screen sharing
+
+No SFU exists yet, so a group call is a genuine **full mesh**: every
+participant opens a direct `RTCPeerConnection` to every other participant,
+capped at `MAX_GROUP_CALL_PARTICIPANTS = 6` (5 simultaneous connections per
+participant — sustainable on a desktop without a media server, honestly
+scoped rather than claiming this scales further than it does).
+
+```mermaid
+graph TD
+    subgraph mesh["Full-mesh group call — one shared SFrame key for every edge"]
+        A((Caller<br/>tag 0))
+        B((Participant<br/>tag 1))
+        C((Participant<br/>tag 2))
+        A <-->|"SFrame-encrypted<br/>Opus/VP8"| B
+        A <-->|"SFrame-encrypted<br/>Opus/VP8"| C
+        B <-->|"SFrame-encrypted<br/>Opus/VP8"| C
+    end
+
+    MLS["MLS group's own exporter secret<br/>(bh_crypto::mls::Group::export_call_base_key,<br/>RFC 9420 — same mechanism a TLS 1.3 exporter uses)"]
+    MLS -.->|"every member already shares<br/>epoch secrets — zero extra<br/>key-agreement round trips"| A
+    MLS -.-> B
+    MLS -.-> C
+```
+
+The key insight: instead of a bespoke per-edge Diffie-Hellman scheme (which
+would mean *N·(N-1)/2* independent keys for what should be one logical
+call), every participant derives the **same** SFrame base key straight from
+the call's MLS group — members already share epoch secrets after
+processing the same commits, so deriving a call key costs nothing extra and
+reuses `openmls`'s own audited key schedule instead of new protocol code
+(`CLAUDE.md`'s "no custom crypto primitives" non-negotiable, applied here
+exactly as it is everywhere else). Each participant's frames are tagged
+with a distinct `ParticipantTag` on the shared `SframeContext`, so mixing
+up who-sent-what across the mesh isn't possible even though every edge
+carries the same key.
+
+**Screen sharing** rides the exact same pipeline as camera video — capture
+(via [`scap`](https://github.com/CapsAdmin/scap), the same cross-platform
+crate wrapping ScreenCaptureKit/Windows.Graphics.Capture/PipeWire) → VP8
+encode → SFrame encrypt — just on a second, parallel WebRTC track (`id:
+"screen"` vs `"video"`). No separate codec, no separate encryption scheme,
+no new attack surface beyond "the pixels shown are now the pixels sent,"
+which is the client's job to make an obvious, deliberate user action.
+
+Both group calls and screen sharing have complete, tested backend support
+today but **no client UI yet** — the same gap 1:1 calls already had before
+either was built (needs STUN/TURN first; see [Status](#status)).
+
+---
+
 ## Cryptography
 
 No custom cryptographic primitives, anywhere. `bh-crypto`'s X3DH/Double
@@ -279,9 +454,12 @@ than *"as trusted as libsignal."*
 **Post-quantum from day one, not a later patch** — mitigates
 "harvest-now-decrypt-later" attacks. The hybrid combiner uses HKDF over
 *both* legs, so a break in ML-KEM alone degrades to "as secure as X25519
-alone," never full compromise. It's implemented and tested as a standalone
-primitive but **not yet integrated into live X3DH sessions** — real
-sessions today don't get PQ protection yet.
+alone," never full compromise. **Now integrated into the live X3DH flow**:
+`SignedPreKey`/`PreKeyBundle` carry a second, ML-KEM-768 prekey alongside
+the classical X25519 one (both Ed25519-signed and verified before use),
+and `x3dh_initiate`/`x3dh_respond` combine both legs via HKDF — every real
+1:1 session gets the hybrid protection today, tested for tampering on each
+leg independently.
 
 Any future in-house cryptosystem is explicitly deferred and gated on
 professional cryptographers, formal verification (Tamarin/ProVerif), and
@@ -330,11 +508,15 @@ graph LR
   specific `(recipient, ciphertext, timestamp)` tuple so a solved
   challenge can't be replayed for a different message.
 
-**⚠️ Known open risk — onion packet-size leak.** Unlike Sphinx (constant
-packet size end-to-end), this implementation's packets shrink by a fixed
-amount at every hop, which leaks a relay's position in the circuit to
-anyone observing packet sizes on the wire. This is the single most
-consequential unresolved gap in the codebase today — see
+**⚠️ Known open risk, mitigated but not eliminated — onion packet-size
+leak.** Packets are now length-prefixed and padded to the nearest of a
+fixed set of size buckets at every hop, so same-bucket payloads of
+different real sizes become indistinguishable on the wire. Unlike Sphinx
+(constant packet size end-to-end), this is bucketing, not perfectly
+constant size: two payloads straddling a bucket boundary — or one larger
+than every bucket — are still distinguishable, and packet-shrinkage
+patterns can still leak coarse position-in-circuit information. Still the
+single most consequential unresolved gap in the codebase today — see
 `docs/THREAT_MODEL.md` §3.4.
 
 ---
@@ -349,18 +531,22 @@ consequential unresolved gap in the codebase today — see
   failure, not just "would fail in theory."
 - **Panic wipe**: a tested, irreversible emergency-destruction path,
   reachable via `POST /panic-wipe`, confirmed end-to-end (deletes the data
-  directory and exits the process) and wired into the desktop client's dev
-  shell as a button.
+  directory and exits the process) and wired into the desktop client as a
+  button.
 - Self-destructing messages, screenshot-blocking in sensitive chats, and
-  window-blur content mitigation (already wired in the desktop shell).
+  window-blur content mitigation (all wired into the real client UI).
 - **Zero third-party analytics/crash SDKs** — no Firebase Analytics, no
   Crashlytics, nothing. If error reporting is ever added, it will be
   self-hosted and explicitly opt-in.
-- **Known gap**: the SQLCipher key is currently generated with the system
-  RNG and stored directly in the OS keystore — there's no additional
-  PIN/passphrase-derived layer in front of it yet. Today, keystore
-  compromise alone (without a device PIN) is enough to unlock the
-  database. See `docs/THREAT_MODEL.md` §3.7.
+- **Optional PIN layer in front of the SQLCipher key**: the key itself is
+  still generated with the system RNG, but `bh_storage::db_key_lock` can
+  now seal that same key under a user-chosen PIN (reusing the existing
+  Argon2id + ChaCha20-Poly1305 backup-passphrase primitive rather than a
+  new one) — `POST /security/db-pin` sets it, daemon startup and
+  profile-switch both enforce it via `BLACKHOLE_DB_PIN`. **Opt-in, per
+  profile, off by default**: a fresh profile is exactly as protected as
+  before until its owner explicitly sets a PIN. See
+  `docs/THREAT_MODEL.md` §3.7.
 
 ---
 
@@ -377,12 +563,21 @@ consequential unresolved gap in the codebase today — see
   centralized, always-on directory.
 - **Key verification**: safety-number / QR verification between contacts
   (Signal-style) is the real trust anchor today, not the display name.
-  Complemented in the target design by a **Key Transparency** log (not yet
-  implemented) that would let clients detect the network handing out
-  inconsistent keys for the same contact.
+  Complemented in the target design by a **Key Transparency** log —
+  `bh-crypto::key_transparency` implements the RFC 6962 Merkle tree
+  hash/inclusion/consistency-proof primitives from scratch, exhaustively
+  tested including tampered-proof and rewritten-history negative cases,
+  but nothing gossips signed tree heads yet — it's a tested building
+  block, not a deployed defense. MITM detection in practice is still
+  manual-verification-only.
 - **Multi-device**: new devices link via QR scan against an already
   authenticated device; private keys are never uploaded in the clear to
-  any server. Users can see and instantly revoke any linked device.
+  any server. Users can see and instantly revoke any linked device. Once
+  linked, a device's message history stays current via a real X3DH +
+  Double Ratchet sync round-trip (`bh-api::device_sync`) — today the
+  "linked device" side of that handshake is a locally-simulated shadow
+  identity rather than a real second process, same honest-about-scope
+  caveat as linking itself.
 - **Encrypted backups** with a key only the user controls — the server
   can't read them without it.
 - **Seed-phrase recovery, no backdoor**: a 12-24 word BIP-39 phrase
@@ -406,17 +601,30 @@ opt-in:
   their own local history to share; the platform never sees anything the
   user didn't explicitly attach.
 - **Network-level anti-spam**, not content-level: the PoW primitive above,
-  invisible to a normal user, costly for an automated mass sender. (Not
-  yet enforced server-side — see Status table.)
+  invisible to a normal user, costly for an automated mass sender — **now
+  verified server-side**, mailbox nodes reject a `push`/`fan_out` whose
+  solution doesn't check out before doing any storage work, not just
+  defined-and-tested in isolation.
 
 ---
 
 ## Payments & monetization
 
 The messaging core is free, always, no exceptions. Monetization is
-strictly cosmetic — profile gifts, banners, themes, badges — never sold as
-"more privacy." **Not implemented yet**; this describes the target design
-from `SPEC.md` §12.
+strictly cosmetic — profile gifts, banners, themes, badges, sticker packs
+— never sold as "more privacy."
+
+**The cosmetics store's data model, isolation boundary, and client UI are
+implemented and tested** (catalog, purchase records, entitlement-token
+grant, inventory/equip, sticker packs usable in chat — `bh-api::cosmetics`/
+`stickers`, `client/desktop`'s Store panel). **What's not implemented yet**
+is the real BTCPay HTTP integration: `create_purchase` records an invoice
+id the *caller* supplies rather than the daemon creating one itself, and
+`mark_purchase_paid` is a stand-in for BTCPay's payment-confirmed webhook —
+gated behind an HMAC-SHA256 signature only a real webhook (or someone
+reading the keystore directly) could produce, so the client deliberately
+has **no button that can complete a purchase today**, by design rather
+than oversight. This describes the target design from `SPEC.md` §12.
 
 - **Monero (XMR) as the primary method** — private by default (ring
   signatures, stealth addresses, hidden amounts). The only option that
@@ -464,17 +672,47 @@ Full STRIDE-style breakdown per subsystem lives in
 | Compromised device (post-unlock) | Full access to an already-unlocked device | Everything on it — explicitly **out of scope** |
 | The Blackhole operator/maintainers | Publishes the code, open source & (aspirationally) reproducibly built | Nothing, by design |
 
-**Open risks, ranked** (from `docs/THREAT_MODEL.md` §4):
+**Open risks, ranked** (from `docs/THREAT_MODEL.md` §4 — 20 tracked items
+total; most of the earliest-identified ones are now FIXED/MITIGATED, kept
+in the numbered list with that status rather than renumbered, so
+cross-references stay stable). The genuinely still-**open** ones today:
 
-1. Onion routing packet-size leak — position-in-circuit is inferable from
-   packet size today (§3.4).
-2. Mailbox manifest race condition under concurrent writers — a message
-   isn't lost, but can end up unreferenced (§3.6).
-3. No Key Transparency — MITM detection is manual-verification-only (§3.1).
-4. PQ hybrid handshake not integrated into the live X3DH flow (§3.3).
-5. Anti-spam PoW not enforced anywhere server-side yet (§3.8).
-6. No PIN/passphrase layer in front of the SQLCipher key (§3.7).
-7. MLS group state not persisted across daemon restarts (§3.2).
+1. **Onion routing packet-size leak** — mitigated (bucketed/padded sizes),
+   not eliminated: two payloads straddling a bucket boundary are still
+   distinguishable (§3.4).
+2. **`yamux` remote-panic CVE-2026-32314** — the node auto-respawns on
+   crash now (`bh_network::supervised`), but the underlying panic is still
+   open, blocked on an upstream `rust-libp2p` release (§3.10).
+3. **No Key Transparency deployment** — the RFC 6962 primitive is real and
+   tested; nothing gossips signed tree heads yet (§3.1).
+4. **`glib` GTK vulnerability** — dormant until a Linux build ships (§3.10).
+5. **Calls have no STUN/TURN or anonymity properties** — applies equally
+   to 1:1, group calls, and screen sharing (§3.11/§3.12).
+6. **Link previews are a voluntary, by-design metadata leak when
+   enabled** — off by default, stated plainly in the toggle's own copy,
+   not fixable without proxying through the (not-yet-wired) P2P network
+   (§3.12).
+7. **Opaque push relay leaks coarse online/timing metadata, registration
+   unauthenticated** — inherent to the concept, off by default (§3.12).
+8. **Device sync's crypto is real, its peer is not** — same simulated-peer
+   caveat as device linking and groups' shadow members (§3.12).
+9. **Broadcast-channel posting restriction lives in one function, not
+   structurally** — same pattern already accepted for invite-token
+   consumption (§3.12).
+10. **File attachments have no resumability** — swept by the
+    disappearing-message timer now, but uploads are still fully
+    synchronous with nothing to resume without a live `bh-network` peer
+    (§3.11).
+11. **Device linking and device sync are same-daemon simulations**, not
+    real cross-device/cross-process behavior yet (§3.11/§3.12).
+
+Several other historically-tracked items are now **FIXED**: PQ hybrid is
+integrated into every live X3DH session (was #4 above), PoW is verified
+server-side by mailbox nodes (was #5), an opt-in PIN layer now sits in
+front of the SQLCipher key (was #6), MLS group state survives a daemon
+restart (was #7), and the mailbox manifest race is closed via
+read-merge-write-verify retry — see `docs/THREAT_MODEL.md` §4 for the full
+list with what specifically closed each one.
 
 None of these are hidden — each is called out in the relevant module's own
 doc comments. This section (and the doc it summarizes) exists to make the
@@ -485,19 +723,29 @@ aggregate picture visible in one place.
 ## Building & running
 
 Requires a stable Rust toolchain, Node.js, [pnpm](https://pnpm.io), and a
-system OpenSSL (used to build SQLCipher and the WebAuthn stack). If
-`cargo build` can't find it, point it at your OpenSSL install, e.g. on an
-Apple Silicon Mac with Homebrew:
+system OpenSSL (used to build SQLCipher and the WebAuthn stack), plus
+`opus`/`libvpx`/`pkg-config` for `bh-calls` (voice/video, incl. group calls
+and screen sharing). If `cargo build` can't find OpenSSL, point it at your
+install, e.g. on an Apple Silicon Mac with Homebrew:
 
 ```sh
 export OPENSSL_DIR=/opt/homebrew/opt/openssl@3
+brew install opus libvpx pkg-config
 ```
 
+On Linux, screen sharing's `scap` dependency additionally needs
+`libpipewire-0.3-dev`/`libdbus-1-dev` (its xdg-desktop-portal/PipeWire
+screencast backend) — see `.github/workflows/ci.yml` for the exact
+`apt-get` line. macOS/Windows use native platform capture APIs and need
+nothing extra.
+
 ```sh
-# daemon + all library crates
+# daemon + all library crates + the push relay + the Tauri client's Rust side
 cargo build --workspace
 
-# run the full test suite (93 tests)
+# run the full test suite (285 tests — a handful of bh-calls tests need
+# real UDP loopback and can be flaky under sandboxing/CI resource
+# contention; see that crate's test comments)
 cargo test --workspace
 
 # run the daemon (binds 127.0.0.1:47853 by default,
@@ -506,6 +754,10 @@ cargo run -p bh-daemon
 
 # desktop client (in a separate terminal, daemon must be running)
 cd client/desktop && pnpm install && pnpm tauri dev
+
+# the opaque wake-push relay (separate, internet-facing — not part of
+# the daemon; only needed if you're exercising the push feature)
+cargo run -p bh-push-relay
 ```
 
 CI (`.github/workflows/ci.yml`) runs, on every push/PR:
@@ -516,25 +768,38 @@ CI (`.github/workflows/ci.yml`) runs, on every push/PR:
 - `cargo test --workspace`
 - desktop client typecheck + `pnpm build`
 
-### Daemon API surface (localhost only)
+---
+
+## Daemon API surface (localhost only)
 
 `bh-api` binds `127.0.0.1` exclusively — it is never reachable from the
-network by construction, not just by configuration.
+network by construction, not just by configuration. ~90 routes across 28
+handler modules; representative examples per area below rather than an
+exhaustive list (see `crates/bh-api/src/server.rs` for the full route
+table, or `crates/bh-api/src/*.rs` — one file per area, named to match).
 
-| Method | Path | Purpose |
+| Area | Example routes | Module |
 |---|---|---|
-| `GET` | `/health` | Liveness + version check |
-| `GET` / `POST` | `/identity` | Read / bootstrap the local identity (create refuses to overwrite an existing one — `409 Conflict`) |
-| `POST` | `/panic-wipe` | Irreversibly wipe the data directory and exit |
-| `GET` / `POST` | `/contacts` | List / add contacts |
-| `POST` | `/contacts/:id/block` | Block a contact |
-| `POST` | `/contacts/:id/unblock` | Unblock a contact |
-| `GET` | `/conversations` | List conversations |
-| `GET` | `/conversations/:id/messages` | List messages in a conversation |
-| `GET` | `/message-requests` | List pending message requests |
-| `POST` | `/message-requests/:contact_id/accept` | Accept a message request |
-| `POST` | `/message-requests/:contact_id/decline` | Decline a message request |
-| `POST` | `/reports` | File a voluntary report |
+| Identity & lifecycle | `GET/POST /identity`, `POST /panic-wipe` | `identity.rs`, `panic_wipe.rs` |
+| Security | `GET/POST /security/db-pin`, `POST /security/db-pin/clear` | `security.rs` |
+| Contacts & moderation | `GET/POST /contacts`, `POST /contacts/:id/block`, `POST /reports` | `contacts.rs`, `moderation.rs` |
+| Conversations & messages | `GET/POST /conversations/:id/messages`, `PATCH /conversations/:id/messages/:mid` (edit), `GET .../edits` (history) | `conversations.rs` |
+| Reactions & receipts | `POST /messages/:id/reactions`, `POST /conversations/:id/receipts` | `reactions.rs`, `receipts.rs` |
+| Safety numbers | `GET /contacts/:id/safety-number`, `POST /contacts/:id/verify` | `safety_number.rs` |
+| Invites | `POST /invites`, `POST /invites/decode`, `POST /invites/:token/revoke` | `invites.rs` |
+| Export/import | `POST /conversations/:id/export`, `POST /conversations/import` | `export.rs` |
+| Profiles (multi-account) | `GET /profiles`, `POST /profiles/:id/activate` | `profiles.rs` |
+| Device linking & sync | `POST /devices/link/begin`, `GET /devices/:id/sync`, `GET .../sync/status` | `device_link.rs`, `device_sync.rs` |
+| Local unlock | `GET /local-auth/status`, `POST /local-auth/totp/enroll/start` | `local_auth.rs` |
+| Groups & channels | `POST /groups` (`kind: "group"\|"broadcast"`), `POST /groups/:id/members` | `groups.rs` |
+| Files & voice messages | `POST /conversations/:id/attachments` (`duration_secs` ⇒ voice), `GET /attachments/:hash/download` | `files.rs` |
+| Cosmetics & stickers | `GET /cosmetics/catalog`, `POST /cosmetics/purchases`, `POST /conversations/:id/stickers` | `cosmetics.rs`, `stickers.rs` |
+| Typing presence | `GET/POST /settings/typing-indicators`, `GET/POST /conversations/:id/typing` | `presence.rs` |
+| Wake-push registration | `GET/POST /push/register` | `push.rs` |
+| Local search | `GET /search?q=...&conversation_id=...` | `search.rs` |
+| Calls: 1:1, group, screen-share | `POST /calls`, `POST /calls/group/start`, `POST /calls/:id/screen-share/start` | `calls.rs` |
+| Payment requests | `POST /conversations/:id/payment-requests`, `POST /messages/:id/payment-request/paid` | `payment_requests.rs` |
+| Network status | `GET /network/status` | `network.rs` |
 
 ---
 

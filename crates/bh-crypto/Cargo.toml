@@ -42,6 +42,16 @@ bip39 = "2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 base64 = "0.22"
 
+# In-chat crypto payment requests (SPEC.md §15): address *format*
+# validation only (base58/bech32 decoding, checksum hashing) — not a
+# cryptosystem, just parsing a public address string with an audited hash
+# function, same "composition of audited primitives" posture as
+# safety_number.rs. bs58/bech32 cover BTC; sha3 (Keccak-256) covers both
+# ETH's EIP-55 checksum and Monero's base58 checksum.
+bs58 = { version = "0.5", features = ["check"] }
+bech32 = "0.12"
+sha3 = "0.10"
+
 # Backup passphrase -> key derivation (SPEC.md §4): memory-hard on purpose,
 # since a backup file can be brute-forced offline forever once it leaks.
 argon2 = "0.5"
@@ -59,3 +69,13 @@ webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"]
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# MLS state persistence (docs/THREAT_MODEL.md §3.2): a real openmls-maintained
+# StorageProvider over rusqlite, pointed at our own SQLCipher-keyed
+# connection rather than the crate's in-memory default — see mls_storage.rs.
+# A dedicated database file/key (same isolation pattern as the payments
+# database), not bh-storage's messaging database directly, so this crate
+# doesn't need to depend on bh-storage.
+openmls_sqlite_storage = "0.2.0"
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+hex = "0.4"

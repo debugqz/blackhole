@@ -117,6 +117,34 @@ impl Node {
         self.local_peer_id
     }
 
+    /// `false` once the background swarm event loop has stopped running —
+    /// e.g. after an unrecoverable panic inside `libp2p`/`yamux` itself
+    /// (see the yamux CVE in `docs/THREAT_MODEL.md` §3.10: a crafted
+    /// inbound frame can panic `libp2p-yamux`'s internal state machine).
+    /// A `tokio::spawn`ed task panicking doesn't crash the process, but it
+    /// does drop everything the task owned — including `command_rx` here
+    /// — which is exactly what this checks: `mpsc::Sender::is_closed` is
+    /// `true` once its paired receiver is gone, no round-trip needed. Once
+    /// this is `false`, every other method on this `Node` will return
+    /// `NetworkError::NodeShutDown` forever; see [`crate::supervised`] for
+    /// a wrapper that respawns a fresh `Node` when that happens.
+    pub fn is_alive(&self) -> bool {
+        !self.command_tx.is_closed()
+    }
+
+    /// Test-only: builds a `Node` handle around an already-dead channel
+    /// (its receiver dropped), to exercise supervisor failure-detection
+    /// without needing to reproduce a real libp2p panic.
+    #[cfg(test)]
+    pub(crate) fn dead_handle_for_test() -> Self {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        drop(command_rx);
+        Self {
+            local_peer_id: PeerId::random(),
+            command_tx,
+        }
+    }
+
     pub async fn listen_addrs(&self) -> Vec<Multiaddr> {
         let (resp, rx) = oneshot::channel();
         if self

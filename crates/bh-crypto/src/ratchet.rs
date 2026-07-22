@@ -17,8 +17,10 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
+use zeroize::Zeroizing;
 
 use crate::identity::IdentityKeyPair;
+use crate::pq_hybrid::{self, HybridCiphertext, HybridPublicKey, HybridSecretKey};
 use crate::CryptoError;
 
 /// Bound on how many out-of-order message keys we'll cache per session
@@ -31,12 +33,18 @@ const MAX_SKIP: u32 = 1000;
 // ---------------------------------------------------------------------
 
 /// One of Bob's medium-term signed prekeys, plus the identity signature
-/// over it that lets Alice verify it really came from Bob.
+/// over it that lets Alice verify it really came from Bob. Bundles a
+/// post-quantum hybrid prekey alongside the classical one (SPEC.md §2.1:
+/// PQ hybrid from day one, not bolted on later) — every session actually
+/// gets both legs, not just whichever `bh-crypto::pq_hybrid` demonstrates
+/// standalone.
 pub struct SignedPreKey {
     pub id: u32,
     pub secret: X25519Secret,
     pub public: X25519PublicKey,
     pub signature: Signature,
+    pub pq_prekey: HybridSecretKey,
+    pub pq_prekey_signature: Signature,
 }
 
 impl SignedPreKey {
@@ -44,11 +52,17 @@ impl SignedPreKey {
         let secret = X25519Secret::random();
         let public = X25519PublicKey::from(&secret);
         let signature = identity.sign(public.as_bytes());
+
+        let pq_prekey = HybridSecretKey::generate();
+        let pq_prekey_signature = identity.sign(&pq_prekey.public_key().to_bytes());
+
         Self {
             id,
             secret,
             public,
             signature,
+            pq_prekey,
+            pq_prekey_signature,
         }
     }
 }
@@ -79,6 +93,8 @@ pub struct PreKeyBundle {
     pub signed_prekey_id: u32,
     pub signed_prekey: X25519PublicKey,
     pub signed_prekey_signature: Signature,
+    pub pq_prekey: HybridPublicKey,
+    pub pq_prekey_signature: Signature,
     pub one_time_prekey_id: Option<u32>,
     pub one_time_prekey: Option<X25519PublicKey>,
 }
@@ -87,6 +103,9 @@ impl PreKeyBundle {
     fn verify_signed_prekey(&self) -> Result<(), CryptoError> {
         self.identity_signing_key
             .verify(self.signed_prekey.as_bytes(), &self.signed_prekey_signature)
+            .map_err(|_| CryptoError::InvalidSignature)?;
+        self.identity_signing_key
+            .verify(&self.pq_prekey.to_bytes(), &self.pq_prekey_signature)
             .map_err(|_| CryptoError::InvalidSignature)
     }
 }
@@ -94,13 +113,30 @@ impl PreKeyBundle {
 fn hkdf_sk(input_key_material: &[u8]) -> [u8; 32] {
     // X3DH §2.2: prepend 32 0xFF bytes so the KDF input can't collide with
     // a valid Curve25519 point, then HKDF-extract+expand to the session key.
-    let mut ikm = vec![0xFFu8; 32];
+    // `ikm` is heap-allocated and holds the raw DH outputs concatenated —
+    // wrapped so it's wiped on drop rather than left in freed heap memory.
+    let mut ikm: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0xFFu8; 32]);
     ikm.extend_from_slice(input_key_material);
     let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; 32]), &ikm);
     let mut sk = [0u8; 32];
     hkdf.expand(b"blackhole-x3dh-v1", &mut sk)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     sk
+}
+
+/// Combines the classical X3DH secret with the post-quantum hybrid KEM
+/// secret into the final session key. Defense in depth by construction,
+/// same as `pq_hybrid::combine`: breaking the PQ leg alone still leaves an
+/// attacker facing the full classical X3DH secret, and vice versa.
+fn combine_classical_and_pq(classical_sk: &[u8; 32], pq_secret: &[u8; 32]) -> [u8; 32] {
+    let mut ikm: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(64));
+    ikm.extend_from_slice(classical_sk);
+    ikm.extend_from_slice(pq_secret);
+    let hkdf = Hkdf::<Sha256>::new(None, &ikm);
+    let mut out = [0u8; 32];
+    hkdf.expand(b"blackhole-x3dh-pq-hybrid-v1", &mut out)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    out
 }
 
 /// The message Alice sends to start a session — Bob needs this (plus his
@@ -111,10 +147,13 @@ pub struct InitialMessage {
     pub sender_ephemeral_key: X25519PublicKey,
     pub used_signed_prekey_id: u32,
     pub used_one_time_prekey_id: Option<u32>,
+    pub pq_ciphertext: HybridCiphertext,
 }
 
 /// Alice's side of X3DH: given Bob's published prekey bundle, derive the
-/// shared secret and the message that lets Bob derive the same one.
+/// shared secret and the message that lets Bob derive the same one. The
+/// returned secret is a classical-X3DH/PQ-hybrid combination (SPEC.md
+/// §2.1) — not just the classical X3DH output.
 pub fn x3dh_initiate(
     my_identity: &IdentityKeyPair,
     their_bundle: &PreKeyBundle,
@@ -139,7 +178,9 @@ pub fn x3dh_initiate(
         ikm.extend_from_slice(dh4.as_bytes());
     }
 
-    let sk = hkdf_sk(&ikm);
+    let classical_sk = hkdf_sk(&ikm);
+    let (pq_secret, pq_ciphertext) = pq_hybrid::hybrid_encapsulate(&their_bundle.pq_prekey)?;
+    let sk = combine_classical_and_pq(&classical_sk, &pq_secret);
 
     Ok((
         sk,
@@ -152,6 +193,7 @@ pub fn x3dh_initiate(
                     .one_time_prekey_id
                     .expect("one_time_prekey_id set whenever one_time_prekey is")
             }),
+            pq_ciphertext,
         },
     ))
 }
@@ -186,7 +228,9 @@ pub fn x3dh_respond(
         ikm.extend_from_slice(dh4.as_bytes());
     }
 
-    Ok(hkdf_sk(&ikm))
+    let classical_sk = hkdf_sk(&ikm);
+    let pq_secret = pq_hybrid::hybrid_decapsulate(&my_signed_prekey.pq_prekey, &msg.pq_ciphertext)?;
+    Ok(combine_classical_and_pq(&classical_sk, &pq_secret))
 }
 
 // ---------------------------------------------------------------------
@@ -195,19 +239,26 @@ pub fn x3dh_respond(
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn kdf_root(root_key: &[u8; 32], dh_output: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+fn kdf_root(
+    root_key: &[u8; 32],
+    dh_output: &[u8; 32],
+) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
     let hkdf = Hkdf::<Sha256>::new(Some(root_key), dh_output);
-    let mut output = [0u8; 64];
-    hkdf.expand(b"blackhole-double-ratchet-root-v1", &mut output)
+    let mut output: Zeroizing<[u8; 64]> = Zeroizing::new([0u8; 64]);
+    hkdf.expand(b"blackhole-double-ratchet-root-v1", &mut *output)
         .expect("64 bytes is a valid HKDF-SHA256 output length");
-    let mut new_root = [0u8; 32];
-    let mut new_chain = [0u8; 32];
+    let mut new_root = Zeroizing::new([0u8; 32]);
+    let mut new_chain = Zeroizing::new([0u8; 32]);
     new_root.copy_from_slice(&output[..32]);
     new_chain.copy_from_slice(&output[32..]);
     (new_root, new_chain)
 }
 
-fn kdf_chain(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+/// Returns `(next_chain_key, message_key)`, both wrapped so the chain key
+/// stored back into the session and the one-time message key handed to
+/// `message_key_to_aead` are wiped as soon as they go out of scope instead
+/// of lingering in freed memory for the rest of the session's lifetime.
+fn kdf_chain(chain_key: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
     let mut mac = HmacSha256::new_from_slice(chain_key).expect("HMAC accepts any key length");
     mac.update(&[0x01]);
     let message_key = mac.finalize().into_bytes();
@@ -216,8 +267,8 @@ fn kdf_chain(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     mac.update(&[0x02]);
     let next_chain_key = mac.finalize().into_bytes();
 
-    let mut mk = [0u8; 32];
-    let mut ck = [0u8; 32];
+    let mut mk = Zeroizing::new([0u8; 32]);
+    let mut ck = Zeroizing::new([0u8; 32]);
     mk.copy_from_slice(&message_key);
     ck.copy_from_slice(&next_chain_key);
     (ck, mk)
@@ -229,8 +280,8 @@ fn kdf_chain(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 /// material from the message key via HKDF rather than using it directly.
 fn message_key_to_aead(message_key: &[u8; 32]) -> (AeadKey, Nonce) {
     let hkdf = Hkdf::<Sha256>::new(None, message_key);
-    let mut output = [0u8; 44];
-    hkdf.expand(b"blackhole-double-ratchet-msg-v1", &mut output)
+    let mut output: Zeroizing<[u8; 44]> = Zeroizing::new([0u8; 44]);
+    hkdf.expand(b"blackhole-double-ratchet-msg-v1", &mut *output)
         .expect("44 bytes is a valid HKDF-SHA256 output length");
     let key = AeadKey::try_from(&output[..32]).expect("32 bytes");
     let nonce = Nonce::try_from(&output[32..44]).expect("12 bytes");
@@ -256,18 +307,25 @@ pub struct RatchetMessage {
 
 /// An established 1:1 session between two identities — the persistent
 /// state that `bh-storage::sessions` stores as an opaque blob.
+///
+/// `root_key`/`sending_chain_key`/`receiving_chain_key`/`skipped_keys`'
+/// values are `Zeroizing` — this state lives for the session's entire
+/// lifetime (potentially a whole conversation), so it's the highest-value
+/// target for a memory-disclosure read; wrapping it means every one of
+/// those fields is wiped the moment it's replaced or the `Session` drops,
+/// rather than left sitting in freed memory.
 pub struct Session {
     associated_data: Vec<u8>,
-    root_key: [u8; 32],
+    root_key: Zeroizing<[u8; 32]>,
     dh_self_secret: X25519Secret,
     dh_self_public: X25519PublicKey,
     dh_remote_public: Option<X25519PublicKey>,
-    sending_chain_key: Option<[u8; 32]>,
-    receiving_chain_key: Option<[u8; 32]>,
+    sending_chain_key: Option<Zeroizing<[u8; 32]>>,
+    receiving_chain_key: Option<Zeroizing<[u8; 32]>>,
     send_count: u32,
     recv_count: u32,
     prev_chain_len: u32,
-    skipped_keys: HashMap<([u8; 32], u32), [u8; 32]>,
+    skipped_keys: HashMap<([u8; 32], u32), Zeroizing<[u8; 32]>>,
 }
 
 impl Session {
@@ -308,7 +366,7 @@ impl Session {
         let dh_self_public = X25519PublicKey::from(&my_signed_prekey_secret);
         Self {
             associated_data,
-            root_key: shared_secret,
+            root_key: Zeroizing::new(shared_secret),
             dh_self_secret: my_signed_prekey_secret,
             dh_self_public,
             dh_remote_public: None,
@@ -341,7 +399,14 @@ impl Session {
     }
 
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<RatchetMessage, CryptoError> {
-        let chain_key = self.sending_chain_key.ok_or(CryptoError::NoSession)?;
+        // `.take()` rather than a Copy-out: `Zeroizing<[u8; 32]>` is
+        // intentionally not `Copy`, and the old chain key is fully
+        // consumed here (replaced below), so taking it lets it zeroize on
+        // drop at the end of this scope instead of lingering.
+        let chain_key = self
+            .sending_chain_key
+            .take()
+            .ok_or(CryptoError::NoSession)?;
         let (next_chain_key, message_key) = kdf_chain(&chain_key);
         self.sending_chain_key = Some(next_chain_key);
 
@@ -372,18 +437,32 @@ impl Session {
         })
     }
 
-    fn try_skipped(&mut self, msg: &RatchetMessage) -> Option<[u8; 32]> {
+    fn try_skipped(&mut self, msg: &RatchetMessage) -> Option<Zeroizing<[u8; 32]>> {
         self.skipped_keys.remove(&(msg.dh_public, msg.counter))
     }
 
     fn skip_receiving_keys(&mut self, until: u32) -> Result<(), CryptoError> {
-        let Some(chain_key) = self.receiving_chain_key else {
+        // Cloned rather than taken: an early return below (over-skip,
+        // over-cap) must leave `self.receiving_chain_key` untouched, so the
+        // session isn't left without a receiving chain key after a
+        // rejected call.
+        let Some(mut chain_key) = self.receiving_chain_key.clone() else {
             return Ok(());
         };
-        if until.saturating_sub(self.recv_count) > MAX_SKIP {
+        let new_keys = until.saturating_sub(self.recv_count);
+        if new_keys > MAX_SKIP {
             return Err(CryptoError::Decrypt);
         }
-        let mut chain_key = chain_key;
+        // `recv_count` resets to 0 on every `dh_ratchet`, so bounding only
+        // this call's `new_keys` against it caps growth per DH epoch, not
+        // per session — a peer that keeps ratcheting could otherwise add
+        // up to MAX_SKIP entries on every epoch forever. Cap the *total*
+        // cached count across the session's lifetime instead, matching
+        // what MAX_SKIP's own doc comment (and THREAT_MODEL.md §3.1)
+        // actually claims it bounds.
+        if self.skipped_keys.len() as u32 + new_keys > MAX_SKIP {
+            return Err(CryptoError::Decrypt);
+        }
         let remote = self
             .dh_remote_public
             .ok_or(CryptoError::NoSession)?
@@ -409,7 +488,10 @@ impl Session {
                 self.dh_ratchet(incoming_dh);
             }
             self.skip_receiving_keys(msg.counter)?;
-            let chain_key = self.receiving_chain_key.ok_or(CryptoError::NoSession)?;
+            let chain_key = self
+                .receiving_chain_key
+                .take()
+                .ok_or(CryptoError::NoSession)?;
             let (next_chain_key, message_key) = kdf_chain(&chain_key);
             self.receiving_chain_key = Some(next_chain_key);
             self.recv_count += 1;
@@ -453,6 +535,8 @@ mod tests {
             signed_prekey_id: signed_prekey.id,
             signed_prekey: signed_prekey.public,
             signed_prekey_signature: signed_prekey.signature,
+            pq_prekey: signed_prekey.pq_prekey.public_key(),
+            pq_prekey_signature: signed_prekey.pq_prekey_signature,
             one_time_prekey_id: otk.map(|k| k.id),
             one_time_prekey: otk.map(|k| k.public),
         }
@@ -497,6 +581,41 @@ mod tests {
         bundle.signed_prekey_signature = other_spk.signature;
 
         assert!(x3dh_initiate(&alice_id, &bundle).is_err());
+    }
+
+    #[test]
+    fn x3dh_rejects_a_tampered_pq_prekey_signature() {
+        let alice_id = IdentityKeyPair::generate().unwrap();
+        let bob_id = IdentityKeyPair::generate().unwrap();
+        let bob_spk = SignedPreKey::generate(&bob_id, 1);
+        let mut bundle = bob_bundle(&bob_id, &bob_spk, None);
+        let other_spk = SignedPreKey::generate(&bob_id, 2);
+        bundle.pq_prekey_signature = other_spk.pq_prekey_signature;
+
+        assert!(x3dh_initiate(&alice_id, &bundle).is_err());
+    }
+
+    /// Proves the PQ leg isn't decorative: a session derived with a
+    /// tampered post-quantum ciphertext ends up with a *different* key on
+    /// each side, so the final session key genuinely depends on both legs
+    /// (SPEC.md §2.1 hybrid-from-day-one), not just the classical X3DH
+    /// output.
+    #[test]
+    fn tampering_with_the_pq_ciphertext_changes_the_derived_key() {
+        let alice_id = IdentityKeyPair::generate().unwrap();
+        let bob_id = IdentityKeyPair::generate().unwrap();
+        let bob_spk = SignedPreKey::generate(&bob_id, 1);
+        let bundle = bob_bundle(&bob_id, &bob_spk, None);
+
+        let (alice_sk, mut initial_msg) = x3dh_initiate(&alice_id, &bundle).unwrap();
+        let last = initial_msg.pq_ciphertext.ml_kem_ciphertext.len() - 1;
+        initial_msg.pq_ciphertext.ml_kem_ciphertext[last] ^= 0xFF;
+
+        let bob_sk = x3dh_respond(&bob_id, &bob_spk, None, &initial_msg).unwrap();
+        assert_ne!(
+            alice_sk, bob_sk,
+            "a tampered PQ ciphertext must change the derived session key"
+        );
     }
 
     fn establish_session_pair() -> (Session, Session) {
@@ -564,6 +683,39 @@ mod tests {
             let m = bob.encrypt(from_bob.as_bytes()).unwrap();
             assert_eq!(alice.decrypt(&m).unwrap(), from_bob.as_bytes());
         }
+    }
+
+    /// Regression test for the unbounded-growth bug: `recv_count` resets to
+    /// 0 on every `dh_ratchet`, so bounding a single `skip_receiving_keys`
+    /// call against only `recv_count` capped growth per DH epoch, not per
+    /// session — a peer could ratchet repeatedly and add up to `MAX_SKIP`
+    /// entries each time, forever. Drive several "epochs" (each
+    /// individually well under `MAX_SKIP`) and confirm the *cumulative*
+    /// cache size is what gets capped.
+    #[test]
+    fn skipped_key_cache_is_capped_across_the_whole_session_not_just_per_epoch() {
+        let (_, mut bob) = establish_session_pair();
+
+        for epoch in 0..2u8 {
+            bob.dh_remote_public = Some(X25519PublicKey::from([epoch; 32]));
+            bob.receiving_chain_key = Some(Zeroizing::new([epoch; 32]));
+            bob.recv_count = 0;
+            bob.skip_receiving_keys(400).unwrap();
+        }
+        assert_eq!(bob.skipped_keys.len(), 800);
+
+        // A third epoch that's individually under MAX_SKIP (1000) would
+        // have succeeded under the old per-epoch-only check, even though
+        // the total cache would then hold 1200 entries.
+        bob.dh_remote_public = Some(X25519PublicKey::from([2u8; 32]));
+        bob.receiving_chain_key = Some(Zeroizing::new([2u8; 32]));
+        bob.recv_count = 0;
+        assert!(bob.skip_receiving_keys(400).is_err());
+        assert_eq!(
+            bob.skipped_keys.len(),
+            800,
+            "a rejected skip must not partially insert keys"
+        );
     }
 
     #[test]

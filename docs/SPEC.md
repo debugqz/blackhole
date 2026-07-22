@@ -206,6 +206,135 @@ Implementadas sobre la base de v0.1, sin tocar ninguno de los no-negociables (§
   - *Audio* (`bh_calls::audio`): Opus (`audiopus`, bindings sobre libopus) + captura/reproducción real con `cpal`. El roundtrip de codec está testeado con PCM sintético; captura/reproducción de hardware real no se ejercita en CI (sin micrófono/altavoces).
   - *Video* (`bh_calls::video`): captura de cámara (`nokhwa`) + codificación VP8 (`vpx-encode`, sobre libvpx). **Decodificación VP8 deliberadamente fuera de alcance**: no existe un crate Rust seguro de decodificación VP8, y escribir bindings FFI propios contra libvpx es exactamente el tipo de código no auditado que este proyecto evita escribir (mismo principio que §2.2, aplicado a códecs en vez de a criptografía) — se deja al cliente Tauri, que puede decodificar con las APIs nativas del webview.
   - Requiere en tiempo de compilación `opus`, `libvpx` y `pkg-config` del sistema (vía Homebrew/apt/etc.) — ver comentarios en `crates/bh-calls/Cargo.toml`.
+- **Solicitudes de pago cripto en el chat** (`bh_crypto::payment_address`, `bh_storage::payment_requests`, `bh-api::payment_requests`): deliberadamente el diseño más simple posible — un mensaje cifrado más que lleva una dirección/monto sugerido/memo para XMR, BTC o ETH. Blackhole nunca custodia fondos ni consulta una blockchain; la liquidación ocurre wallet-a-wallet, totalmente fuera de la app, y "pagado" es siempre una marca manual local (`paid_at`), nunca una confirmación on-chain. Esto es intencional y distinto del §12 (monetización cosmética vía BTCPay): al no tocar infraestructura de pagos en absoluto, esta función queda automáticamente fuera del requisito de aislamiento pagos/mensajería de §12, en vez de tener que cumplirlo. `bh_crypto::payment_address` valida el *formato* de la dirección (base58check+bech32 para BTC, EIP-55 para ETH, base58 con checksum Keccak-256 propio de Monero para XMR) para atrapar errores de tipeo antes de mostrar un QR — composición de funciones hash auditadas, no un criptosistema nuevo (mismo criterio que `safety_number` en §2.2). El monto nunca se codifica en el URI/deep-link (`bitcoin:`/`ethereum:`/`monero:` + solo la dirección) para evitar que un bug de conversión de unidades (wei, unidades atómicas) falsee silenciosamente cuánto se debe — se muestra aparte, como texto informativo.
+
+---
+
+## 16. Funciones añadidas (segunda ronda, post-§15)
+
+Segunda tanda de funciones sobre la base de §15, mismo criterio: nada toca
+los no-negociables (§2.2, CLAUDE.md), todo es real y testeado en su crate
+correspondiente salvo donde se indica lo contrario.
+
+- **Sync activo multi-dispositivo** (`bh-api::device_sync`): distinto de la
+  vinculación de dispositivo (§4, ya implementada) — una vez un dispositivo
+  está vinculado, este módulo mantiene su vista del historial al día. Sin
+  `bh-network` ni un segundo proceso real, `GET /devices/:id/sync` ejercita
+  de todas formas un handshake X3DH + Double Ratchet genuino entre la
+  identidad real del dispositivo primario y una identidad "sombra" generada
+  localmente para el endpoint del dispositivo vinculado (mismo truco que
+  usan los miembros "sombra" de grupos para contactos) — cada entrada
+  sincronizada trae `ratchet_roundtrip_ok` como prueba en vivo de que el
+  cifrado/descifrado ocurrió de verdad, no una simulación. Lo que sí
+  persiste entre reinicios es el cursor de entrega
+  (`device_sync_cursor`); la sesión ratchet en sí es memoria de proceso,
+  igual que el estado MLS de `groups.rs` antes de §3.2 del threat model.
+- **Paquetes de stickers y temas de pago** (`bh-storage::cosmetics`/
+  `message_stickers`, `bh-api::cosmetics`/`stickers`): extiende el sistema
+  de cosméticos de §12 con un cuarto tipo (`sticker_pack`) además de
+  banner/theme/badge. Enviar un sticker exige poseerlo — verificado
+  server-side contra `cosmetic_inventory` (la base de mensajería), nunca
+  contra `cosmetic_catalog`/`purchases` (la de pagos), preservando el
+  aislamiento estricto que exige §12. El contenido de cada pack (qué
+  stickers existen) es metadata estática en código, no hay todavía un
+  pipeline de assets real.
+- **Notas a uno mismo**: una conversación local singleton por perfil, sin
+  contraparte (`ConversationKind::SelfNotes`, `contact_id`/`group_id`
+  ambos `NULL`). Como no hay contraparte, no hay sesión de cifrado que
+  establecer — el mensaje va directo a la base ya cifrada por SQLCipher,
+  el mismo límite de confianza que todo lo demás en esa base, simplemente
+  sin la capa Double Ratchet/MLS encima (esa capa protege mensajes *en
+  tránsito* entre dos partes; aquí no hay tránsito). Se crea de forma
+  perezosa en el primer `GET /conversations` y también eager en
+  `POST /identity`, así que cubre tanto cuentas nuevas como perfiles
+  existentes.
+- **Mensajes editables**: editar reutiliza el mismo camino de
+  almacenamiento local que enviar; nunca es una sobreescritura silenciosa
+  — `Database::edit_message` archiva el cuerpo anterior en
+  `message_edits` (con la marca de tiempo desde la que fue la versión
+  vigente) antes de actualizar la fila viva, así que `edited_at.is_some()`
+  es una señal siempre visible de que existe historial para inspeccionar.
+  Solo el propio usuario puede editar sus mensajes salientes
+  (`sender_contact_id` nulo) — editar un mensaje ajeno es `403`.
+- **Canales de difusión (broadcast)** (`bh-storage::groups`,
+  `bh-api::groups`/`conversations`): un canal es el mismo grupo MLS de
+  siempre con un flag `broadcast_only` — la restricción de "solo el owner
+  puede publicar" se aplica a nivel API (`send_message` rechaza con `403`
+  cualquier envío que declare un `sender_contact_id` que no sea el usuario
+  local, si el grupo detrás de la conversación es `broadcast_only`), no a
+  nivel criptográfico. El grupo MLS subyacente funciona exactamente igual
+  que cualquier otro — esto es una política de posting, no un mecanismo
+  criptográfico nuevo.
+- **Vista previa de enlaces (client-side)**: deliberadamente **nunca pasa
+  por el daemon**. Un comando de Tauri separado
+  (`fetch_link_preview`, `client/desktop/src-tauri/src/link_preview.rs`)
+  hace la petición HTTP directo al sitio enlazado — el daemon no tiene
+  forma de saber que se pidió una preview. Off por defecto: activarlo
+  revela la IP del usuario (y que abrió ese link) al operador del sitio
+  enlazado, un costo de privacidad real e inevitable para esta clase de
+  función, comunicado explícitamente en el texto del toggle en vez de
+  escondido detrás de un default silencioso. Incluye una guardia SSRF
+  best-effort (rechaza loopback/privado/link-local; no resuelve el
+  hostname, así que DNS-rebinding queda fuera de alcance — aceptable
+  porque el usuario elige qué URL pegar, no es una superficie
+  atacante-controlada).
+- **Relay de notificaciones push opacas** (`crates/bh-push-relay`, nuevo
+  crate — implementa §5.6): a diferencia de todo lo demás en este repo,
+  este es un componente de servidor nuevo, no una función del daemon
+  local. Su único trabajo es reenviar un token opaco de "despertar" — sin
+  contenido, sin identidad del remitente, sin id de conversación ni de
+  contacto. `POST /register` acepta el token; `POST /wake/:token` (que el
+  código de buzones del daemon llamaría una vez conectado — hoy un
+  `// TODO(real-push)` marcado explícitamente, no implementado) dispararía
+  un push sin contenido hacia APNs/FCM/UnifiedPush, en sí mismo todavía un
+  stub. Sin base de datos, sin logging más allá de lo operacionalmente
+  necesario. El registro del lado del daemon
+  (`bh-storage::push`/`bh-api::push`) guarda solo un token opaco rotativo
+  + on/off — opt-in, apagado por defecto, ya que incluso un push opaco
+  tiene un costo de metadata ("algún cliente, más o menos ahora, quiere
+  despertar") que un usuario totalmente offline/manual no paga.
+- **Mensajes de voz**: reutiliza exactamente el mismo camino de adjuntos
+  con chunking y cifrado por chunk de §5.5/`bh-files` — la única
+  diferencia es un `attachment_kind: voice` y una duración en segundos.
+  Como un sticker, el mensaje va con `body: null`; el cliente lo identifica
+  pidiendo el adjunto en vez de parsear un emoji en el texto. Grabado con
+  `MediaRecorder` en el webview, reproducción inline con un `<audio>`
+  cargado bajo demanda.
+- **Búsqueda local de mensajes**: FTS5 real de SQLite sobre
+  `messages.body`, indexado dentro de la misma base cifrada con SQLCipher
+  — hereda el mismo cifrado en reposo que todo lo demás. Esto es el
+  usuario buscando su propio buzón ya descifrado localmente por el
+  daemon, nunca nada que salga del proceso ni sea visible para un
+  relay/operador — explícitamente no es "escaneo de contenido" en el
+  sentido prohibido de §8/CLAUDE.md. Las queries se sanitizan (cada
+  palabra se cita como literal FTS5 y se unen con `AND`) para que
+  puntuación arbitraria (`"`, `-`, `NOT`, `:`, `*`) nunca se interprete
+  como sintaxis de consulta.
+- **Llamadas grupales** (`bh-calls::group`): malla completa (*full-mesh*)
+  WebRTC — cada participante abre una conexión directa a cada otro
+  participante, tope de `MAX_GROUP_CALL_PARTICIPANTS = 6` (no existe SFU
+  todavía). La clave base compartida de SFrame para toda la llamada sale
+  directo del *exporter secret* del grupo MLS
+  (`bh_crypto::mls::Group::export_call_base_key`, el mismo mecanismo que
+  usa un exporter de TLS 1.3) en vez de un esquema de acuerdo de claves
+  por-arista inventado — cada miembro ya comparte secretos de época tras
+  procesar los mismos commits, así que no hace falta ninguna ronda extra
+  de negociación y no se escribió ninguna primitiva criptográfica nueva
+  (mismo criterio que §2.2). Sin `bh-network` ni membresía de grupo real
+  todavía, los participantes además del que llama son miembros MLS
+  "sombra" generados localmente — mismo patrón honesto-sobre-su-alcance
+  que ya usan grupos/canales.
+- **Compartir pantalla** (`bh-calls::screen`, vía el crate `scap` —
+  ScreenCaptureKit en macOS, Windows.Graphics.Capture en Windows, el
+  portal PipeWire en Linux): los frames pasan por el mismo pipeline de
+  codificación VP8 + cifrado SFrame que ya usa el video de cámara, en una
+  segunda pista WebRTC paralela (`"screen"` en vez de `"video"`) — no es
+  un códec ni un esquema de cifrado separado. La captura real necesita
+  permiso de grabación de pantalla otorgado al proceso, algo que un
+  sandbox de CI no tiene, así que esa apertura concreta no se ejercita en
+  CI (los tests cubren la lógica de recorte de dimensiones y, por
+  separado, que la pista de screen-share sobrevive una conexión WebRTC
+  local real).
 
 ---
 
@@ -242,3 +371,4 @@ No estaban fijadas en v0.1 y se resolvieron al arrancar el repo:
 
 - **Lenguaje del daemon: Rust.** Justificación: `libsignal` (la propia librería de Signal para X3DH/Double Ratchet) está escrita en Rust; `openmls` es la implementación de referencia de MLS (RFC 9420) en Rust; `rust-libp2p` es una implementación madura de libp2p. Es la opción con mejor alineación directa con el stack de la sección 2 y 5, minimizando bindings/FFI.
 - **Cliente inicial: solo desktop (Tauri).** Se prioriza un extremo a extremo funcional en Windows/Mac/Linux antes de invertir en mobile/web. Tauri permite compartir crates de Rust entre el daemon y el shell del cliente. Mobile (iOS/Android) y web quedan para una fase posterior — la pregunta abierta de la §14 sobre distribución en iOS sigue sin resolver y deberá cerrarse antes de arrancar ese cliente.
+- **Infraestructura de cobro para personalización cosmética (§12): Monero vía el plugin oficial de BTCPay (`BTCPayServer.Plugins.Monero`), no un servicio `monero-wallet-rpc` propio.** Reutiliza la misma instancia BTCPay ya decidida para BTC/Lightning en vez de sumar y operar una pieza de infraestructura separada; el plugin es menos maduro que el soporte BTC nativo de BTCPay, riesgo aceptado a cambio de superficie operativa mínima. **v1 lanza solo con XMR + BTC/Lightning — ETH y otras altcoins quedan diferidas explícitamente**, coherente con que BTC/ETH son pseudónimos y no privados por diseño (§12), y evita meter una integración no nativa de BTCPay en el camino crítico de monetización antes del lanzamiento. Ninguna de las dos piezas está implementada todavía — esto cierra la decisión de arquitectura, no el trabajo de construcción (modelo de datos aislado, integración `bh-api`, UI de tienda en el cliente siguen pendientes).

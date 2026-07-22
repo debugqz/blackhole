@@ -69,6 +69,12 @@ where
 
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(config.interval);
+        // Default `MissedTickBehavior::Burst` fires every missed tick
+        // back-to-back the moment `send` is briefly slow, which is exactly
+        // the opposite of this module's entire purpose — a burst is a
+        // real, observable timing tell. `Delay` just resumes the constant
+        // cadence from whenever the late tick actually completed.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick fires immediately; skip it so cover traffic
         // starts on the same cadence it'll keep, not with a burst at t=0.
         ticker.tick().await;

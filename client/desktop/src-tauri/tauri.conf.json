@@ -14,12 +14,14 @@
     "windows": [
       {
         "title": "Blackhole",
-        "width": 800,
-        "height": 600
+        "width": 1040,
+        "height": 700,
+        "minWidth": 760,
+        "minHeight": 480
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {

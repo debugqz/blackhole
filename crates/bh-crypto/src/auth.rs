@@ -75,6 +75,16 @@ impl TotpSecret {
     pub fn verify(&self, code: &str) -> bool {
         self.totp.check_current(code).unwrap_or(false)
     }
+
+    /// The current 6-digit code for this secret. Exposed for the daemon's
+    /// own integration tests (which can't otherwise produce a code that
+    /// [`TotpSecret::verify`] will accept) — a real authenticator app is
+    /// what generates this in normal use.
+    pub fn generate_current(&self) -> Result<String, CryptoError> {
+        self.totp
+            .generate_current()
+            .map_err(|_| CryptoError::KeyDerivation)
+    }
 }
 
 // ---------------------------------------------------------------------

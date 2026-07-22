@@ -75,6 +75,24 @@ pub fn new_video_track(stream_id: &str) -> Arc<TrackLocalStaticSample> {
     ))
 }
 
+/// A second, parallel VP8 track for screen-share video — same codec
+/// capability as [`new_video_track`], just a distinct track id ("screen"
+/// vs "video") so the receive side can tell which source a given remote
+/// `TrackRemote` is (see `TrackRemote::id`) and depacketize/route it
+/// separately from camera video, even though both carry SFrame-encrypted
+/// VP8 samples produced by the exact same encoder/encryption path.
+pub fn new_screen_share_track(stream_id: &str) -> Arc<TrackLocalStaticSample> {
+    Arc::new(TrackLocalStaticSample::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_VP8.to_owned(),
+            clock_rate: 90_000,
+            ..Default::default()
+        },
+        "screen".to_owned(),
+        stream_id.to_owned(),
+    ))
+}
+
 /// Writes one already-SFrame-encrypted sample (an encrypted Opus or VP8
 /// frame) to a local track. webrtc-rs packetizes it into RTP and DTLS-SRTP
 /// encrypts that for the hop to whatever's on the other end — our own
@@ -312,6 +330,135 @@ mod tests {
         assert_eq!(
             decrypted_plaintexts, plaintexts,
             "the real frames (filler frames excluded) must decrypt in order"
+        );
+
+        let _ = caller_pc.close().await;
+        let _ = callee_pc.close().await;
+    }
+
+    /// Same shape as the audio test above, but for the screen-share track
+    /// ([`new_screen_share_track`]): confirms a *second*, independent VP8
+    /// track (distinct id from camera video, `"screen"`) survives a real
+    /// local WebRTC connection end to end through SFrame encryption too —
+    /// i.e. screen sharing rides the same transport+crypto stack as
+    /// audio/video, just on its own track, not a special-cased path.
+    #[tokio::test]
+    async fn encrypted_screen_share_frames_survive_a_real_local_webrtc_connection() {
+        let caller_pc = new_peer_connection(vec![]).await.unwrap();
+        let callee_pc = new_peer_connection(vec![]).await.unwrap();
+
+        let screen_track = new_screen_share_track("bh-calls-test-screen");
+        caller_pc
+            .add_track(screen_track.clone()
+                as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
+            .await
+            .unwrap();
+
+        let received_track: Arc<tokio::sync::Mutex<Option<Arc<TrackRemote>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let received_track_clone = received_track.clone();
+        callee_pc.on_track(Box::new(
+            move |track: Arc<TrackRemote>,
+                  _receiver: Arc<RTCRtpReceiver>,
+                  _transceiver: Arc<RTCRtpTransceiver>| {
+                let received_track_clone = received_track_clone.clone();
+                Box::pin(async move {
+                    *received_track_clone.lock().await = Some(track);
+                })
+            },
+        ));
+
+        let outgoing = OutgoingCall::new("test-call-screen-1", true);
+        let offer_sdp = create_local_offer(&caller_pc).await.unwrap();
+        let offer_signal = outgoing.offer(offer_sdp.into_bytes());
+
+        let incoming = IncomingCall::from_offer(&offer_signal).unwrap();
+        let answer_sdp = create_local_answer(
+            &callee_pc,
+            String::from_utf8(incoming.transport_description.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (answer_signal, callee_sframe) = incoming.answer(answer_sdp.into_bytes());
+
+        let (caller_sframe, callee_answer_sdp) = outgoing.accept_answer(&answer_signal).unwrap();
+        apply_remote_answer(&caller_pc, String::from_utf8(callee_answer_sdp).unwrap())
+            .await
+            .unwrap();
+
+        wait_connected(&caller_pc).await;
+        wait_connected(&callee_pc).await;
+
+        let encryptor = FrameEncryptor::new(caller_sframe, CALLER_SENDER_TAG);
+        let decryptor = FrameDecryptor::new(callee_sframe);
+
+        // Screen-share frames at a realistic-ish cadence for a low-fps
+        // screen share (here: every 100ms, i.e. ~10fps) — stands in for
+        // already-VP8-encoded frame payloads (this test exercises
+        // transport+crypto, not the codec, same as the audio test above).
+        let plaintexts: Vec<Vec<u8>> = (0..5)
+            .map(|i| format!("vp8-screen-frame-{i}").into_bytes())
+            .collect();
+        for plaintext in &plaintexts {
+            let encrypted = encryptor.encrypt(plaintext).unwrap();
+            write_encrypted_sample(&screen_track, encrypted, StdDuration::from_millis(100))
+                .await
+                .unwrap();
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        for _ in 0..3 {
+            let encrypted = encryptor.encrypt(b"__flush__").unwrap();
+            write_encrypted_sample(&screen_track, encrypted, StdDuration::from_millis(100))
+                .await
+                .unwrap();
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+
+        let track = tokio::time::timeout(StdDuration::from_secs(15), async {
+            loop {
+                if let Some(t) = received_track.lock().await.clone() {
+                    return t;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("callee never received the remote screen-share track");
+        assert_eq!(
+            track.id(),
+            "screen",
+            "must be the screen-share track, not camera video"
+        );
+
+        let mut sample_builder =
+            SampleBuilder::new(50, webrtc::rtp::codecs::vp8::Vp8Packet::default(), 90_000);
+        let mut decrypted_plaintexts = Vec::new();
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(15);
+        let mut buf = vec![0u8; 1500];
+        let received_any = AtomicBool::new(false);
+        while decrypted_plaintexts.len() < plaintexts.len()
+            && tokio::time::Instant::now() < deadline
+        {
+            match tokio::time::timeout(StdDuration::from_millis(500), track.read(&mut buf)).await {
+                Ok(Ok((packet, _attrs))) => {
+                    received_any.store(true, Ordering::SeqCst);
+                    sample_builder.push(packet);
+                    while let Some(sample) = sample_builder.pop() {
+                        let (_, _, _, plaintext) = decryptor.decrypt(&sample.data).unwrap();
+                        decrypted_plaintexts.push(plaintext);
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        assert!(
+            received_any.load(Ordering::SeqCst),
+            "never read any RTP packets on the screen-share track"
+        );
+        assert_eq!(
+            decrypted_plaintexts, plaintexts,
+            "the real screen-share frames (filler frames excluded) must decrypt in order"
         );
 
         let _ = caller_pc.close().await;

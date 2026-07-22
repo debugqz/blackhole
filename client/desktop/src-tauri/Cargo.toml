@@ -24,3 +24,9 @@ tauri-plugin-opener = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Link previews (client-only, opt-in — see src/link_preview.rs): a plain
+# synchronous HTTP client so the daemon and its network stack are never in
+# this request's path. Default features (rustls + gzip) are all we need.
+ureq = "3"
+url = "2"
+

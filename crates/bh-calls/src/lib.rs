@@ -30,7 +30,9 @@
 //! yet (mirrors `bh-network`'s own current state).
 
 pub mod audio;
+pub mod group;
 pub mod media_crypto;
+pub mod screen;
 pub mod session;
 pub mod signaling;
 pub mod transport;

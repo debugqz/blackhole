@@ -40,6 +40,13 @@ nokhwa = { version = "0.10", features = ["input-native"] }
 # `docs/SPEC.md` build prerequisites.
 vpx-encode = "0.4"
 env-libvpx-sys = { version = "5", features = ["generate"] }
+# Screen capture for screen sharing (`screen.rs`) — real platform capture
+# APIs under the hood: ScreenCaptureKit on macOS, Windows.Graphics.Capture
+# on Windows, the xdg-desktop-portal/PipeWire screencast portal on Linux.
+# The Linux backend needs libpipewire + libdbus headers (pkg-config) at
+# build time, in addition to this crate's existing opus/libvpx/pkg-config
+# prerequisites — see `.github/workflows/ci.yml`'s system-dependencies step.
+scap = "0.0.8"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

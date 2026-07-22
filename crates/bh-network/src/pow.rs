@@ -19,15 +19,21 @@ pub struct Challenge {
 }
 
 /// Binds the challenge to this specific message so a solved PoW can't be
-/// replayed to cover a different (or repeated) send.
+/// replayed to cover a different (or repeated) send. `message_id` is part
+/// of the binding, not just `(recipient, ciphertext, timestamp)` — without
+/// it, one solved PoW for a given ciphertext/timestamp could be replayed
+/// across any number of distinct `message_id`s, storing unlimited
+/// duplicate mailbox entries for near-zero marginal cost.
 pub fn challenge_for_message(
     recipient_key_hash: &[u8],
+    message_id: &[u8],
     message_ciphertext: &[u8],
     timestamp: i64,
     difficulty_bits: u8,
 ) -> Challenge {
     let mut hasher = Sha256::new();
     hasher.update(recipient_key_hash);
+    hasher.update(message_id);
     hasher.update(message_ciphertext);
     hasher.update(timestamp.to_be_bytes());
     Challenge {
@@ -89,14 +95,14 @@ mod tests {
 
     #[test]
     fn solved_proof_of_work_verifies() {
-        let challenge = challenge_for_message(b"recipient", b"ciphertext", 1000, 12);
+        let challenge = challenge_for_message(b"recipient", b"msg-1", b"ciphertext", 1000, 12);
         let solution = solve(&challenge);
         assert!(verify(&challenge, &solution));
     }
 
     #[test]
     fn wrong_nonce_fails_verification() {
-        let challenge = challenge_for_message(b"recipient", b"ciphertext", 1000, 12);
+        let challenge = challenge_for_message(b"recipient", b"msg-1", b"ciphertext", 1000, 12);
         let solution = solve(&challenge);
         let wrong = Solution {
             nonce: solution.nonce.wrapping_add(1),
@@ -117,22 +123,39 @@ mod tests {
 
     #[test]
     fn solution_does_not_transfer_to_a_different_message() {
-        let challenge_a = challenge_for_message(b"recipient", b"message A", 1000, 12);
-        let challenge_b = challenge_for_message(b"recipient", b"message B", 1000, 12);
+        let challenge_a = challenge_for_message(b"recipient", b"msg-1", b"message A", 1000, 12);
+        let challenge_b = challenge_for_message(b"recipient", b"msg-1", b"message B", 1000, 12);
+        let solution_a = solve(&challenge_a);
+        assert!(!verify(&challenge_b, &solution_a));
+    }
+
+    /// Regression test: the challenge must bind `message_id`, not just
+    /// `(recipient, ciphertext, timestamp)` — otherwise a single solved PoW
+    /// for one message_id could be replayed to cover any number of other
+    /// message_ids sharing the same ciphertext/timestamp.
+    #[test]
+    fn solution_does_not_transfer_to_a_different_message_id() {
+        let challenge_a =
+            challenge_for_message(b"recipient", b"msg-1", b"same ciphertext", 1000, 12);
+        let challenge_b =
+            challenge_for_message(b"recipient", b"msg-2", b"same ciphertext", 1000, 12);
+        assert_ne!(challenge_a.bytes, challenge_b.bytes);
         let solution_a = solve(&challenge_a);
         assert!(!verify(&challenge_b, &solution_a));
     }
 
     #[test]
     fn different_timestamps_prevent_replay_of_the_same_content() {
-        let challenge_1 = challenge_for_message(b"recipient", b"same ciphertext", 1000, 8);
-        let challenge_2 = challenge_for_message(b"recipient", b"same ciphertext", 2000, 8);
+        let challenge_1 =
+            challenge_for_message(b"recipient", b"msg-1", b"same ciphertext", 1000, 8);
+        let challenge_2 =
+            challenge_for_message(b"recipient", b"msg-1", b"same ciphertext", 2000, 8);
         assert_ne!(challenge_1.bytes, challenge_2.bytes);
     }
 
     #[test]
     fn higher_difficulty_solutions_still_verify_at_their_own_level() {
-        let challenge = challenge_for_message(b"recipient", b"ciphertext", 1000, 16);
+        let challenge = challenge_for_message(b"recipient", b"msg-1", b"ciphertext", 1000, 16);
         let solution = solve(&challenge);
         assert!(verify(&challenge, &solution));
         // A solution meeting 16 bits of difficulty necessarily also meets

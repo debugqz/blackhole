@@ -8,14 +8,19 @@
 //! combiner only produces a weak shared secret if *both* legs are broken.
 
 use hkdf::Hkdf;
-use ml_kem::{Decapsulate, DecapsulationKey768, Encapsulate, EncapsulationKey768, Kem, MlKem768};
+use ml_kem::{
+    Decapsulate, DecapsulationKey768, Encapsulate, EncapsulationKey768, Kem, KeyExport, MlKem768,
+};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
+use zeroize::Zeroizing;
 
 use crate::CryptoError;
 
 fn combine(x25519_shared: &[u8; 32], ml_kem_shared: &[u8]) -> [u8; 32] {
-    let mut ikm = Vec::with_capacity(32 + ml_kem_shared.len());
+    // Heap-allocated and holds both raw shared secrets concatenated —
+    // wrapped so it's wiped on drop rather than left in freed heap memory.
+    let mut ikm: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(32 + ml_kem_shared.len()));
     ikm.extend_from_slice(x25519_shared);
     ikm.extend_from_slice(ml_kem_shared);
     let hkdf = Hkdf::<Sha256>::new(None, &ikm);
@@ -35,9 +40,21 @@ pub struct HybridSecretKey {
 
 /// The public half, published so a peer can run [`hybrid_encapsulate`]
 /// against it.
+#[derive(Clone)]
 pub struct HybridPublicKey {
     pub x25519_public: X25519PublicKey,
     pub ml_kem_encap: EncapsulationKey768,
+}
+
+impl HybridPublicKey {
+    /// Raw bytes suitable for signing or wire transmission: the X25519
+    /// public key followed by the encoded ML-KEM encapsulation key.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 1184);
+        out.extend_from_slice(self.x25519_public.as_bytes());
+        out.extend_from_slice(self.ml_kem_encap.to_bytes().as_slice());
+        out
+    }
 }
 
 /// What the initiator sends to the responder: their ephemeral X25519

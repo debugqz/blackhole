@@ -12,15 +12,36 @@
 //! if the receipt's content stayed encrypted.
 //!
 //! Encoding is plain `serde_json` (already used the same way in
-//! `bh-network::sealed_sender`) — compactness doesn't matter here since the
-//! whole thing is encrypted before it ever reaches a byte the network can
-//! measure at that granularity; the ciphertext *length* leaking coarse
-//! content-type information is a separate, already-tracked risk (see
-//! `docs/THREAT_MODEL.md` onion packet-size entry).
+//! `bh-network::sealed_sender`), length-prefixed and then padded up to a
+//! fixed size bucket (see [`bucket_len`]) before it's handed to the
+//! ratchet/MLS layer for encryption. Padding is what actually closes the
+//! metadata gap the module-level comment above describes: without it, a
+//! `Reaction` (tiny JSON) and a `Call(Offer)` (an SDP blob, often a few KB)
+//! would produce distinguishably different ciphertext lengths even though
+//! both are opaque to anyone but the recipient — an observer could infer
+//! "this pair just started a call" from size alone. Same bucket-padding
+//! approach as `bh-network::onion`, and the same caveat: this collapses
+//! exact length down to one of a handful of buckets, it doesn't achieve
+//! Sphinx-style perfectly-constant size (see that module's doc comment for
+//! why that's harder and out of scope here too).
 
 use serde::{Deserialize, Serialize};
 
 use crate::CryptoError;
+
+const SIZE_BUCKETS: &[usize] = &[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
+/// Rounds `len` up to the next size bucket, falling back to the next
+/// multiple of the largest bucket for anything bigger than all of them.
+fn bucket_len(len: usize) -> usize {
+    match SIZE_BUCKETS.iter().copied().find(|&b| b >= len) {
+        Some(b) => b,
+        None => {
+            let largest = *SIZE_BUCKETS.last().expect("SIZE_BUCKETS is non-empty");
+            len.div_ceil(largest) * largest
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReceiptKind {
@@ -50,6 +71,29 @@ pub enum CallSignal {
     Answer {
         call_id: String,
         callee_ephemeral_public: [u8; 32],
+        transport_description: Vec<u8>,
+    },
+    /// One edge of a full-mesh group call's signaling (`bh_calls::group`):
+    /// offers the WebRTC transport description for the connection from
+    /// `from_participant` to `to_participant`. Unlike `Offer`, this
+    /// carries no ephemeral public key — the SFrame base key for the whole
+    /// call comes from the MLS group's own exporter secret
+    /// (`bh_crypto::mls::Group::export_call_base_key`), already implicitly
+    /// shared by every current member without any additional per-edge
+    /// key-agreement round trip, so there is nothing to negotiate here
+    /// beyond the WebRTC transport description itself.
+    GroupOffer {
+        call_id: String,
+        from_participant: u8,
+        to_participant: u8,
+        transport_description: Vec<u8>,
+        video: bool,
+    },
+    /// Answers a [`CallSignal::GroupOffer`] for the same mesh edge.
+    GroupAnswer {
+        call_id: String,
+        from_participant: u8,
+        to_participant: u8,
         transport_description: Vec<u8>,
     },
     IceCandidate {
@@ -91,16 +135,37 @@ pub enum Envelope {
         timer_secs: Option<i64>,
     },
     Call(CallSignal),
+    /// Ephemeral "is typing…" presence ping (opt-in — see
+    /// `bh-api::presence`). Carries no payload beyond the variant tag
+    /// itself: there is nothing to persist, nothing to read back later,
+    /// just a marker that gets encrypted and decrypted exactly like any
+    /// other envelope — going through the same sealed session/mailbox
+    /// channel is what makes it metadata-free from the operator's point of
+    /// view — same reasoning as `Receipt` above, and the same ciphertext a
+    /// mailbox/relay/operator would see either way.
+    Typing,
 }
 
 impl Envelope {
+    /// Serializes and pads to a fixed size bucket. See the module doc
+    /// comment for why the padding matters, not just the JSON.
     pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
-        serde_json::to_vec(self).map_err(|_| CryptoError::NotImplemented("envelope: encode failed"))
+        let json = serde_json::to_vec(self)
+            .map_err(|_| CryptoError::NotImplemented("envelope: encode failed"))?;
+
+        let mut framed = Vec::with_capacity(4 + json.len());
+        framed.extend_from_slice(&(json.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&json);
+        framed.resize(bucket_len(framed.len()), 0u8);
+        Ok(framed)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CryptoError> {
-        serde_json::from_slice(bytes)
-            .map_err(|_| CryptoError::NotImplemented("envelope: malformed payload"))
+        let malformed = || CryptoError::NotImplemented("envelope: malformed payload");
+        let real_len_bytes: [u8; 4] = bytes.get(..4).ok_or_else(malformed)?.try_into().unwrap();
+        let real_len = u32::from_be_bytes(real_len_bytes) as usize;
+        let json = bytes.get(4..4 + real_len).ok_or_else(malformed)?;
+        serde_json::from_slice(json).map_err(|_| malformed())
     }
 }
 
@@ -159,5 +224,110 @@ mod tests {
     #[test]
     fn garbage_bytes_are_rejected_not_panicked_on() {
         assert!(Envelope::decode(b"not json").is_err());
+    }
+
+    /// The point of the padding: a tiny reaction and a receipt covering
+    /// several messages land in the same size bucket, so measuring
+    /// encoded length alone can't distinguish "someone reacted" from
+    /// "someone read several messages."
+    #[test]
+    fn different_small_variants_pad_to_the_same_bucket() {
+        let reaction = Envelope::Reaction {
+            message_id: "m1".into(),
+            emoji: "👍".into(),
+            remove: false,
+        };
+        let receipt = Envelope::Receipt {
+            message_ids: vec!["m1".into(), "m2".into(), "m3".into()],
+            kind: ReceiptKind::Read,
+        };
+        assert_eq!(
+            reaction.encode().unwrap().len(),
+            receipt.encode().unwrap().len()
+        );
+    }
+
+    #[test]
+    fn encoded_length_is_always_a_known_bucket_size() {
+        let env = Envelope::Text {
+            body: "hi".into(),
+            reply_to_message_id: None,
+        };
+        let len = env.encode().unwrap().len();
+        assert!(
+            SIZE_BUCKETS.contains(&len),
+            "expected one of {SIZE_BUCKETS:?}, got {len}"
+        );
+    }
+
+    #[test]
+    fn oversized_payload_still_round_trips() {
+        let env = Envelope::Call(CallSignal::Offer {
+            call_id: "call-1".into(),
+            caller_ephemeral_public: [1u8; 32],
+            transport_description: vec![9u8; 200_000], // bigger than the largest bucket
+            video: true,
+        });
+        let bytes = env.encode().unwrap();
+        let Envelope::Call(CallSignal::Offer {
+            transport_description,
+            ..
+        }) = Envelope::decode(&bytes).unwrap()
+        else {
+            panic!("expected Call(Offer) variant");
+        };
+        assert_eq!(transport_description.len(), 200_000);
+    }
+
+    #[test]
+    fn typing_envelope_roundtrips() {
+        let env = Envelope::Typing;
+        let decoded = Envelope::decode(&env.encode().unwrap()).unwrap();
+        assert!(matches!(decoded, Envelope::Typing));
+    }
+
+    #[test]
+    fn group_offer_and_answer_envelopes_roundtrip() {
+        let offer_env = Envelope::Call(CallSignal::GroupOffer {
+            call_id: "group-call-1".into(),
+            from_participant: 0,
+            to_participant: 2,
+            transport_description: vec![4, 5, 6],
+            video: false,
+        });
+        let bytes = offer_env.encode().unwrap();
+        let Envelope::Call(CallSignal::GroupOffer {
+            call_id,
+            from_participant,
+            to_participant,
+            transport_description,
+            video,
+        }) = Envelope::decode(&bytes).unwrap()
+        else {
+            panic!("expected Call(GroupOffer) variant");
+        };
+        assert_eq!(call_id, "group-call-1");
+        assert_eq!(from_participant, 0);
+        assert_eq!(to_participant, 2);
+        assert_eq!(transport_description, vec![4, 5, 6]);
+        assert!(!video);
+
+        let answer_env = Envelope::Call(CallSignal::GroupAnswer {
+            call_id: "group-call-1".into(),
+            from_participant: 2,
+            to_participant: 0,
+            transport_description: vec![7, 8, 9],
+        });
+        let bytes = answer_env.encode().unwrap();
+        let Envelope::Call(CallSignal::GroupAnswer {
+            from_participant,
+            to_participant,
+            ..
+        }) = Envelope::decode(&bytes).unwrap()
+        else {
+            panic!("expected Call(GroupAnswer) variant");
+        };
+        assert_eq!(from_participant, 2);
+        assert_eq!(to_participant, 0);
     }
 }

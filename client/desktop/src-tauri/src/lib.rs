@@ -1,53 +1,151 @@
 //! The UI talks only to the local daemon over localhost, never directly to
-//! the P2P network (docs/SPEC.md §6). These commands are raw HTTP over a
-//! `TcpStream` — fine while the API surface is this small; once it grows
-//! past a handful of calls this should move to a typed HTTP client.
+//! the P2P network (docs/SPEC.md §6). `daemon_call` is a single generic
+//! command that proxies an HTTP request over a raw `TcpStream` — the API
+//! surface grew past "a handful of calls" (see git history for the old
+//! one-Tauri-command-per-route version), so the typed surface now lives on
+//! the TypeScript side (`src/api.ts`) instead of being duplicated here.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use serde::Serialize;
+
+mod link_preview;
+
 const DEFAULT_DAEMON_PORT: u16 = 47_853;
 
-fn daemon_request(port: Option<u16>, method: &str, path: &str) -> Result<String, String> {
-    let port = port.unwrap_or(DEFAULT_DAEMON_PORT);
-    let mut stream =
-        TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("daemon unreachable: {e}"))?;
+#[derive(Serialize)]
+pub struct DaemonResponse {
+    status: u16,
+    body: String,
+}
+
+/// HTTP verbs the daemon's route table actually uses (`server.rs`) — an
+/// allowlist, not a general HTTP client, since `method` ends up spliced
+/// directly into the request line below.
+const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH"];
+
+/// `method` and `path` are spliced directly into the request line, and
+/// this webview-callable command has no other gate in front of it — a
+/// future XSS bug in the webview (e.g. a contact-controlled string
+/// reaching `innerHTML`) would otherwise get an unvalidated bridge into
+/// raw request-line/header injection against whatever is listening on
+/// this port. Reject anything that isn't a plain, single-line HTTP
+/// request against the daemon's own route table.
+fn validate_method_and_path(method: &str, path: &str) -> Result<(), String> {
+    if !ALLOWED_METHODS.contains(&method) {
+        return Err(format!("unsupported method: {method}"));
+    }
+    if !path.starts_with('/') || path.contains(['\r', '\n']) {
+        return Err("invalid path".to_string());
+    }
+    Ok(())
+}
+
+fn daemon_request(
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<DaemonResponse, String> {
+    validate_method_and_path(method, path)?;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", DEFAULT_DAEMON_PORT))
+        .map_err(|e| format!("daemon unreachable: {e}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
+
+    let payload = body.unwrap_or_default();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
     stream
-        .write_all(format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(request.as_bytes())
         .map_err(|e| e.to_string())?;
+
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
         .map_err(|e| e.to_string())?;
-    response
-        .split("\r\n\r\n")
-        .nth(1)
-        .map(str::to_string)
-        .ok_or_else(|| "malformed daemon response".to_string())
+
+    let mut parts = response.splitn(2, "\r\n\r\n");
+    let head = parts.next().unwrap_or_default();
+    let body = parts.next().unwrap_or_default().to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| "malformed daemon response".to_string())?;
+
+    Ok(DaemonResponse { status, body })
 }
 
 #[tauri::command]
-fn daemon_health(port: Option<u16>) -> Result<String, String> {
-    daemon_request(port, "GET", "/health")
+fn daemon_call(
+    method: String,
+    path: String,
+    body: Option<String>,
+) -> Result<DaemonResponse, String> {
+    daemon_request(&method, &path, body)
 }
 
-/// Irreversible. Wipes the daemon's local key material and database, then
-/// the daemon process exits (SPEC.md §7) — this is meant to be gated
-/// behind a real confirmation in the UI, not a stray click.
+/// Fetches a URL directly (never through the daemon) for a client-side
+/// link preview — see `link_preview.rs` module doc for the privacy
+/// tradeoff and SSRF guard this enforces.
 #[tauri::command]
-fn panic_wipe_daemon(port: Option<u16>) -> Result<String, String> {
-    daemon_request(port, "POST", "/panic-wipe")
+fn fetch_link_preview(url: String) -> Result<link_preview::LinkPreviewResponse, String> {
+    link_preview::fetch(&url)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![daemon_health, panic_wipe_daemon])
+        .invoke_handler(tauri::generate_handler![daemon_call, fetch_link_preview])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_method_outside_the_allowlist() {
+        assert!(validate_method_and_path("TRACE", "/health").is_err());
+        assert!(
+            validate_method_and_path("get", "/health").is_err(),
+            "case-sensitive"
+        );
+    }
+
+    #[test]
+    fn accepts_every_allowlisted_method() {
+        for method in ALLOWED_METHODS {
+            assert!(validate_method_and_path(method, "/health").is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_a_path_that_does_not_start_with_a_slash() {
+        assert!(validate_method_and_path("GET", "health").is_err());
+    }
+
+    /// Regression test: a path containing CR/LF could otherwise splice
+    /// extra header lines (or a second request) into the request this
+    /// bridge sends to the daemon.
+    #[test]
+    fn rejects_a_path_containing_crlf() {
+        assert!(validate_method_and_path("GET", "/health\r\nX-Injected: 1").is_err());
+        assert!(validate_method_and_path("GET", "/health\nX-Injected: 1").is_err());
+    }
+
+    #[test]
+    fn accepts_a_well_formed_path() {
+        assert!(validate_method_and_path("POST", "/conversations/abc-123/messages").is_ok());
+    }
 }

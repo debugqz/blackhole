@@ -42,35 +42,100 @@ and "what could go wrong here" questions are already answered there.
 
 - `daemon/` — Rust binary; owns the SQLCipher database and platform
   keystore, runs the self-destruct sweeper, and exposes the localhost API
-  the UI talks to (SPEC.md §6). `bh-network` (DHT/onion/mailboxes) is not
-  wired into the daemon yet — it's a fully tested standalone layer, not yet
-  connected to a live network or to message send/receive.
+  the UI talks to (SPEC.md §6). `bh-network` (DHT/onion/mailboxes) *is*
+  spawned and listening here via `bh_network::supervised::SupervisedNetwork`
+  (binding all interfaces via `BLACKHOLE_NETWORK_LISTEN_ADDR`, unlike the
+  HTTP API's loopback-only bind — THREAT_MODEL.md §3.10), and is reachable
+  read-only via `GET /network/status`. It is still not wired into message
+  send/receive: `bh-api::conversations`' handlers go straight to the local
+  database, not the network stack, so nothing about live P2P delivery is
+  real yet — that's a separate follow-up.
 - `crates/bh-crypto` — identity + seed phrase, passkeys/TOTP, X3DH + Double
   Ratchet, MLS, PQ hybrid, invite QR/links, device linking, encrypted
-  backups (SPEC.md §2-4). All real, tested implementations.
+  backups (SPEC.md §2-4). All real, tested implementations. Also:
+  `key_transparency.rs` (RFC 6962 Merkle tree hash/inclusion/consistency
+  proofs — a tested client-side primitive, not yet a deployed gossiped
+  log, THREAT_MODEL.md §3.1), `mls_storage.rs`
+  (`PersistentMlsProvider` — SQLCipher-backed `openmls` storage so group
+  state survives a daemon restart), `payment_address.rs` (address-format
+  validation for XMR/BTC/ETH payment requests), `qr.rs` (shared QR
+  rendering for invites/device-linking/safety-numbers), `webhook.rs`
+  (HMAC-SHA256 signing/verification gating the cosmetics-store
+  payment-confirmed webhook).
 - `crates/bh-network` — libp2p transport + Kademlia DHT, onion routing,
   Eclipse/Sybil-resistant node selection, cover traffic, mailboxes, sealed
   sender, anti-spam PoW (SPEC.md §5). Real and tested against local
   multi-node scenarios; not yet deployed against a real network, and see
   THREAT_MODEL.md §3.4/§3.6 for the two biggest known gaps (onion packet-
-  size leak, mailbox manifest race).
+  size leak, mailbox manifest race). `supervised.rs` wraps the event loop
+  so a panic (e.g. the live `yamux` CVE, THREAT_MODEL.md §3.10) respawns
+  a fresh node instead of permanently killing that node's networking.
 - `crates/bh-storage` — SQLCipher-backed data model (contacts,
   conversations, messages, groups, devices, sessions, files, settings),
   platform keystore (Keychain/Credential Manager/Secret Service via
   `keyring`), panic wipe, self-destruct message sweeper (SPEC.md §7).
+  Also: `db_key_lock.rs` (optional PIN layer sealing the SQLCipher key,
+  Argon2id + ChaCha20-Poly1305, opt-in per profile), `local_auth.rs`
+  (passkey/TOTP credential storage for the client-side unlock gate —
+  does not gate DB decryption itself), `cosmetics.rs`/`message_stickers.rs`
+  (inventory/equip state and per-message sticker attachment, SPEC.md §12),
+  `push.rs` (this profile's own opt-in wake-relay registration —
+  opaque token + on/off, never content or a contact/conversation id),
+  `search.rs` (local FTS5 full-text search over this profile's own
+  already-decrypted `messages.body` — a pure local query, never
+  "content scanning" in the CLAUDE.md-forbidden sense since nothing
+  leaves the daemon).
 - `crates/bh-files` — content-addressed file chunking, per-chunk E2EE,
   resumable download tracking (SPEC.md §5.5). Storage/transport-agnostic by
   design — the daemon wires it to disk and the network separately.
 - `crates/bh-api` — localhost RPC surface between daemon and UI clients.
   Real endpoints for identity bootstrap, panic wipe, contacts, moderation
-  (block/message-requests/reports), conversations/messages, reactions,
-  quote-reply, disappearing-message timers, delivery/read receipts, safety
-  numbers, expiring/limited-use invites, encrypted conversation
-  export/import, multi-account profile management, and call
-  signaling/setup — all backed by `bh-storage`/`bh-crypto`/`bh-calls`,
-  verified end-to-end via live HTTP smoke tests during development plus an
-  in-process `tower::ServiceExt` integration test suite
-  (`crates/bh-api/tests/api_smoke.rs`).
+  (block/message-requests/reports), conversations/messages (including
+  message editing with a preserved-history model, never a silent
+  overwrite), reactions, quote-reply, disappearing-message timers,
+  delivery/read receipts, safety numbers, expiring/limited-use invites,
+  encrypted conversation export/import, multi-account profile management,
+  call signaling/setup (1:1, group, and screen-share), device linking
+  (`device_link.rs`) and device *sync* (`device_sync.rs` — keeps an
+  already-linked device's message history current, distinct from linking
+  itself), passkey/TOTP local-unlock (`local_auth.rs`), groups
+  (`groups.rs`, including broadcast channels — a group with
+  `broadcast_only` set so only the owner may post, enforced at the API
+  layer on top of the same MLS group, not a crypto-level restriction),
+  file/media attachments (`files.rs`, including voice messages — the same
+  attachment path tagged `attachment_kind: voice` with a duration, body
+  `null` like a sticker), sticker packs (`stickers.rs`, gated by
+  cosmetic-inventory ownership), the cosmetics store (`cosmetics.rs`),
+  opt-in typing presence (`presence.rs`), opt-in wake-push registration
+  (`push.rs`), and local full-text search (`search.rs`) — all backed by
+  `bh-storage`/`bh-crypto`/`bh-calls`/`bh-files`, verified end-to-end via
+  live HTTP smoke tests during development plus an in-process
+  `tower::ServiceExt` integration test suite
+  (`crates/bh-api/tests/api_smoke.rs`). Device linking, device sync,
+  groups, and file attachments are deliberately scoped to what works
+  without a live `bh-network`: device linking is a single-daemon
+  simulation of the real 4-step protocol (not a second physical device);
+  device sync exercises a genuine X3DH + Double Ratchet handshake between
+  the primary device's real identity and a locally-generated shadow
+  identity for the linked device's endpoint (same trick groups uses for
+  contacts) so the sync round-trip is real crypto, not a same-process
+  echo; groups (including broadcast channels and group calls) use
+  per-contact/per-participant "shadow" MLS members generated locally to
+  exercise the real crypto path (not real remote peers); and live MLS
+  group state does survive a daemon restart
+  (`bh_crypto::mls_storage::PersistentMlsProvider` backs the own member in
+  every group, and `bh-api::groups.rs` reconstructs a `GroupRegistry`
+  cache miss from storage — `add_member`/`remove_member`/`mls-self-test`
+  no longer return `410` after a restart — THREAT_MODEL.md §3.2);
+  attachments are base64-in-JSON with a 25 MiB cap, and are swept by the
+  disappearing-message timer (the expiry sweeper deletes a purged
+  message's orphaned chunk directory from disk, not just its DB row).
+  Local search (`search.rs`) is a pure local SQLite FTS5 query over this
+  profile's own already-decrypted message history — nothing about a
+  search term or its results ever leaves the daemon process, so this is
+  not "content scanning" in the CLAUDE.md-forbidden sense. Local unlock
+  gates the Tauri client's UI only — it does not gate SQLCipher DB
+  decryption (THREAT_MODEL.md §3.7).
 - `crates/bh-calls` — voice/video calls: real WebRTC transport (ICE/DTLS/
   SRTP via `webrtc-rs`) plus an independent SFrame-style end-to-end media
   encryption layer keyed from `bh-crypto::call_keys` (so even a coerced
@@ -78,23 +143,97 @@ and "what could go wrong here" questions are already answered there.
   playback) is fully real and tested; camera capture and VP8 encoding are
   real, but VP8 *decoding* is deliberately left to the client (no audited
   safe-Rust VP8 decoder exists — see SPEC.md §15/THREAT_MODEL.md §3.11).
-  No STUN/TURN yet, same current limitation as `bh-network`. Needs `opus`,
-  `libvpx`, and `pkg-config` installed at build time (see
-  `crates/bh-calls/Cargo.toml`).
-- `client/desktop` — Tauri desktop client. Minimal dev shell (not product
-  UI) with daemon health check, panic wipe button, and window-blur content
-  mitigation wired up.
+  **Group calls** (`group.rs`): full-mesh WebRTC (every participant
+  connects directly to every other one, capped at
+  `MAX_GROUP_CALL_PARTICIPANTS = 6` — no SFU exists yet), with the shared
+  SFrame base key derived straight from the call's MLS group via
+  `bh_crypto::mls::Group::export_call_base_key` (RFC 9420's own exporter
+  secret, the same mechanism a TLS 1.3 exporter uses) instead of a bespoke
+  per-edge key-agreement scheme — every member already shares epoch
+  secrets after processing the same commits, so no extra round trip is
+  needed and no new crypto primitive was written. **Screen sharing**
+  (`screen.rs`, via the cross-platform `scap` crate — ScreenCaptureKit on
+  macOS, Windows.Graphics.Capture on Windows, the PipeWire portal on
+  Linux): frames flow through the *exact same* VP8 encode + SFrame
+  encrypt path camera video already uses, just on a second, parallel
+  track (`"screen"` vs `"video"` track id) — not a separate codec or
+  encryption scheme. No STUN/TURN yet, same current limitation as
+  `bh-network`, so today's WebRTC connections (1:1, group-mesh, and
+  screen-share alike) only work when peers can reach each other directly.
+  Needs `opus`, `libvpx`, and `pkg-config` installed at build time (see
+  `crates/bh-calls/Cargo.toml`); the Linux screen-capture backend
+  additionally needs `libpipewire`/`libdbus` headers (see
+  `.github/workflows/ci.yml`'s system-dependencies step).
+- `crates/bh-push-relay` — a small, separate, internet-facing binary (not
+  part of the `bh-api` loopback-only daemon) whose *only* job is relaying
+  an opaque "wake up" token — never message content, sender identity, or
+  conversation id. `POST /register` accepts a client's opaque token;
+  `POST /wake/:token` (called by the daemon's mailbox code once wired —
+  currently a marked `// TODO(real-push)` integration point, not built)
+  triggers a content-free push to whatever real provider (APNs/FCM/
+  UnifiedPush) is plugged in later, itself still a stub
+  (`forward_to_push_provider`). In-memory only, no database, no logging
+  beyond what's operationally necessary — see the crate's own module doc
+  for the full design rationale (SPEC.md §5.6). The daemon-side
+  registration state (opaque, rotating token + on/off) lives in
+  `bh-storage::push`/`bh-api::push`, opt-in and off by default.
+- `client/desktop` — Tauri desktop client. Real product UI (monochrome
+  "Event Horizon" visual direction), wired end-to-end against every
+  same-profile `bh-api` route that doesn't need a live network: identity
+  bootstrap with one-time seed phrase reveal, contacts/conversations/
+  messages (including inline editing with a viewable edit-history
+  affordance), safety number verification, invite create/decode/revoke,
+  moderation (block/unblock, message requests, reports), multi-profile
+  switching, message reactions, delivery/read receipt display,
+  disappearing-message timer, encrypted conversation export/import, panic
+  wipe, device linking (local simulation, labeled as such in the UI) plus
+  device *sync* (a "Sync now" action + pending-count badge per linked
+  device), passkey/TOTP local-unlock gate, groups (create/manage
+  members/verify the MLS crypto path) including broadcast channels
+  (a "Broadcast channel" toggle at creation, labeled `(channel)` in the
+  conversation list), file/media attachments (attach, list, download)
+  plus voice messages (record via `MediaRecorder`, inline playback), a
+  singleton local-only "Notes to self" conversation (pinned at the top of
+  the list, no encryption session since there's no counterparty), a
+  cosmetics store (browse/buy/equip banners/themes/stickers — "buy"
+  records a pending purchase; there is no client-side way to confirm
+  payment, by design, since that's gated behind an HMAC secret only a
+  real BTCPay webhook should have), a sticker picker in the composer
+  (only shows owned packs), opt-in "typing…" indicators (debounced
+  send-while-typing + polled status line), opt-in link previews (resolved
+  **client-side only**, via a dedicated Tauri command
+  (`fetch_link_preview`, `src-tauri/src/link_preview.rs`) that never goes
+  through `daemon_call`/the daemon at all — enabling it reveals the
+  user's IP to whatever site is linked, stated explicitly in the toggle's
+  copy rather than hidden), opt-in wake-push registration, and local
+  message search (a search overlay with FTS5-highlighted snippets).
+  Talks to the daemon only through a single generic `daemon_call` Tauri
+  command (`src-tauri/src/lib.rs`) proxying raw HTTP over loopback — the
+  typed request/response surface lives in `src/api.ts`. Not yet wired:
+  calls of any kind, 1:1/group/screen-share alike (needs STUN/TURN, same
+  gap as `bh-network`/`bh-calls` — there is real, tested backend capacity
+  for all three, just no client UI yet, consistent with 1:1 calls never
+  having gotten one either). The passkey enroll/unlock WebAuthn glue
+  (`navigator.credentials.create()/get()` in `main.ts`) can't be
+  exercised headlessly — verify manually on real hardware (Touch ID/
+  Windows Hello/a security key) before relying on it.
 - `docs/SPEC.md` — full spec, source of truth for architecture decisions.
-  §15 covers everything added post-v0.1 (reactions, disappearing timers,
+  §15 covers the first post-v0.1 batch (reactions, disappearing timers,
   receipts, safety numbers, expiring invites, encrypted export/import,
-  multi-account, calls).
+  multi-account, calls). §16 covers the second batch (device sync,
+  sticker packs/themes, notes to self, message editing, broadcast
+  channels, link previews, wake-push relay, voice messages, local search,
+  group calls, screen sharing).
 - `docs/THREAT_MODEL.md` — per-subsystem STRIDE analysis grounded in the
   actual implementation, plus a ranked list of known open risks.
 
-Workspace-wide: 141 tests across `bh-crypto`/`bh-network`/`bh-storage`/
-`bh-files`/`bh-api`/`bh-calls` (including a real local two-peer WebRTC
-connection test in `bh-calls`), `cargo fmt`/`clippy -D warnings` clean, CI
-in `.github/workflows/ci.yml`. Nothing here has been through independent
-security review — see THREAT_MODEL.md before treating any of it as
-production-ready, especially the onion routing module and the new calls
-media path.
+Workspace-wide: 285 tests across `bh-crypto`/`bh-network`/`bh-storage`/
+`bh-files`/`bh-api`/`bh-calls`/`bh-push-relay` (including real local WebRTC
+connection tests in `bh-calls` — 1:1, three-way group mesh, and a
+screen-share track — all of which need real UDP loopback and can be flaky
+under sandboxing/CI resource contention; see that crate's test comments),
+`cargo fmt`/`clippy -D warnings` clean, CI in `.github/workflows/ci.yml`.
+Nothing here has been through independent security review — see
+THREAT_MODEL.md before treating any of it as production-ready, especially
+the onion routing module and the calls media path (1:1, group, and
+screen-share alike).

@@ -112,6 +112,7 @@ mod tests {
             expires_at: None,
             deleted_at: None,
             reply_to_message_id: None,
+            edited_at: None,
         })
         .unwrap();
     }

@@ -12,10 +12,18 @@ use crate::Database;
 /// Spawns a background task that calls `purge_expired_messages` every
 /// `interval`. `now` is injected (rather than reading the system clock
 /// directly) so callers can test this deterministically.
+///
+/// `on_orphaned_files` is invoked with any `content_hash`es orphaned by a
+/// sweep (i.e. no longer referenced by any live message) whenever a sweep
+/// actually purges something — `bh-storage` only owns the database side of
+/// that cleanup (see `messages::delete_dependent_rows`), so the caller
+/// (`bh-api`'s `restart_expiry_sweeper`) uses this to also remove the
+/// corresponding chunk directories from disk.
 pub fn spawn_expiry_sweeper(
     db: Database,
     interval: Duration,
     now: impl Fn() -> i64 + Send + 'static,
+    on_orphaned_files: impl Fn(Vec<String>) + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -23,11 +31,12 @@ pub fn spawn_expiry_sweeper(
         loop {
             ticker.tick().await;
             match db.purge_expired_messages(now()) {
-                Ok(purged) if !purged.is_empty() => {
+                Ok(result) if !result.message_ids.is_empty() => {
                     tracing::debug!(
-                        count = purged.len(),
+                        count = result.message_ids.len(),
                         "purged expired self-destruct messages"
                     );
+                    on_orphaned_files(result.orphaned_content_hashes);
                 }
                 Ok(_) => {}
                 Err(err) => tracing::warn!(%err, "expiry sweep failed"),
@@ -66,14 +75,18 @@ mod tests {
             expires_at: Some(10),
             deleted_at: None,
             reply_to_message_id: None,
+            edited_at: None,
         })
         .unwrap();
 
         let clock = Arc::new(AtomicI64::new(0));
         let clock_clone = clock.clone();
-        let handle = spawn_expiry_sweeper(db.clone(), Duration::from_millis(15), move || {
-            clock_clone.load(Ordering::SeqCst)
-        });
+        let handle = spawn_expiry_sweeper(
+            db.clone(),
+            Duration::from_millis(15),
+            move || clock_clone.load(Ordering::SeqCst),
+            |_| {},
+        );
 
         // Still before expiry: message survives the first couple of sweeps.
         tokio::time::sleep(Duration::from_millis(40)).await;

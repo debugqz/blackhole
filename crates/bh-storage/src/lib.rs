@@ -1,28 +1,40 @@
 //! Local encrypted-at-rest storage (SQLCipher) and hardware-backed key
 //! custody. See `docs/SPEC.md` §7.
 
+mod payments_schema;
 mod schema;
 
 pub mod contacts;
 pub mod conversations;
+pub mod cosmetics;
 pub mod db;
+pub mod db_key_lock;
 pub mod devices;
 pub mod expiry;
 pub mod files;
 pub mod groups;
 pub mod invites;
 pub mod keystore;
+pub mod local_auth;
 pub mod message_requests;
+pub mod message_stickers;
 pub mod messages;
 pub mod models;
 pub mod own_identity;
+pub mod payment_requests;
+pub mod payments;
+pub mod payments_db;
+pub mod payments_models;
 pub mod profiles;
+pub mod push;
 pub mod reactions;
 pub mod receipts;
+pub mod search;
 pub mod sessions;
 pub mod settings;
 
 pub use db::Database;
+pub use payments_db::PaymentsDatabase;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -38,4 +50,6 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("not found")]
     NotFound,
+    #[error("incorrect PIN or corrupted key material")]
+    InvalidPin,
 }

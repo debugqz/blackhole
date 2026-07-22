@@ -13,7 +13,9 @@ use axum::http::StatusCode;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use bh_storage::models::{Conversation, ConversationKind, Message, MessageReceipt, Reaction};
+use bh_storage::models::{
+    Conversation, ConversationKind, Message, MessageReceipt, PaymentRequest, Reaction,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
@@ -24,6 +26,8 @@ struct ConversationBundle {
     messages: Vec<Message>,
     reactions: Vec<Reaction>,
     receipts: Vec<MessageReceipt>,
+    #[serde(default)]
+    payment_requests: Vec<PaymentRequest>,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +53,14 @@ pub async fn export_conversation(
         .get_conversation(&conversation_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    if conversation.kind == ConversationKind::SelfNotes {
+        // Every profile already has exactly one singleton self-conversation
+        // (`ensure_self_conversation`), created locally rather than
+        // recreated from an imported bundle the way `Direct`/`Group`
+        // conversations are — see `import_conversation` below. An export
+        // that can never be usefully re-imported isn't worth producing.
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
     let messages = state
         .db()
         .list_messages(&conversation_id, i64::MAX)
@@ -56,6 +68,7 @@ pub async fn export_conversation(
 
     let mut reactions = Vec::new();
     let mut receipts = Vec::new();
+    let mut payment_requests = Vec::new();
     for message in &messages {
         reactions.extend(
             state
@@ -69,6 +82,13 @@ pub async fn export_conversation(
                 .list_receipts_for_message(&message.message_id)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         );
+        if let Some(payment_request) = state
+            .db()
+            .get_payment_request(&message.message_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            payment_requests.push(payment_request);
+        }
     }
 
     let bundle = ConversationBundle {
@@ -76,6 +96,7 @@ pub async fn export_conversation(
         messages,
         reactions,
         receipts,
+        payment_requests,
     };
     let plaintext = serde_json::to_vec(&bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let sealed = bh_crypto::backup::seal(&req.passphrase, &plaintext)
@@ -147,6 +168,10 @@ pub async fn import_conversation(
                 )
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
+        // `export_conversation` never produces a bundle with this kind —
+        // see its rejection above — so a bundle claiming to be one is
+        // malformed/hand-crafted input, not a real export.
+        ConversationKind::SelfNotes => return Err(StatusCode::UNPROCESSABLE_ENTITY),
     }
     if let Some(timer) = bundle.conversation.disappearing_timer_secs {
         state
@@ -172,6 +197,12 @@ pub async fn import_conversation(
         state
             .db()
             .upsert_receipt(receipt)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    for payment_request in &bundle.payment_requests {
+        state
+            .db()
+            .insert_payment_request(payment_request)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
 

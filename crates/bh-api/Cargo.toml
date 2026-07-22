@@ -15,12 +15,26 @@ tracing = { workspace = true }
 bh-storage = { workspace = true }
 bh-crypto = { workspace = true }
 bh-calls = { workspace = true }
+bh-network = { workspace = true }
+bh-files = { workspace = true }
+blake3 = "1"
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+url = "2"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 getrandom = "0.4"
 ed25519-dalek = "3"
 x25519-dalek = { version = "3", features = ["static_secrets", "getrandom"] }
+
+# Needed to name the concrete MlsMember<OpenMlsRustCrypto> the group registry
+# uses for shadow members (bh-crypto::mls::MlsMember is generic over the
+# storage backend as of the MLS persistence work — THREAT_MODEL.md §3.2).
+openmls_rust_crypto = "0.5"
+# `OpenMlsProvider` itself — needed to write `add_contact_to_live_group`
+# generically over both the persistent (own-member) and in-memory
+# (shadow-member) providers.
+openmls_traits = "0.5"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

@@ -4,28 +4,591 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Blackhole (dev shell)</title>
+    <title>Blackhole</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
 
   <body>
-    <main class="container">
-      <h1>Blackhole</h1>
-      <p>
-        This is a scaffold-stage dev shell, not the product UI. It only
-        proves the client talks to the local daemon over localhost and
-        nowhere else (see <code>docs/SPEC.md</code> §6).
-      </p>
+    <div id="app">
+      <section id="screen-unlock" class="screen unlock">
+        <div class="orbit" aria-hidden="true"></div>
+        <h1 class="mark">Blackhole</h1>
+        <p id="unlock-status" class="tag">Looking for the daemon…</p>
+        <div id="unlock-actions" class="unlock-actions"></div>
+        <p class="no-phone mono">no phone number · no email · ever</p>
+      </section>
 
-      <div class="row">
-        <button id="check-daemon" type="button">Check daemon</button>
-      </div>
-      <p id="daemon-status"></p>
+      <section id="screen-seed" class="screen seed" hidden>
+        <h2 class="mark small">Write this down</h2>
+        <p class="tag">
+          This is the only time Blackhole will show you these words. If you
+          lose them and every linked device, this identity is gone — there
+          is no password reset, by design.
+        </p>
+        <div id="seed-words" class="seed-words mono"></div>
+        <label class="confirm-row">
+          <input type="checkbox" id="seed-confirm" />
+          I've written down my recovery phrase
+        </label>
+        <button id="seed-continue" class="btn-primary" disabled type="button">
+          Continue
+        </button>
+      </section>
 
-      <div class="row">
-        <button id="panic-wipe" type="button">Panic wipe</button>
+      <section id="screen-local-unlock" class="screen unlock" hidden>
+        <div class="orbit" aria-hidden="true"></div>
+        <h2 class="mark small">Unlock</h2>
+        <p class="tag">
+          A passkey or TOTP code is enrolled for this profile. This gates
+          this app's unlock screen only — it does not change how the local
+          database itself is encrypted.
+        </p>
+        <div class="unlock-actions">
+          <button id="local-unlock-passkey" class="btn-primary wide" type="button" hidden>
+            Unlock with passkey
+          </button>
+          <input
+            id="local-unlock-code"
+            class="field wide"
+            placeholder="6-digit code"
+            autocomplete="off"
+            hidden
+          />
+          <button id="local-unlock-totp-submit" class="btn-outline wide" type="button" hidden>
+            Unlock with code
+          </button>
+        </div>
+        <p id="local-unlock-error" class="error-text" hidden></p>
+      </section>
+
+      <section id="screen-app" class="screen app" hidden>
+        <aside class="rail">
+          <div class="rail-top">
+            <span class="rail-mark">Blackhole</span>
+            <div class="rail-icons">
+              <button
+                id="open-requests"
+                class="icon-btn"
+                type="button"
+                title="Message requests"
+                aria-label="Message requests"
+              >
+                ✉<span id="requests-badge" class="badge" hidden></span>
+              </button>
+              <button
+                id="open-profiles"
+                class="icon-btn"
+                type="button"
+                title="Profiles"
+                aria-label="Profiles"
+              >
+                ◍
+              </button>
+              <button
+                id="open-security"
+                class="icon-btn"
+                type="button"
+                title="Security"
+                aria-label="Security"
+              >
+                ◐
+              </button>
+              <button
+                id="open-store"
+                class="icon-btn"
+                type="button"
+                title="Store"
+                aria-label="Store"
+              >
+                ✦
+              </button>
+              <button
+                id="open-search"
+                class="icon-btn"
+                type="button"
+                title="Search messages"
+                aria-label="Search messages"
+              >
+                🔍
+              </button>
+            </div>
+          </div>
+          <div class="rail-actions">
+            <button id="add-contact" class="add-contact-btn" type="button">
+              + Add contact
+            </button>
+            <button id="new-group" class="add-contact-btn" type="button">
+              ◈ New group
+            </button>
+            <button id="open-import" class="add-contact-btn" type="button">
+              ⇩ Import conversation
+            </button>
+          </div>
+          <div id="conv-list" class="conv-list"></div>
+        </aside>
+
+        <div class="thread">
+          <div id="thread-empty" class="thread-empty">
+            <p>Select a conversation, or add a contact to start one.</p>
+          </div>
+          <div id="thread-active" class="thread-active" hidden>
+            <div class="thread-head">
+              <div>
+                <div id="thread-who" class="who"></div>
+                <div id="thread-sub" class="thread-sub mono"></div>
+              </div>
+              <span id="thread-verify" class="verify-chip"></span>
+            </div>
+            <div id="thread-toolbar" class="thread-toolbar">
+              <button id="toggle-block" class="chip-btn" type="button"></button>
+              <select id="timer-select" class="chip-select" title="Disappearing messages">
+                <option value="">No timer</option>
+                <option value="60">1 minute</option>
+                <option value="3600">1 hour</option>
+                <option value="86400">1 day</option>
+                <option value="604800">1 week</option>
+              </select>
+              <button id="export-conversation" class="chip-btn" type="button">
+                Export
+              </button>
+              <button id="open-payment-request" class="chip-btn" type="button">
+                Payment…
+              </button>
+              <button id="manage-members" class="chip-btn" type="button" hidden>
+                Members
+              </button>
+              <button id="verify-group-crypto" class="chip-btn" type="button" hidden>
+                Verify group crypto
+              </button>
+              <button id="report-contact" class="chip-btn" type="button">
+                Report…
+              </button>
+            </div>
+            <div id="export-panel" class="invite-preview" hidden></div>
+            <div id="members-panel" class="invite-preview" hidden>
+              <div id="members-list" class="device-list"></div>
+              <div class="row">
+                <select id="add-member-select" class="field"></select>
+                <button id="add-member-submit" class="chip-btn" type="button">
+                  Add
+                </button>
+              </div>
+              <p id="members-error" class="error-text" hidden></p>
+            </div>
+            <div id="payment-panel" class="invite-preview" hidden>
+              <select id="payment-asset" class="field">
+                <option value="XMR">Monero (XMR) — private by design</option>
+                <option value="BTC">Bitcoin (BTC) — public on-chain</option>
+                <option value="ETH">Ethereum (ETH) — public on-chain</option>
+              </select>
+              <input id="payment-address" class="field" placeholder="Recipient address" autocomplete="off" />
+              <input id="payment-amount" class="field" placeholder="Amount (optional)" autocomplete="off" />
+              <input id="payment-memo" class="field" placeholder="Memo (optional)" autocomplete="off" />
+              <div class="actions">
+                <button id="payment-send" class="btn-primary" type="button">Send request</button>
+                <button id="payment-cancel" class="btn-outline" type="button">Cancel</button>
+              </div>
+              <div id="payment-error" class="error-text" hidden></div>
+            </div>
+            <div id="msgs" class="msgs"></div>
+            <div id="report-bar" class="report-bar" hidden>
+              <input
+                id="report-reason"
+                class="field"
+                placeholder="Reason for this report…"
+              />
+              <button id="report-submit" class="chip-btn" type="button">
+                Submit (<span id="report-count">0</span>)
+              </button>
+              <button id="report-cancel" class="chip-btn" type="button">
+                Cancel
+              </button>
+            </div>
+            <div id="typing-status" class="typing-status"></div>
+            <div id="sticker-picker" class="invite-preview" hidden>
+              <div id="sticker-picker-list" class="sticker-picker-list"></div>
+              <p id="sticker-picker-empty" class="trust-note" hidden>
+                No sticker packs owned yet — buy one from the Store.
+              </p>
+            </div>
+            <form id="composer" class="composer">
+              <input id="attachment-input" type="file" hidden />
+              <button id="attach-file" class="chip-btn" type="button" title="Attach a file">
+                📎
+              </button>
+              <button id="toggle-sticker-picker" class="chip-btn" type="button" title="Send a sticker">
+                ◆
+              </button>
+              <button id="record-voice" class="chip-btn" type="button" title="Record a voice message">
+                🎙
+              </button>
+              <input
+                id="composer-field"
+                class="field"
+                placeholder="Message…"
+                autocomplete="off"
+              />
+              <button class="send" type="submit">Send</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <div id="screen-security" class="overlay" hidden>
+        <div class="panel-window">
+          <div class="panel-bar">
+            <span>Security</span>
+            <button
+              id="close-security"
+              class="icon-btn"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <div class="panel">
+            <section>
+              <h3>Identity</h3>
+              <div class="kv">
+                <span>Signing key</span><code id="id-signing" class="mono"></code>
+              </div>
+              <div class="kv">
+                <span>Agreement key</span
+                ><code id="id-agreement" class="mono"></code>
+              </div>
+              <p class="trust-note">
+                Your recovery phrase was shown once, at creation. Blackhole
+                never stores it, so it can't be shown again.
+              </p>
+            </section>
+            <section>
+              <h3>Linked devices</h3>
+              <div id="devices-list" class="device-list"></div>
+              <button id="link-device" class="btn-outline wide" type="button">
+                Link a new device (local simulation)
+              </button>
+              <p id="link-status" class="trust-note"></p>
+              <p class="trust-note">
+                This daemon plays both roles of the linking protocol locally
+                — there's no second physical device here, but the
+                cryptographic handoff is real.
+              </p>
+            </section>
+            <section>
+              <h3>Link previews</h3>
+              <label class="toggle-row">
+                <input id="link-preview-toggle" type="checkbox" />
+                <span id="link-preview-label">Show link previews</span>
+              </label>
+              <p id="link-preview-warning" class="trust-note"></p>
+            </section>
+            <section>
+              <h3>Push wake notifications</h3>
+              <label class="toggle-row">
+                <input id="push-toggle" type="checkbox" />
+                Wake this device for new messages (opt-in)
+              </label>
+              <p class="trust-note">
+                Registers an opaque, identity-independent token with a
+                relay whose only job is telling this device "something
+                arrived" — never message content, never who it's from.
+              </p>
+            </section>
+            <section>
+              <h3>Typing indicators</h3>
+              <label class="toggle-row">
+                <input id="typing-indicator-toggle" type="checkbox" />
+                Show/send "is typing…" (off by default)
+              </label>
+              <p class="trust-note">
+                Sealed the same way as a real message — indistinguishable
+                ciphertext to anything but the recipient. Still, it's a
+                small extra signal, so it stays opt-in.
+              </p>
+            </section>
+            <section>
+              <h3>Local unlock</h3>
+              <p id="local-auth-status" class="trust-note">Loading…</p>
+              <div class="actions">
+                <button id="enroll-totp" class="chip-btn" type="button">
+                  Enroll TOTP
+                </button>
+                <button id="remove-totp" class="chip-btn" type="button" hidden>
+                  Remove TOTP
+                </button>
+                <button id="enroll-passkey" class="chip-btn" type="button">
+                  Enroll passkey
+                </button>
+              </div>
+              <div id="totp-enroll-panel" class="invite-preview" hidden></div>
+              <div id="passkey-list"></div>
+              <p class="trust-note">
+                Gates this app's unlock screen only — it does not change how
+                the local database itself is encrypted.
+              </p>
+            </section>
+            <section>
+              <h3>Panic wipe</h3>
+              <button id="panic-wipe" class="wipe-btn" type="button">
+                Wipe this device
+              </button>
+              <p id="wipe-status" class="trust-note"></p>
+              <p class="trust-note">
+                Blackhole cannot read your messages. There is no moderation —
+                ever.
+              </p>
+            </section>
+          </div>
+        </div>
       </div>
-      <p id="wipe-status"></p>
-    </main>
+
+      <div id="screen-store" class="overlay" hidden>
+        <div class="panel-window">
+          <div class="panel-bar">
+            <span>Store</span>
+            <button id="close-store" class="icon-btn" type="button" aria-label="Close">
+              ×
+            </button>
+          </div>
+          <div class="panel">
+            <section>
+              <h3>Catalog</h3>
+              <p class="trust-note">
+                Cosmetic only — banners, themes, badges, stickers. Paid in
+                crypto, never a privacy upsell. Buying records a pending
+                purchase; it's granted once payment is confirmed.
+              </p>
+              <div id="store-catalog-list" class="device-list"></div>
+            </section>
+            <section>
+              <h3>Owned</h3>
+              <div id="store-inventory-list" class="device-list"></div>
+            </section>
+            <section>
+              <h3>Equipped</h3>
+              <div id="store-equipped-list" class="device-list"></div>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <div id="screen-search" class="overlay" hidden>
+        <div class="panel-window">
+          <div class="panel-bar">
+            <span>Search messages</span>
+            <button id="close-search" class="icon-btn" type="button" aria-label="Close">
+              ×
+            </button>
+          </div>
+          <div class="panel">
+            <section>
+              <input
+                id="search-field"
+                class="field wide"
+                placeholder="Search your message history…"
+                autocomplete="off"
+              />
+              <p class="trust-note">
+                Local only — searches your own already-decrypted history on
+                this device. Nothing here is ever sent anywhere.
+              </p>
+              <div id="search-results" class="device-list"></div>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <div id="screen-add-contact" class="overlay" hidden>
+        <div class="panel-window">
+          <div class="panel-bar">
+            <span>Add contact</span>
+            <button
+              id="close-add-contact"
+              class="icon-btn"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <div class="panel">
+            <section>
+              <h3>From an invite link</h3>
+              <textarea
+                id="invite-input"
+                class="invite-field mono"
+                rows="3"
+                placeholder="Paste an invite link…"
+              ></textarea>
+              <button id="invite-decode" class="btn-primary wide" type="button">
+                Decode
+              </button>
+              <div id="invite-preview" class="invite-preview" hidden></div>
+            </section>
+            <section>
+              <h3>Create my own invite</h3>
+              <button id="invite-create" class="btn-outline wide" type="button">
+                Generate invite link
+              </button>
+              <div id="invite-created" class="invite-preview" hidden></div>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <div id="screen-new-group" class="overlay" hidden>
+        <div class="panel-window">
+          <div class="panel-bar">
+            <span>New group</span>
+            <button
+              id="close-new-group"
+              class="icon-btn"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <div class="panel">
+            <section>
+              <h3>Name</h3>
+              <input
+                id="new-group-name"
+                class="field wide"
+                placeholder="Group name…"
+              />
+            </section>
+            <section>
+              <h3>Members</h3>
+              <div id="new-group-contacts" class="device-list"></div>
+              <p class="trust-note">
+                Membership is simulated locally for now — see a group's
+                "Verify group crypto" action for what that proves.
+              </p>
+            </section>
+            <section>
+              <label class="toggle-row">
+                <input id="new-group-broadcast" type="checkbox" />
+                Broadcast channel — only you can post
+              </label>
+            </section>
+            <button
+              id="create-group-submit"
+              class="btn-primary wide"
+              type="button"
+              style="margin-top: 8px"
+            >
+              Create group
+            </button>
+            <div id="new-group-error" class="error-text" hidden></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="screen-profiles" class="overlay" hidden>
+        <div class="panel-window">
+          <div class="panel-bar">
+            <span>Profiles</span>
+            <button
+              id="close-profiles"
+              class="icon-btn"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <div class="panel">
+            <section>
+              <h3>This device's identities</h3>
+              <div id="profiles-list" class="device-list"></div>
+              <p class="trust-note">
+                Every profile is a fully separate, isolated identity —
+                separate keys, contacts, and conversations.
+              </p>
+            </section>
+            <section>
+              <h3>New profile</h3>
+              <input
+                id="new-profile-name"
+                class="field wide"
+                placeholder="Profile name…"
+              />
+              <button id="create-profile" class="btn-primary wide" type="button" style="margin-top:8px;">
+                Create profile
+              </button>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <div id="screen-requests" class="overlay" hidden>
+        <div class="panel-window">
+          <div class="panel-bar">
+            <span>Message requests</span>
+            <button
+              id="close-requests"
+              class="icon-btn"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <div class="panel">
+            <section>
+              <div id="requests-list" class="device-list"></div>
+              <p class="trust-note">
+                A request appears here the first time an unverified contact
+                reaches you — nothing is added to your conversation list
+                until you accept it.
+              </p>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <div id="screen-import" class="overlay" hidden>
+        <div class="panel-window">
+          <div class="panel-bar">
+            <span>Import conversation</span>
+            <button
+              id="close-import"
+              class="icon-btn"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <div class="panel">
+            <section>
+              <p class="trust-note" style="margin-top:0;">
+                Restores a bundle produced by "Export" on another device.
+                The contact it references must already exist here.
+              </p>
+              <textarea
+                id="import-bundle"
+                class="invite-field mono"
+                rows="4"
+                placeholder="Paste the exported bundle (base64)…"
+              ></textarea>
+              <input
+                id="import-passphrase"
+                type="password"
+                class="field wide"
+                placeholder="Passphrase"
+                style="margin-top:8px;"
+              />
+              <button id="import-submit" class="btn-primary wide" type="button" style="margin-top:8px;">
+                Import
+              </button>
+              <p id="import-status" class="trust-note"></p>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
   </body>
 </html>

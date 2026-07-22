@@ -15,8 +15,6 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::VerifyingKey;
-use qrcode::render::svg;
-use qrcode::QrCode;
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::identity::IdentityKeyPair;
@@ -148,15 +146,7 @@ impl InvitePayload {
 
     /// SVG markup for a scannable QR code of [`to_link`](Self::to_link).
     pub fn to_qr_svg(&self) -> Result<String, CryptoError> {
-        let link = self.to_link()?;
-        let code = QrCode::new(link.as_bytes())
-            .map_err(|_| CryptoError::NotImplemented("invite: QR encoding failed"))?;
-        Ok(code
-            .render()
-            .min_dimensions(256, 256)
-            .dark_color(svg::Color("#000000"))
-            .light_color(svg::Color("#ffffff"))
-            .build())
+        crate::qr::to_svg(&self.to_link()?)
     }
 }
 

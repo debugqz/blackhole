@@ -20,6 +20,25 @@ use crate::StorageError;
 pub const DB_KEY_LABEL: &str = "db-encryption-key";
 /// Label under which the device's own long-term signing key is stored.
 pub const DEVICE_SIGNING_KEY_LABEL: &str = "device-signing-key";
+/// Label under which the *payments* database's SQLCipher key is stored —
+/// deliberately a different label (and so a different key) than
+/// `DB_KEY_LABEL`, even though both live in the same per-profile keystore
+/// service. See `crates/bh-storage/src/payments_db.rs` for why the
+/// payments and messaging databases must never share a key.
+pub const PAYMENTS_DB_KEY_LABEL: &str = "payments-db-encryption-key";
+/// Label under which the HMAC-SHA256 secret gating
+/// `bh-api::cosmetics::mark_purchase_paid` is stored (see
+/// `bh_crypto::webhook`). Generated on first use — unlike `DB_KEY_LABEL`,
+/// this has no PIN-protection concept since it never gates database
+/// decryption, only proves a caller knows the shared webhook secret.
+pub const COSMETICS_WEBHOOK_SECRET_LABEL: &str = "cosmetics-webhook-secret";
+/// Label under which the *MLS group storage* database's SQLCipher key is
+/// stored — again a distinct label/key from `DB_KEY_LABEL` and
+/// `PAYMENTS_DB_KEY_LABEL`, for the same reason: `bh_crypto::mls_storage
+/// ::PersistentMlsProvider` keeps group crypto state in its own SQLCipher
+/// file, isolated from both the messaging and payments databases
+/// (`docs/THREAT_MODEL.md` §3.2).
+pub const MLS_DB_KEY_LABEL: &str = "mls-db-encryption-key";
 
 pub struct Keystore {
     service: String,
@@ -95,6 +114,8 @@ impl Keystore {
     pub fn panic_wipe(&self) -> Result<(), StorageError> {
         self.delete_key(DB_KEY_LABEL)?;
         self.delete_key(DEVICE_SIGNING_KEY_LABEL)?;
+        self.delete_key(PAYMENTS_DB_KEY_LABEL)?;
+        self.delete_key(MLS_DB_KEY_LABEL)?;
         if self.data_dir.exists() {
             std::fs::remove_dir_all(&self.data_dir)?;
         }
@@ -140,12 +161,16 @@ mod tests {
         let ks = Keystore::new("blackhole-test-wipe", &dir);
         ks.store_key(DB_KEY_LABEL, &[1u8; 32]).unwrap();
         ks.store_key(DEVICE_SIGNING_KEY_LABEL, &[2u8; 32]).unwrap();
+        ks.store_key(PAYMENTS_DB_KEY_LABEL, &[3u8; 32]).unwrap();
+        ks.store_key(MLS_DB_KEY_LABEL, &[4u8; 32]).unwrap();
         assert_eq!(ks.load_key(DB_KEY_LABEL).unwrap(), Some(vec![1u8; 32]));
 
         ks.panic_wipe().unwrap();
 
         assert_eq!(ks.load_key(DB_KEY_LABEL).unwrap(), None);
         assert_eq!(ks.load_key(DEVICE_SIGNING_KEY_LABEL).unwrap(), None);
+        assert_eq!(ks.load_key(PAYMENTS_DB_KEY_LABEL).unwrap(), None);
+        assert_eq!(ks.load_key(MLS_DB_KEY_LABEL).unwrap(), None);
         assert!(!dir.exists());
     }
 }

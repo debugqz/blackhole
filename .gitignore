@@ -3,3 +3,6 @@
 
 # OS
 .DS_Store
+
+# Claude Code local session/tooling state (worktrees, local settings)
+/.claude/

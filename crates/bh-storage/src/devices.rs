@@ -75,4 +75,60 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// A single device by id, regardless of owner — used by
+    /// `crates/bh-api/src/device_sync.rs` to confirm a sync target is a
+    /// real, non-revoked, own-account device before pulling anything for
+    /// it.
+    pub fn get_device(&self, device_id: &str) -> Result<Option<Device>, StorageError> {
+        let conn = self.conn()?;
+        let sql = format!("SELECT {SELECT_COLUMNS} FROM devices WHERE device_id = ?1");
+        conn.query_row(&sql, params![device_id], row_to_device)
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// The current delivery cursor for a linked device — how far (by
+    /// `sent_at`, tie-broken by `message_id`) it has pulled via
+    /// `GET /devices/:id/sync`. `None` if the device has never synced.
+    pub fn get_device_sync_cursor(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<(i64, Option<String>)>, StorageError> {
+        self.conn()?
+            .query_row(
+                "SELECT cursor_sent_at, cursor_message_id FROM device_sync_cursor WHERE device_id = ?1",
+                params![device_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// Advances (or initializes) a device's sync cursor after a
+    /// successful `GET /devices/:id/sync` pull.
+    pub fn advance_device_sync_cursor(
+        &self,
+        device_id: &str,
+        cursor_sent_at: i64,
+        cursor_message_id: &str,
+        updated_at: i64,
+    ) -> Result<(), StorageError> {
+        self.conn()?.execute(
+            "INSERT INTO device_sync_cursor (device_id, cursor_sent_at, cursor_message_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(device_id) DO UPDATE SET
+                cursor_sent_at = excluded.cursor_sent_at,
+                cursor_message_id = excluded.cursor_message_id,
+                updated_at = excluded.updated_at",
+            params![device_id, cursor_sent_at, cursor_message_id, updated_at],
+        )?;
+        Ok(())
+    }
 }

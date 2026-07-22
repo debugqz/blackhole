@@ -7,20 +7,53 @@
 //! pushing individually per member — every member just pulls from the same
 //! place. See `docs/SPEC.md` §5.3-5.4.
 //!
-//! **Known limitation**: this is built on the plain Kademlia
-//! get/put-record primitives in `dht.rs`, which are single-writer,
-//! last-write-wins per key. The per-recipient manifest here is
-//! read-modify-written, so two sends to the same recipient racing at the
-//! DHT level can lose one manifest update (the message record itself is
-//! never lost, just possibly missing from the list that says to fetch it).
-//! A real deployment needs either a CRDT-style mergeable manifest or a
-//! dedicated mailbox-node protocol instead of raw DHT records — tracked as
-//! a follow-up, not fixed here.
+//! **Anti-spam PoW is enforced here** (SPEC.md §8): [`push`](Mailbox::push)
+//! rejects a message whose proof-of-work doesn't verify against
+//! `pow::challenge_for_message`, binding the work to this exact recipient,
+//! message id, ciphertext, and timestamp so a solved challenge can't be
+//! replayed for a different message (including a different message id
+//! sharing the same ciphertext/timestamp). Callers compute their solution
+//! with [`Mailbox::solve_pow`] first.
+//!
+//! **Manifest races (mitigated, not eliminated).** This is built on the
+//! plain Kademlia get/put-record primitives in `dht.rs`, which are
+//! single-writer, last-write-wins per key — there's no compare-and-swap.
+//! The message record itself is never at risk (each message has its own
+//! key, written once). The per-recipient *manifest* (the list of message
+//! IDs to know to fetch) is what two concurrent senders can race on. To
+//! guard against silently losing an entry, every manifest mutation here
+//! does read-merge-write-**verify**, retrying (`MAX_MANIFEST_MERGE_ATTEMPTS`
+//! times) if a concurrent writer clobbered the record in between — see
+//! `two_concurrent_pushes_to_the_same_recipient_both_survive` below. This
+//! converges correctly under the bursty-but-not-pathological concurrency a
+//! real client sees; it is still not a true CRDT/atomic merge, and a
+//! dedicated mailbox-node protocol with real compare-and-swap remains the
+//! long-term fix (`docs/THREAT_MODEL.md` §3.6).
 
 use serde::{Deserialize, Serialize};
 
 use crate::dht::Dht;
+use crate::pow::{self, Solution};
 use crate::NetworkError;
+
+/// How many times to retry a manifest read-merge-write-verify cycle before
+/// giving up. Each retry only happens when a concurrent writer is detected
+/// (the verify step failed), so this bounds worst-case contention, not the
+/// common case (which succeeds in one attempt).
+const MAX_MANIFEST_MERGE_ATTEMPTS: usize = 8;
+
+/// Deliberately low ("liviano" — SPEC.md §8): a normal client burns single-
+/// digit milliseconds solving this; an automated mass sender pays that same
+/// cost per message, which adds up at scale.
+const POW_DIFFICULTY_BITS: u8 = 16;
+
+/// Hard cap on how far in the future a message's `expires_at` may sit —
+/// without this, a caller-supplied `ttl_seconds` has no upper bound, so a
+/// sender can make a message effectively permanent (defeating the
+/// TTL-bounded-storage design) and `now + ttl_seconds` is otherwise
+/// unchecked `i64` addition. 30 days is generous for offline store-and-
+/// forward delivery.
+const MAX_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Manifest {
@@ -47,6 +80,7 @@ fn message_key(recipient_key_hash: &[u8], message_id: &[u8]) -> Vec<u8> {
     k
 }
 
+#[derive(Clone)]
 pub struct Mailbox {
     dht: Dht,
 }
@@ -54,6 +88,27 @@ pub struct Mailbox {
 impl Mailbox {
     pub fn new(dht: Dht) -> Self {
         Self { dht }
+    }
+
+    /// Solves the anti-spam proof-of-work [`push`](Self::push) will
+    /// require for this exact `(recipient_key_hash, message_id, ciphertext,
+    /// now)` quadruple. Callers must pass the same values to both calls —
+    /// the challenge is bound to them so a solved PoW can't be reused for
+    /// a different message (including a different `message_id` for
+    /// otherwise-identical content).
+    pub fn solve_pow(
+        recipient_key_hash: &[u8],
+        message_id: &[u8],
+        ciphertext: &[u8],
+        now: i64,
+    ) -> Solution {
+        pow::solve(&pow::challenge_for_message(
+            recipient_key_hash,
+            message_id,
+            ciphertext,
+            now,
+            POW_DIFFICULTY_BITS,
+        ))
     }
 
     async fn fetch_manifest(&self, recipient_key_hash: &[u8]) -> Result<Manifest, NetworkError> {
@@ -65,7 +120,11 @@ impl Mailbox {
 
     /// Stores `ciphertext` for `recipient_key_hash`, expiring `ttl_seconds`
     /// after `now` (unix seconds — caller-supplied so this is testable
-    /// without waiting in real time).
+    /// without waiting in real time). Requires a valid `pow_solution` from
+    /// [`solve_pow`](Self::solve_pow) for the same
+    /// `(recipient_key_hash, ciphertext, now)` — a mailbox node enforcing
+    /// this rejects unsolved or mismatched submissions before ever storing
+    /// anything (SPEC.md §8).
     pub async fn push(
         &self,
         recipient_key_hash: &[u8],
@@ -73,10 +132,36 @@ impl Mailbox {
         ciphertext: Vec<u8>,
         ttl_seconds: i64,
         now: i64,
+        pow_solution: &Solution,
     ) -> Result<(), NetworkError> {
+        if !(0..=MAX_TTL_SECONDS).contains(&ttl_seconds) {
+            return Err(NetworkError::Setup(format!(
+                "mailbox: ttl_seconds must be between 0 and {MAX_TTL_SECONDS}, got {ttl_seconds}"
+            )));
+        }
+
+        let challenge = pow::challenge_for_message(
+            recipient_key_hash,
+            message_id,
+            &ciphertext,
+            now,
+            POW_DIFFICULTY_BITS,
+        );
+        if !pow::verify(&challenge, pow_solution) {
+            return Err(NetworkError::Setup(
+                "mailbox: invalid or insufficient proof-of-work".to_string(),
+            ));
+        }
+
         let stored = StoredMessage {
             ciphertext,
-            expires_at: now + ttl_seconds,
+            // Checked, not `now + ttl_seconds` directly: `ttl_seconds` is
+            // already bounded above, but `now` is caller-supplied too, so
+            // guard the addition itself rather than assume it can't
+            // overflow.
+            expires_at: now.checked_add(ttl_seconds).ok_or_else(|| {
+                NetworkError::Setup("mailbox: now + ttl_seconds overflowed".to_string())
+            })?,
         };
         self.dht
             .publish(
@@ -85,8 +170,11 @@ impl Mailbox {
             )
             .await?;
 
-        let mut manifest = self.fetch_manifest(recipient_key_hash).await?;
-        if !manifest.message_ids.iter().any(|id| id == message_id) {
+        for attempt in 0..MAX_MANIFEST_MERGE_ATTEMPTS {
+            let mut manifest = self.fetch_manifest(recipient_key_hash).await?;
+            if manifest.message_ids.iter().any(|id| id == message_id) {
+                return Ok(());
+            }
             manifest.message_ids.push(message_id.to_vec());
             self.dht
                 .publish(
@@ -94,14 +182,33 @@ impl Mailbox {
                     serde_json::to_vec(&manifest)?,
                 )
                 .await?;
+
+            // Read-after-write: a concurrent writer may have clobbered the
+            // manifest between our write and now. If our id didn't stick,
+            // merge again rather than silently losing this entry.
+            let confirm = self.fetch_manifest(recipient_key_hash).await?;
+            if confirm.message_ids.iter().any(|id| id == message_id) {
+                return Ok(());
+            }
+            if attempt + 1 == MAX_MANIFEST_MERGE_ATTEMPTS {
+                return Err(NetworkError::Query(format!(
+                    "mailbox: manifest update did not stick after {MAX_MANIFEST_MERGE_ATTEMPTS} \
+                     attempts (concurrent writers racing on the same recipient); the message \
+                     itself is stored and can be recovered by a future merge, but is not yet \
+                     discoverable via the manifest"
+                )));
+            }
         }
-        Ok(())
+        unreachable!("loop above always returns before exhausting its bound")
     }
 
     /// Pulls every non-expired message currently in the mailbox, as
-    /// `(message_id, ciphertext)` pairs. Expired entries are silently
-    /// skipped, not deleted — deletion is an explicit, separate step so a
-    /// caller can decrypt first and only then request removal.
+    /// `(message_id, ciphertext)` pairs. Expired entries (and entries whose
+    /// underlying message record is already gone) are pruned from the
+    /// manifest here via [`delete`](Self::delete) rather than left behind
+    /// — otherwise every future `pull` would keep re-fetching every stale
+    /// entry ever pushed, growing without bound for the life of the
+    /// mailbox key.
     pub async fn pull(
         &self,
         recipient_key_hash: &[u8],
@@ -109,44 +216,75 @@ impl Mailbox {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, NetworkError> {
         let manifest = self.fetch_manifest(recipient_key_hash).await?;
         let mut out = Vec::new();
+        let mut stale_ids = Vec::new();
         for id in &manifest.message_ids {
-            if let Some(bytes) = self
+            match self
                 .dht
                 .lookup(&message_key(recipient_key_hash, id))
                 .await?
             {
-                let stored: StoredMessage = serde_json::from_slice(&bytes)?;
-                if stored.expires_at > now {
-                    out.push((id.clone(), stored.ciphertext));
+                Some(bytes) => {
+                    let stored: StoredMessage = serde_json::from_slice(&bytes)?;
+                    if stored.expires_at > now {
+                        out.push((id.clone(), stored.ciphertext));
+                    } else {
+                        stale_ids.push(id.clone());
+                    }
                 }
+                None => stale_ids.push(id.clone()),
             }
+        }
+        for id in stale_ids {
+            // Best-effort housekeeping: the entry is already excluded from
+            // `out` above regardless of whether this prune succeeds, so a
+            // failure here (e.g. a concurrent writer) shouldn't fail the
+            // pull itself.
+            let _ = self.delete(recipient_key_hash, &id).await;
         }
         Ok(out)
     }
 
     /// Requests deletion of one message: removes it from the manifest so
-    /// future pulls skip it. See the module-level note — this does not
-    /// (and with plain Kademlia records, cannot) force other holders of
-    /// the record to purge their copy; that needs a real mailbox-node
-    /// delete RPC.
+    /// future pulls skip it. Same read-merge-write-verify retry as
+    /// [`push`](Self::push), for the same reason. This does not (and with
+    /// plain Kademlia records, cannot) force other holders of the message
+    /// record to purge their copy; that needs a real mailbox-node delete
+    /// RPC.
     pub async fn delete(
         &self,
         recipient_key_hash: &[u8],
         message_id: &[u8],
     ) -> Result<(), NetworkError> {
-        let mut manifest = self.fetch_manifest(recipient_key_hash).await?;
-        manifest.message_ids.retain(|id| id != message_id);
-        self.dht
-            .publish(
-                &manifest_key(recipient_key_hash),
-                serde_json::to_vec(&manifest)?,
-            )
-            .await
+        for attempt in 0..MAX_MANIFEST_MERGE_ATTEMPTS {
+            let mut manifest = self.fetch_manifest(recipient_key_hash).await?;
+            if !manifest.message_ids.iter().any(|id| id == message_id) {
+                return Ok(());
+            }
+            manifest.message_ids.retain(|id| id != message_id);
+            self.dht
+                .publish(
+                    &manifest_key(recipient_key_hash),
+                    serde_json::to_vec(&manifest)?,
+                )
+                .await?;
+
+            let confirm = self.fetch_manifest(recipient_key_hash).await?;
+            if !confirm.message_ids.iter().any(|id| id == message_id) {
+                return Ok(());
+            }
+            if attempt + 1 == MAX_MANIFEST_MERGE_ATTEMPTS {
+                return Err(NetworkError::Query(format!(
+                    "mailbox: manifest deletion did not stick after {MAX_MANIFEST_MERGE_ATTEMPTS} attempts"
+                )));
+            }
+        }
+        unreachable!("loop above always returns before exhausting its bound")
     }
 
     /// Publishes once to `group_id` rather than once per member (SPEC.md
     /// §5.4) — every group member just calls [`pull`](Self::pull) with the
-    /// same `group_id` as the recipient key.
+    /// same `group_id` as the recipient key. Same PoW requirement as
+    /// [`push`](Self::push).
     pub async fn fan_out(
         &self,
         group_id: &[u8],
@@ -154,9 +292,17 @@ impl Mailbox {
         ciphertext: Vec<u8>,
         ttl_seconds: i64,
         now: i64,
+        pow_solution: &Solution,
     ) -> Result<(), NetworkError> {
-        self.push(group_id, message_id, ciphertext, ttl_seconds, now)
-            .await
+        self.push(
+            group_id,
+            message_id,
+            ciphertext,
+            ttl_seconds,
+            now,
+            pow_solution,
+        )
+        .await
     }
 }
 
@@ -190,8 +336,12 @@ mod tests {
         ttl: i64,
         now: i64,
     ) {
+        let solution = Mailbox::solve_pow(recipient, id, &ct, now);
         for attempt in 0..20 {
-            match mailbox.push(recipient, id, ct.clone(), ttl, now).await {
+            match mailbox
+                .push(recipient, id, ct.clone(), ttl, now, &solution)
+                .await
+            {
                 Ok(()) => return,
                 Err(_) if attempt < 19 => tokio::time::sleep(Duration::from_millis(200)).await,
                 Err(e) => panic!("push failed after retries: {e}"),
@@ -246,6 +396,19 @@ mod tests {
             messages.is_empty(),
             "message past its TTL must not be returned"
         );
+
+        // Regression test: `pull` must also prune the expired entry from
+        // the manifest itself, not just exclude it from the returned
+        // list — otherwise every future pull keeps re-fetching every
+        // stale entry ever pushed, growing without bound.
+        let manifest = recipient_mailbox
+            .fetch_manifest(recipient_key)
+            .await
+            .unwrap();
+        assert!(
+            manifest.message_ids.is_empty(),
+            "an expired entry must be pruned from the manifest by pull, not left behind"
+        );
     }
 
     #[tokio::test]
@@ -291,15 +454,18 @@ mod tests {
         let member_a_mailbox = Mailbox::new(member_dht.clone());
         let member_b_mailbox = Mailbox::new(member_dht);
         let group_id = b"group-42";
+        let ciphertext = b"meeting at noon".to_vec();
+        let solution = Mailbox::solve_pow(group_id, b"group-msg-1", &ciphertext, 1_000);
 
         for attempt in 0..20 {
             match sender_mailbox
                 .fan_out(
                     group_id,
                     b"group-msg-1",
-                    b"meeting at noon".to_vec(),
+                    ciphertext.clone(),
                     86_400,
                     1_000,
+                    &solution,
                 )
                 .await
             {
@@ -313,5 +479,131 @@ mod tests {
         let b_messages = member_b_mailbox.pull(group_id, 1_000).await.unwrap();
         assert_eq!(a_messages, b_messages);
         assert_eq!(a_messages[0].1, b"meeting at noon");
+    }
+
+    /// The race this module's manifest-merge retry exists to survive: two
+    /// senders push to the *same recipient* at the same time. Without the
+    /// read-merge-write-verify loop, a naive read-modify-write would let
+    /// the second writer's blind overwrite silently drop the first
+    /// writer's entry from the manifest.
+    #[tokio::test]
+    async fn two_concurrent_pushes_to_the_same_recipient_both_survive() {
+        let (sender_dht, recipient_dht) = connected_pair().await;
+        let mailbox_a = Mailbox::new(sender_dht.clone());
+        let mailbox_b = Mailbox::new(sender_dht);
+        let recipient_mailbox = Mailbox::new(recipient_dht);
+        let recipient_key = b"recipient-key-hash-race";
+        let ct_a = b"hello from a".to_vec();
+        let ct_b = b"hello from b".to_vec();
+        let solution_a = Mailbox::solve_pow(recipient_key, b"from-a", &ct_a, 1_000);
+        let solution_b = Mailbox::solve_pow(recipient_key, b"from-b", &ct_b, 1_000);
+
+        let (result_a, result_b) = tokio::join!(
+            mailbox_a.push(
+                recipient_key,
+                b"from-a",
+                ct_a.clone(),
+                86_400,
+                1_000,
+                &solution_a
+            ),
+            mailbox_b.push(
+                recipient_key,
+                b"from-b",
+                ct_b.clone(),
+                86_400,
+                1_000,
+                &solution_b
+            ),
+        );
+        result_a.expect("push a should eventually succeed via retry");
+        result_b.expect("push b should eventually succeed via retry");
+
+        let mut messages = recipient_mailbox.pull(recipient_key, 1_000).await.unwrap();
+        messages.sort();
+        let mut expected = vec![(b"from-a".to_vec(), ct_a), (b"from-b".to_vec(), ct_b)];
+        expected.sort();
+        assert_eq!(
+            messages, expected,
+            "both concurrent pushes must survive in the manifest, not just the last writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_without_valid_pow_is_rejected() {
+        let (sender_dht, _recipient_dht) = connected_pair().await;
+        let sender_mailbox = Mailbox::new(sender_dht);
+        let recipient_key = b"recipient-key-hash-pow";
+        let ciphertext = b"spam attempt".to_vec();
+
+        // A solution solved for a *different* message doesn't satisfy this
+        // one's challenge.
+        let wrong_solution = Mailbox::solve_pow(b"someone-else", b"msg-1", &ciphertext, 1_000);
+        let result = sender_mailbox
+            .push(
+                recipient_key,
+                b"msg-1",
+                ciphertext,
+                86_400,
+                1_000,
+                &wrong_solution,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "push with an invalid PoW solution must be rejected"
+        );
+    }
+
+    /// Regression test: a PoW solved for one `message_id` must not satisfy
+    /// `push` for a different `message_id`, even with identical recipient,
+    /// ciphertext, and timestamp — otherwise one solved PoW could be
+    /// replayed to store unlimited duplicate mailbox entries for free.
+    #[tokio::test]
+    async fn push_rejects_a_pow_solved_for_a_different_message_id() {
+        let (sender_dht, _recipient_dht) = connected_pair().await;
+        let sender_mailbox = Mailbox::new(sender_dht);
+        let recipient_key = b"recipient-key-hash-pow-msgid";
+        let ciphertext = b"same content".to_vec();
+
+        let solution_for_msg_1 = Mailbox::solve_pow(recipient_key, b"msg-1", &ciphertext, 1_000);
+        let result = sender_mailbox
+            .push(
+                recipient_key,
+                b"msg-2",
+                ciphertext,
+                86_400,
+                1_000,
+                &solution_for_msg_1,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a PoW solved for msg-1 must not be replayable to push msg-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_rejects_a_ttl_beyond_the_maximum() {
+        let (sender_dht, _recipient_dht) = connected_pair().await;
+        let sender_mailbox = Mailbox::new(sender_dht);
+        let recipient_key = b"recipient-key-hash-ttl";
+        let ciphertext = b"hello".to_vec();
+        let solution = Mailbox::solve_pow(recipient_key, b"msg-1", &ciphertext, 1_000);
+
+        let result = sender_mailbox
+            .push(
+                recipient_key,
+                b"msg-1",
+                ciphertext,
+                MAX_TTL_SECONDS + 1,
+                1_000,
+                &solution,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a ttl beyond MAX_TTL_SECONDS must be rejected"
+        );
     }
 }

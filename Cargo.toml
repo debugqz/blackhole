@@ -8,6 +8,7 @@ members = [
     "crates/bh-files",
     "crates/bh-api",
     "crates/bh-calls",
+    "crates/bh-push-relay",
     "client/desktop/src-tauri",
 ]
 
