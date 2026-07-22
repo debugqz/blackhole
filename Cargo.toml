@@ -18,6 +18,45 @@ edition = "2021"
 publish = false
 license = "AGPL-3.0-or-later"
 
+# Workspace-wide optimization knobs. Defaults give faster compile/LTO-off
+# for `dev`/`test`, and a slim, smooth-running binary for `release` —
+# `lto = "thin"` shaves a meaningful chunk off installer size without
+# paying full-LTO's clang-time explosion; `codegen-units = 1` lets thin LTO
+# do its job; `strip = "symbols"` removes the heaviest section of the
+# binary (relevant for sidecar bundle size on macOS/Windows, where it
+# lands in the .app/.msi); `opt-level = 3` is the standard max.
+#
+# For dev/test we leave the default `opt-level = 0` — debug builds stay
+# fast to iterate on, and `sccache` (configured in CI / bootstrap.sh) does
+# the cache reuse work.
+#
+# `bh-calls` overrides only if needed: WebRTC's Rust glue sometimes wants
+# frame pointers preserved for profiling, but with `strip = "symbols"`
+# that's already not happening in release anyway, so no per-crate override
+# is necessary.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+panic = "abort"
+
+# Release *with* debug info, used by release.yml's profile="release-with-
+# debuginfo" — same optimizations, but keeps the symbol table so a
+# packaged `blackhole-daemon` can be `debugger`-attached / `perf`-sampled
+# from a corrupted user report without a separate debug build.
+[profile.release-with-debuginfo]
+inherits = "release"
+debug = 1
+strip = "none"
+
+# Coverage profile only used by hand on demand (`cargo +nightly test
+# --profile cov`); not enabled in CI today. Keeping the knobs here so
+# they're easy to flip.
+[profile.coverage]
+inherits = "test"
+debug = 1
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 serde = { version = "1", features = ["derive"] }

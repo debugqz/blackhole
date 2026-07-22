@@ -4,11 +4,57 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `pull_request_target` would let us also branch-check PRs from forks
+    # without giving them write secrets, but we don't need fork PRs to do
+    # anything secret-gated yet — the release/cd jobs run on `main` only,
+    # not on PRs. If/when that's added later, broaden the workflow trigger
+    # carefully and use the standard `pull_request_target` fork-PR pattern.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  # `sccache` is reused between jobs in the same workflow run via this
+  # directory inside the runner's workspace; `Swatinem/rust-cache` then
+  # backs it across runs via its own cache. Two layers of caching for two
+  # timescales: in-run (sccache's dir, wiped by GitHub at job end) and
+  # cross-run (rust-cache, persisted in GH Actions' cache store).
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
+  RUSTC_WRAPPER: sccache
 
 jobs:
+  # Cheap static-analysis pass for fast PR feedback. Runs only `fmt` +
+  # `clippy` — no `cargo build`, no `cargo test`, no fuzzing. Trades a
+  # guarantee of "this builds" for a ~2 min feedback loop on style and
+  # lints instead of the full ~10 min for the heavyweight job. Bumped
+  # for `${NO_BUILD_JOB}`-style opt-outs later by setting `run-fast:
+  # false` on a PR via the PR label `full-ci` if needed — out of scope
+  # here.
+  rust-fast:
+    name: Rust fast (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libclang-dev clang
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The "real" CI that's currently the only one — full build, full test
+  # suite, fuzz smoke. PRs to main get both `rust-fast` (cheap, fast) and
+  # `rust` (heavier, slower) so style feedback isn't waiting ten minutes
+  # behind a build.
   rust:
     name: Rust (fmt, clippy, build, test)
     runs-on: ubuntu-latest
@@ -28,6 +74,19 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev
 
+      - name: Install sccache
+        # `sccache` cuts the wall-clock cost of anything not already in
+        # `Swatinem/rust-cache`'s cache (cross-run) by reusing crate
+        # compilations within the same workflow run. Pairs with
+        # `RUSTC_WRAPPER: sccache` set in the workflow `env:`, and
+        # `SCCACHE_DIR` pointing at a temp dir the runner wipes at job
+        # end (rust-cache takes over persistence).
+        run: |
+          curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.7.4/sccache-v0.7.4-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C /tmp
+          sudo cp /tmp/sccache-v0.7.4-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          sccache --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -35,6 +94,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `--frozen` + `--offline` so the build/test/fuzz steps below can't
+      # silently drift away from `Cargo.lock`.
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -42,10 +103,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   cargo-deny:
     name: Dependency advisories (cargo-deny)
