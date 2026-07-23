@@ -666,10 +666,7 @@ mod tests {
             move |frame| s.lock().unwrap().push(frame),
         );
 
-        // A handful of frames per track, plus flush frames (the receive
-        // side's `SampleBuilder` needs a later-timestamped packet before
-        // it releases the previous one — same technique `transport.rs`'s
-        // own tests use).
+        // A handful of frames per track, tagged with their index.
         for i in 0..3 {
             caller_session
                 .send_audio_frame(
@@ -694,7 +691,23 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(StdDuration::from_millis(20)).await;
         }
-        for _ in 0..3 {
+
+        // Keep nudging every track with a flush frame (the receive side's
+        // `SampleBuilder` needs a later-timestamped packet before it
+        // releases the previous one — same technique `transport.rs`'s own
+        // tests use) until every callback has caught up or the deadline
+        // hits, instead of a fixed burst of 3 up front: this is real UDP
+        // over the loopback interface, and a CI runner under resource
+        // contention can drop a packet — a one-shot flush burst then
+        // strands that track's last real frame in its jitter buffer
+        // forever (nothing else arrives to release it), where continuous
+        // retries just cost a little more wall time.
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(15);
+        while (audio_frames.lock().unwrap().len() < 3
+            || video_frames.lock().unwrap().len() < 3
+            || screen_frames.lock().unwrap().len() < 3)
+            && tokio::time::Instant::now() < deadline
+        {
             caller_session
                 .send_audio_frame(b"__flush__", StdDuration::from_millis(20))
                 .await
@@ -707,15 +720,6 @@ mod tests {
                 .send_screen_share_frame(b"__flush__", StdDuration::from_millis(100))
                 .await
                 .unwrap();
-            tokio::time::sleep(StdDuration::from_millis(20)).await;
-        }
-
-        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(15);
-        while (audio_frames.lock().unwrap().len() < 3
-            || video_frames.lock().unwrap().len() < 3
-            || screen_frames.lock().unwrap().len() < 3)
-            && tokio::time::Instant::now() < deadline
-        {
             tokio::time::sleep(StdDuration::from_millis(50)).await;
         }
 
