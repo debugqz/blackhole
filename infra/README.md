@@ -24,6 +24,16 @@ a standalone bootstrap-node-only profile. If you *are* the operator and a
 community member just handed you their multiaddr, see
 `ACCEPTING_COMMUNITY_NODES.md` before adding it to anything you publish.
 
+## Table of contents
+
+- [What this does not do](#what-this-does-not-do)
+- [Order of operations](#order-of-operations)
+- [1. DHT bootstrap node](#1-dht-bootstrap-node)
+- [2. Push relay](#2-push-relay)
+- [3. TURN relay](#3-turn-relay)
+- [After deploying](#after-deploying)
+- Community-run nodes: [`COMMUNITY_NODE_GUIDE.md`](COMMUNITY_NODE_GUIDE.md) · [`ACCEPTING_COMMUNITY_NODES.md`](ACCEPTING_COMMUNITY_NODES.md)
+
 ## What this does *not* do
 
 - Doesn't touch any real cloud account, DNS provider, or domain registrar.
@@ -48,6 +58,22 @@ community member just handed you their multiaddr, see
    that are both behind a symmetric NAT — STUN alone (already defaulted
    on, `BLACKHOLE_STUN_SERVERS`) covers ordinary NATs. Skip it if that
    case doesn't matter to you yet.
+
+```mermaid
+flowchart LR
+    subgraph operator["Operator's own stack — this file"]
+        direction TB
+        Boot["1. DHT bootstrap node<br/>(required)"] --> Push["2. Push relay + Caddy<br/>(independent, do it whenever)"]
+        Push --> Turn["3. TURN relay<br/>(optional — symmetric NAT only)"]
+    end
+    subgraph community["Community members —<br/>COMMUNITY_NODE_GUIDE.md"]
+        direction TB
+        CBoot["Their own bootstrap node,<br/>same image, joins the same DHT"]
+    end
+
+    Boot -.->|"multiaddr shared,<br/>then verified before trusting it —<br/>see ACCEPTING_COMMUNITY_NODES.md"| CBoot
+    CBoot -.->|"published back into<br/>BLACKHOLE_BOOTSTRAP_PEERS"| Boot
+```
 
 ---
 

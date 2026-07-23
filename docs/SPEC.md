@@ -4,6 +4,43 @@
 
 Este documento es el contexto base del proyecto. Está pensado para entregarse a un agente de desarrollo (Claude Code) como punto de partida. Recoge todas las decisiones de arquitectura ya tomadas, el razonamiento detrás de cada una, y lo que queda explícitamente pendiente.
 
+📖 English translation: **[docs/SPEC.en.md](SPEC.en.md)**
+
+## Tabla de contenidos
+
+- [0. Visión y alcance](#0-visión-y-alcance)
+- [1. Modelo de amenaza](#1-modelo-de-amenaza)
+- [2. Arquitectura criptográfica](#2-arquitectura-criptográfica)
+  - [2.1 Protocolo base](#21-protocolo-base)
+  - [2.2 Sobre el criptosistema propio (futuro)](#22-sobre-el-criptosistema-propio-futuro)
+  - [2.3 Metadata](#23-metadata)
+  - [2.4 Key Transparency](#24-key-transparency)
+- [3. Identidad y autenticación](#3-identidad-y-autenticación)
+- [4. Multi-dispositivo, backups y recuperación](#4-multi-dispositivo-backups-y-recuperación)
+- [5. Arquitectura de red (P2P)](#5-arquitectura-de-red-p2p)
+  - [5.1 Capa de transporte](#51-capa-de-transporte)
+  - [5.2 Enrutamiento y anonimato](#52-enrutamiento-y-anonimato)
+  - [5.3 Mensajería offline (store-and-forward)](#53-mensajería-offline-store-and-forward)
+  - [5.4 Grupos a escala](#54-grupos-a-escala)
+  - [5.5 Archivos y multimedia](#55-archivos-y-multimedia)
+  - [5.6 Notificaciones push](#56-notificaciones-push)
+- [6. Cliente y daemon local](#6-cliente-y-daemon-local)
+- [7. Seguridad del endpoint (dispositivo)](#7-seguridad-del-endpoint-dispositivo)
+- [8. Moderación, spam y abuso](#8-moderación-spam-y-abuso)
+- [9. Transparencia y auditoría](#9-transparencia-y-auditoría)
+- [10. Distribución](#10-distribución)
+- [11. Gobernanza](#11-gobernanza)
+- [12. Modelo económico y pagos](#12-modelo-económico-y-pagos)
+- [13. Explícitamente diferido / en stand-by](#13-explícitamente-diferido--en-stand-by)
+- [14. Decisiones pendientes de confirmar](#14-decisiones-pendientes-de-confirmar)
+- [15. Funciones añadidas (post-v0.1)](#15-funciones-añadidas-post-v01)
+- [16. Funciones añadidas (segunda ronda, post-§15)](#16-funciones-añadidas-segunda-ronda-post-15)
+- [17. Conectar la red real y cerrar riesgos pendientes (post-§16)](#17-conectar-la-red-real-y-cerrar-riesgos-pendientes-post-16)
+- [18. Bloqueos compartibles, señal de confianza, preferencias de UI y cuarta ronda de hardening](#18-bloqueos-compartibles-señal-de-confianza-de-contacto-preferencias-de-ui-y-cuarta-ronda-de-hardening-post-17)
+- [Apéndice — Stack tecnológico de referencia](#apéndice--stack-tecnológico-de-referencia)
+- [Apéndice — Mapeo de decisiones originales (1-31)](#apéndice--mapeo-de-decisiones-originales-1-31)
+- [Decisiones de stack tomadas al iniciar el scaffold](#decisiones-de-stack-tomadas-al-iniciar-el-scaffold-post-v01)
+
 ---
 
 ## 0. Visión y alcance
@@ -29,6 +66,24 @@ Explícitamente **no** pretendemos proteger contra un atacante con control físi
 ---
 
 ## 2. Arquitectura criptográfica
+
+```mermaid
+graph TD
+    IK["Clave de identidad de largo plazo<br/>Ed25519 (firma) + X25519 (acuerdo)"]
+    SPK["Prekey firmada<br/>clásica (X25519) + PQ (ML-KEM)"]
+
+    IK --> X3DH["X3DH — acuerdo de claves 1:1<br/>combinado vía HKDF: piernas clásicas + PQ<br/>(mitiga 'harvest now, decrypt later')"]
+    SPK --> X3DH
+    X3DH --> DR["Double Ratchet<br/>una clave de mensaje distinta por mensaje,<br/>forward secrecy + post-compromise security"]
+
+    IK --> MLS["MLS (RFC 9420) — grupos<br/>árbol de claves, un commit por cambio<br/>de membresía, escala mejor que N sesiones"]
+
+    DR -.->|"nunca cripto casera —<br/>ver §2.2"| Audit["Solo primitivas ya auditadas<br/>(libsodium o equivalente)"]
+    MLS -.-> Audit
+
+    style X3DH fill:#1a1a2e,stroke:#666
+    style MLS fill:#1a1a2e,stroke:#666
+```
 
 ### 2.1 Protocolo base
 - **Signal Protocol** (X3DH + Double Ratchet) para chats 1:1.
@@ -76,6 +131,16 @@ Log público append-only y auditable de claves públicas (mismo concepto que Cer
 
 ## 5. Arquitectura de red (P2P)
 
+```mermaid
+graph LR
+    T["5.1 Transporte<br/>libp2p, STUN + TURN de respaldo"] --> D["5.2 DHT Kademlia<br/>+ resistencia Eclipse/Sybil"]
+    D --> O["5.2 Onion routing<br/>3+ saltos, tráfico de cobertura"]
+    O --> M["5.3 Buzones<br/>store-and-forward, TTL, sealed sender"]
+    M --> G["5.4 Fan-out de grupos<br/>un publish, N pulls"]
+    F["5.5 Archivos/multimedia<br/>content-addressed, chunked"] -.->|"capa independiente,<br/>no comparte buzón de texto"| M
+    P["5.6 Push<br/>payload vacío, opt-in"] -.->|"solo 'algo cambió',<br/>nunca contenido"| M
+```
+
 ### 5.1 Capa de transporte
 - **libp2p** como base (no reinventar NAT traversal/descubrimiento de peers desde cero).
 - **STUN** para hole punching directo entre peers cuando es posible.
@@ -109,6 +174,14 @@ Log público append-only y auditable de claves públicas (mismo concepto que Cer
 - Arquitectura de **daemon local** corriendo en `localhost` (puerto propio) en la máquina/dispositivo del usuario.
 - La UI (app/web) habla únicamente con el daemon vía localhost, nunca directo a la red.
 - El daemon gestiona: claves criptográficas, cifrado/descifrado, y la conexión a la red P2P/DHT/onion.
+
+```mermaid
+graph TB
+    UI["UI (app/web)"] -->|"localhost únicamente"| Daemon["Daemon local"]
+    Daemon --> Keys["Claves criptográficas<br/>+ cifrado/descifrado"]
+    Daemon --> Net["Red P2P/DHT/onion (§5)"]
+    UI -.->|"nunca directo"| Net
+```
 
 ---
 
@@ -173,6 +246,17 @@ Log público append-only y auditable de claves públicas (mismo concepto que Cer
 - **Infraestructura de cobro**: BTCPay Server (open source, auto-hosteado, sin KYC impuesto), nativo para BTC/Lightning, con plugin para Monero. ETH/otras altcoins requieren integración adicional, no vienen "de fábrica" tan maduras — a resolver en fase de implementación.
 - Solicitudes de pago ruteadas también a través del onion service, para que ni la IP de quien paga quede expuesta.
 - **Aislamiento estricto de datos**: la base de datos de pagos/suscripciones nunca se vincula directamente con la de mensajería — solo un token opaco intercambiable confirma "activo/inactivo".
+
+```mermaid
+graph LR
+    subgraph msg["Dominio de mensajería"]
+        MsgDB[("Mensajes, contactos, grupos")]
+    end
+    subgraph pay["Dominio de pagos"]
+        PayDB[("Suscripciones, cosméticos")]
+    end
+    MsgDB <-.->|"solo token opaco activo/inactivo<br/>— nunca un enlace directo"| PayDB
+```
 
 ---
 

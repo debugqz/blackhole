@@ -6,6 +6,22 @@ need to run the platform's push-relay or TURN relay for this; a bootstrap
 node stands entirely on its own, and every bit it helps benefits the whole
 network, not just one operator.
 
+## Table of contents
+
+- [What you're actually running](#what-youre-actually-running)
+- [Before you start](#before-you-start)
+- [Steps](#steps)
+- [Get your own multiaddr (to give back)](#get-your-own-multiaddr-to-give-back)
+- [Keeping it working](#keeping-it-working)
+
+```mermaid
+flowchart LR
+    You[("Your node<br/>(this guide)")] -->|"BLACKHOLE_BOOTSTRAP_PEERS"| Known["Bootstrap peer(s)<br/>you were given"]
+    Known -->|"already joined"| DHT(("The wider<br/>Kademlia DHT"))
+    You -->|"once you're in,<br/>you help others<br/>find each other too"| DHT
+    You -.->|"send your own multiaddr back"| Operator["Whoever you're helping<br/>— see ACCEPTING_COMMUNITY_NODES.md"]
+```
+
 ## What you're actually running
 
 An ordinary `daemon` (`bh-daemon`) process, same code and image as

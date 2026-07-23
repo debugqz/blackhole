@@ -9,6 +9,22 @@ registration/authentication protocol for bootstrap peers at all (see
 plausible-looking string" and "a real, working, non-malicious peer" is
 you checking it yourself.
 
+## Table of contents
+
+- [What a bad or fake entry actually costs](#what-a-bad-or-fake-entry-actually-costs)
+- [Step 1 — confirm it's reachable and real](#step-1--confirm-its-actually-reachable-and-really-a-blackhole-peer)
+- [Step 2 — add it to what you distribute](#step-2--add-it-to-what-you-actually-distribute)
+- [Step 3 — treat it as ongoing](#step-3--treat-it-as-ongoing-not-one-time)
+
+```mermaid
+flowchart TD
+    Submit(["Community member sends<br/>you a multiaddr"]) --> Verify{"Step 1: dial it alone<br/>with a disposable daemon —<br/>does it actually connect?"}
+    Verify -- "no / times out" --> Reject(["Reject — ask them to check<br/>firewall/port-forward/PeerId"])
+    Verify -- yes --> Publish["Step 2: append to whatever<br/>bootstrap-peer list you distribute,<br/>note date + submitter"]
+    Publish --> Monitor["Step 3: periodically re-verify —<br/>no uptime monitoring exists,<br/>removal isn't retroactive"]
+    Monitor -.->|"goes dark or misbehaves"| Reject
+```
+
 ## What a bad or fake entry actually costs
 
 Low, but not zero. A bootstrap node never sees message content or contact

@@ -5,6 +5,13 @@ pattern for large FOSS projects at this stage (same shape as Linux, Python
 for most of its history, Rust before the team-based model matured). This
 document exists so that shape is explicit rather than implicit.
 
+## Table of contents
+
+- [Decision-making](#decision-making)
+- [Why this model, for now](#why-this-model-for-now)
+- [What's deferred](#whats-deferred)
+- [Security and vulnerability reports](#security-and-vulnerability-reports)
+
 ## Decision-making
 
 - The project maintainer(s) have final say on protocol design, roadmap, and
@@ -22,6 +29,19 @@ document exists so that shape is explicit rather than implicit.
   homegrown cryptosystem without professional cryptographic review and
   formal verification — require the same bar regardless of who proposes
   them, maintainer included.
+
+```mermaid
+flowchart TD
+    Propose(["Anyone opens an issue or PR"]) --> Discuss["Public discussion on the merits"]
+    Discuss --> Agree{"Consensus reached?"}
+    Agree -- Yes --> Merge(["Merged — no tie-break needed"])
+    Agree -- No --> Tiebreak["Maintainer's final say<br/>— last resort, not a substitute<br/>for the discussion above"]
+    Tiebreak --> Merge
+
+    Discuss --> Spec2{"Touches docs/SPEC.md §2<br/>(cryptographic architecture)?"}
+    Spec2 -- Yes --> ExtraBar["Same elevated bar for everyone,<br/>maintainer included — see<br/>§2.2's professional-review requirement"]
+    ExtraBar --> Agree
+```
 
 ## Why this model, for now
 

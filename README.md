@@ -15,7 +15,8 @@ Session + Tor, combined*. The operator cannot read message content and
 cannot reconstruct who talks to whom, not as a policy promise but as a
 structural property of the protocol.
 
-📖 Full architecture & rationale: **[docs/SPEC.md](docs/SPEC.md)**
+📖 Full architecture & rationale: **[docs/SPEC.en.md](docs/SPEC.en.md)**
+(original: **[docs/SPEC.md](docs/SPEC.md)**, Spanish — source of truth if the two ever disagree)
 🛡️ Attack surface & known open risks, per subsystem: **[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)**
 📐 Non-negotiables & contributor summary: **[CLAUDE.md](CLAUDE.md)**
 ⚖️ Decision-making model: **[GOVERNANCE.md](GOVERNANCE.md)**

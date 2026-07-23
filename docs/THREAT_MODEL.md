@@ -11,6 +11,27 @@ This document describes the **current implementation**, not just the
 design intent — where something is a known gap, it says so explicitly
 rather than describing the aspirational end state.
 
+## Table of contents
+
+- [1. Assets](#1-assets)
+- [2. Adversaries and trust boundaries](#2-adversaries-and-trust-boundaries)
+- [3. Per-subsystem analysis](#3-per-subsystem-analysis)
+  - [3.1 Identity & 1:1 sessions](#31-identity--11-sessions-bh-cryptoidentity-bh-cryptoratchet)
+  - [3.2 Groups (MLS)](#32-groups-bh-cryptomls)
+  - [3.3 Post-quantum hybrid](#33-post-quantum-hybrid-bh-cryptopq_hybrid)
+  - [3.4 Onion routing](#34-onion-routing-bh-networkonion)
+  - [3.5 DHT & node selection](#35-dht--node-selection-bh-networktransport-dht-eclipse_resistance)
+  - [3.6 Mailboxes & sealed sender](#36-mailboxes--sealed-sender-bh-networkmailbox-sealed_sender)
+  - [3.7 Local storage](#37-local-storage-bh-storage)
+  - [3.8 Anti-spam PoW](#38-anti-spam-pow-bh-networkpow)
+  - [3.9 Daemon API surface](#39-daemon-api-surface-bh-api)
+  - [3.10 Third-party dependency vulnerabilities](#310-third-party-dependency-vulnerabilities-github-dependabot)
+  - [3.11 Post-v0.1 features](#311-post-v01-features-bh-cryptoenvelopesafety_numbercall_keyspayment_address-bh-storagereactionsreceiptsinvitesprofilespayment_requestslocal_auth-bh-apidevice_linkfiles-bh-calls)
+  - [3.12 Second post-v0.1 batch](#312-second-post-v01-batch-bh-apidevice_synccosmeticsstickerspresencepushsearchgroupsconversations-bh-storagepushsearchcosmeticsmessage_stickers-cratesbh-push-relay-bh-callsgroupscreen-bh-cryptomlsexport_call_base_key-clientdesktopsrc-taurisrclink_previewrs)
+  - [3.13 Network-wired direct messages and call streaming](#313-network-wired-direct-messages-and-call-streaming-bh-apimessage_cryptomessage_receive-bh-apicall_streamcall_audio-clientdesktopsrc-taurisrccall_stream_bridgers)
+  - [3.14 Shareable blocklists, trust level, UI prefs, fourth hardening pass](#314-shareable-blocklists-contact-trust-level-client-ui-prefs-and-a-fourth-hardening-pass-bh-apimoderationcontacts-bh-storagecontacts-clientdesktopsrcui_prefsts-plus-the-mailboxkeystoretokenparser-fixes-folded-into-363739312-above)
+- [4. Ranked open risks (28 tracked items)](#4-ranked-open-risks)
+
 ---
 
 ## 1. Assets
@@ -48,6 +69,31 @@ physical/root control of an already-unlocked device — OS-level keyloggers,
 preinstalled malware, forensic device imaging. No messaging app can
 meaningfully defend against that; claiming otherwise would be a false
 guarantee.
+
+```mermaid
+flowchart TB
+    subgraph trusted["Trusted with plaintext"]
+        Sender(["Sending device<br/>(post-unlock)"])
+        Recipient(["Recipient device<br/>(post-unlock)"])
+    end
+
+    subgraph untrusted["Everything in between — ciphertext + coarse metadata only"]
+        direction LR
+        Observer["Passive network<br/>observer"]
+        Relay["Malicious/compromised<br/>relay or mailbox node"]
+        Operator["Blackhole operator<br/>/ maintainers"]
+    end
+
+    Sender -->|"ciphertext, sealed sender,<br/>onion-routed"| untrusted
+    untrusted -->|"ciphertext only"| Recipient
+
+    Contact["Malicious contact<br/>(real, authenticated peer)"] -.->|"trusted only with<br/>what the user chooses to send"| Recipient
+
+    OutOfScope["Compromised device, post-unlock<br/>— explicitly OUT OF SCOPE,<br/>no messaging app defends against this"]
+
+    style untrusted fill:#1a1a2e,stroke:#666,stroke-dasharray: 4 4
+    style OutOfScope fill:none,stroke:#a33,stroke-dasharray: 2 2
+```
 
 ## 3. Per-subsystem analysis
 
@@ -1109,7 +1155,7 @@ storage or synthetic tests.
   real" work actually lands (see §3.7's file-keystore-backend entry for
   the precedent of documenting `infra/`-level decisions in this file).
 
-
+## 4. Ranked open risks
 
 Numbering is kept stable across revisions (rather than renumbered as items
 close) so cross-references elsewhere in this document keep pointing at the
