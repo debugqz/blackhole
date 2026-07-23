@@ -1,5 +1,11 @@
 # Blackhole
 
+[![CI](https://github.com/debugqz/blackhole/actions/workflows/ci.yml/badge.svg)](https://github.com/debugqz/blackhole/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3--or--later-blue.svg)](LICENSE)
+![No official app stores](https://img.shields.io/badge/distribution-no%20app%20stores-lightgrey.svg)
+![No content moderation](https://img.shields.io/badge/content%20moderation-never-lightgrey.svg)
+![Security review](https://img.shields.io/badge/independent%20security%20review-not%20yet-red.svg)
+
 **Private P2P messaging with real end-to-end encryption, zero-knowledge by
 design, no content moderation, no central custody of data — funded by
 cosmetic-only in-app purchases paid in cryptocurrency.**
@@ -13,6 +19,31 @@ structural property of the protocol.
 🛡️ Attack surface & known open risks, per subsystem: **[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)**
 📐 Non-negotiables & contributor summary: **[CLAUDE.md](CLAUDE.md)**
 ⚖️ Decision-making model: **[GOVERNANCE.md](GOVERNANCE.md)**
+
+---
+
+## At a glance
+
+No account server, no phone number, no central place that ever holds
+plaintext. Everything below is real code, not aspiration — see [How a
+message travels](#how-a-message-travels-11-and-group-both-now-live) for
+the full, proven-by-integration-test version of this same picture.
+
+```mermaid
+graph LR
+    A(["Alice<br/>daemon + client"]) -->|"encrypt: PQ-hybrid X3DH<br/>+ Double Ratchet"| C1["3+ hop<br/>onion circuit"]
+    C1 -->|"ciphertext only,<br/>sender identity sealed"| MB[("Bob's encrypted mailbox<br/>DHT record, TTL ~30 days")]
+    MB -->|"pull on reconnect"| B(["Bob<br/>daemon + client"])
+
+    subgraph sees["What any relay/mailbox node ever sees"]
+        direction TB
+        S1["Ciphertext"]
+        S2["Coarse routing metadata<br/>(hash of recipient key)"]
+        S3["Never: content, sender identity,<br/>or who-talks-to-whom"]
+    end
+
+    style sees fill:#1a1a2e,stroke:#666,stroke-dasharray: 4 4
+```
 
 ---
 
@@ -72,6 +103,7 @@ the `bh-network` integration (now live for `Direct` messages, not yet for
 
 ## Table of contents
 
+- [At a glance](#at-a-glance)
 - [Design pillars](#design-pillars)
 - [Architecture](#architecture)
 - [Feature set](#feature-set)
@@ -495,6 +527,31 @@ This is "protocol composition from audited primitives," explicitly not
 review. Treat it as *"implements the right algorithm, unreviewed"* rather
 than *"as trusted as libsignal."*
 
+**Key hierarchy** — how a long-term identity turns into the one-time key
+that actually encrypts a single message:
+
+```mermaid
+graph TD
+    IK["Long-term identity key<br/>Ed25519 (sign) + X25519 (agree)<br/>generated once, seed-phrase recoverable"]
+    SPK["Signed prekey<br/>X25519 (classical) + ML-KEM-768 (PQ)<br/>both Ed25519-signed, rotated, DHT-published"]
+    OPK["One-time prekey (classical)<br/>consumed on use, not reused"]
+
+    IK --> X3DH
+    SPK --> X3DH
+    OPK --> X3DH
+
+    X3DH["X3DH key agreement<br/>HKDF-combines every classical DH leg<br/>+ the ML-KEM-768 leg — a break in ML-KEM<br/>alone still leaves X25519-strength security"]
+
+    X3DH --> RK["Double Ratchet root key"]
+    RK -->|"DH ratchet step<br/>on each reply"| RK
+    RK --> CKs["Sending chain key"]
+    RK --> CKr["Receiving chain key"]
+    CKs -->|"symmetric-ratchet<br/>per message"| MKs["Message key<br/>ChaCha20-Poly1305 AEAD<br/>forward-secret, deleted after use"]
+    CKr -->|"symmetric-ratchet<br/>per message"| MKr["Message key"]
+
+    style X3DH fill:#1a1a2e,stroke:#666
+```
+
 | Layer | Choice | Crate |
 |---|---|---|
 | 1:1 session handshake | X3DH | `x25519-dalek`, `ed25519-dalek` (composed) |
@@ -609,6 +666,30 @@ unresolved gap in the codebase today — see `docs/THREAT_MODEL.md` §3.4.
   before until its owner explicitly sets a PIN. See
   `docs/THREAT_MODEL.md` §3.7.
 
+**Two different things both called "unlock," easy to conflate**: the
+ordinary passkey/TOTP screen only gates the *UI*; a separate, dedicated
+enrollment gates the *daemon process itself* — and therefore actual
+SQLCipher decryption.
+
+```mermaid
+flowchart TD
+    Start(["Desktop app launch"]) --> Q{"'Database lock' (WebAuthn PRF)<br/>enrolled for this profile?"}
+
+    Q -- "No — default" --> Spawn1["Tauri spawns bh-daemon<br/>immediately, DB decrypts as normal"]
+    Spawn1 --> Unlock1["Passkey / TOTP local-auth screen"]
+    Unlock1 --> Ready1["Chat UI unlocked<br/>(gates the UI only — DB was<br/>already open before this screen ran)"]
+
+    Q -- "Yes — opt-in" --> PRF["WebAuthn passkey PRF assertion<br/>required BEFORE the daemon spawns"]
+    PRF -->|success| Spawn2["Tauri spawns bh-daemon<br/>with the PRF-derived secret"]
+    Spawn2 --> Ready2["SQLCipher genuinely decrypts,<br/>chat UI unlocked"]
+    PRF -->|"failure / cancelled"| Blocked["Daemon never spawns —<br/>no DB access exists at all"]
+```
+
+TOTP is deliberately excluded from the PRF gate specifically: a TOTP
+secret has to be readable by the client *without* the database open, so it
+can't provide a real second factor for something that's supposed to gate
+opening the database in the first place.
+
 ---
 
 ## Identity, multi-device & recovery
@@ -646,6 +727,23 @@ unresolved gap in the codebase today — see `docs/THREAT_MODEL.md` §3.4.
   "linked device" side of that handshake is a locally-simulated shadow
   identity rather than a real second process, same honest-about-scope
   caveat as linking itself.
+
+  ```mermaid
+  sequenceDiagram
+      participant P as Primary device<br/>(already authenticated)
+      participant Relay as device_link_relay<br/>(one-shot DHT relay)
+      participant N as New device<br/>(no identity yet)
+
+      P->>P: POST /devices/link/begin<br/>ephemeral link secret + QR code
+      N->>N: scan QR (out-of-band, camera)
+      N->>Relay: publish "scan" ciphertext
+      P->>Relay: poll / fetch it
+      P->>P: POST /devices/link/accept<br/>verifies the scan, prepares the transfer
+      P->>Relay: publish "accept" ciphertext<br/>(the account identity itself)
+      N->>Relay: poll / fetch it
+      N->>N: POST /devices/link/finish<br/>recovers the primary's real account identity
+      Note over N: gets its own signing + X25519<br/>device identity too — addressable<br/>the same way a Contact is
+  ```
 - **Encrypted backups** with a key only the user controls — the server
   can't read them without it.
 - **Seed-phrase recovery, no backdoor**: a 12-24 word BIP-39 phrase
@@ -696,7 +794,7 @@ sequenceDiagram
     Note over Alice: Alice has already blocked<br/>two abusive contacts locally
     AliceUI->>Alice: GET /moderation/blocklist/export
     Alice-->>AliceUI: blackhole://blocklist?d=... <br/>(identity pubkeys + labels, plain base64 JSON)
-    AliceUI-->>BobUI: pastes the link<br/>(any channel — chat, email; not sent by Blackhole itself)
+    AliceUI-->>BobUI: pastes the link<br/>(any channel — chat, email, not sent by Blackhole itself)
     BobUI->>Bob: POST /moderation/blocklist/decode
     Bob-->>BobUI: preview: which entries match<br/>Bob's own contacts (nothing blocked yet)
     Note over BobUI: Bob reviews and<br/>explicitly selects entries
