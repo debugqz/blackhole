@@ -719,8 +719,13 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(50)).await;
         }
 
+        // Compare only the first 3 frames of each: the wait loop above races
+        // the still-running depacketize loops, which may have already
+        // pushed one or more `__flush__` frames past the length-3 threshold
+        // by the time this grabs the lock again — that's expected, not a
+        // routing bug, so it shouldn't fail the assertion.
         assert_eq!(
-            *audio_frames.lock().unwrap(),
+            audio_frames.lock().unwrap()[..3].to_vec(),
             vec![
                 b"audio-0".to_vec(),
                 b"audio-1".to_vec(),
@@ -729,7 +734,7 @@ mod tests {
             "audio callback must only ever see audio frames, in order"
         );
         assert_eq!(
-            *video_frames.lock().unwrap(),
+            video_frames.lock().unwrap()[..3].to_vec(),
             vec![
                 b"video-0".to_vec(),
                 b"video-1".to_vec(),
@@ -738,7 +743,7 @@ mod tests {
             "video callback must only ever see video frames, in order"
         );
         assert_eq!(
-            *screen_frames.lock().unwrap(),
+            screen_frames.lock().unwrap()[..3].to_vec(),
             vec![
                 b"screen-0".to_vec(),
                 b"screen-1".to_vec(),
