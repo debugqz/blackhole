@@ -13,13 +13,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # `sccache` is reused between jobs in the same workflow run via this
-  # directory inside the runner's workspace; `Swatinem/rust-cache` then
-  # backs it across runs via its own cache. Two layers of caching for two
-  # timescales: in-run (sccache's dir, wiped by GitHub at job end) and
-  # cross-run (rust-cache, persisted in GH Actions' cache store).
-  SCCACHE_DIR: ${{ github.workspace }}/.sccache
-  RUSTC_WRAPPER: sccache
 
 jobs:
   # Cheap static-analysis pass for fast PR feedback. Runs only `fmt` +
@@ -35,8 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `--workspace` pulls in `client/desktop/src-tauri`, so this needs
+      # Tauri's own Linux build deps (webkit2gtk transitively brings in
+      # glib/gtk3), not just the crypto/networking crates' own libs — see
+      # the `rust` job's own comment on the same package list below.
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libclang-dev clang
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libclang-dev clang libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -58,6 +55,18 @@ jobs:
   rust:
     name: Rust (fmt, clippy, build, test)
     runs-on: ubuntu-latest
+    # `sccache` is reused between steps in this job via this directory
+    # inside the runner's workspace; `Swatinem/rust-cache` then backs it
+    # across runs via its own cache. Two layers of caching for two
+    # timescales: in-run (sccache's dir, wiped by GitHub at job end) and
+    # cross-run (rust-cache, persisted in GH Actions' cache store).
+    # Scoped to this job only (not the workflow-level `env:` above) —
+    # `rust-fast`/`fuzz-smoke`/`cargo-deny` never install the `sccache`
+    # binary, so `RUSTC_WRAPPER` pointing at it there just breaks every
+    # cargo invocation with "could not execute process `sccache ...`".
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
 
@@ -76,17 +85,22 @@ jobs:
       # `scap` dependency additionally needs libpipewire + libdbus headers
       # on Linux (its xdg-desktop-portal/PipeWire screencast backend) —
       # macOS/Windows use native platform capture APIs instead and need
-      # nothing extra here.
+      # nothing extra here. `--workspace` (both here and in `rust-fast`)
+      # also pulls in `client/desktop/src-tauri`, which needs Tauri's own
+      # Linux build deps — webkit2gtk transitively brings in glib/gtk3,
+      # which is why `glib-sys`'s build script (`pkg-config --libs glib-2.0`)
+      # was failing before these were added, not just a webkit-specific gap.
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev libasound2-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
 
       - name: Install sccache
         # `sccache` cuts the wall-clock cost of anything not already in
         # `Swatinem/rust-cache`'s cache (cross-run) by reusing crate
-        # compilations within the same workflow run. Pairs with
-        # `RUSTC_WRAPPER: sccache` set in the workflow `env:`, and
-        # `SCCACHE_DIR` pointing at a temp dir the runner wipes at job
-        # end (rust-cache takes over persistence).
+        # compilations within the same workflow run. Pairs with this job's
+        # own `RUSTC_WRAPPER: sccache` env (not the workflow-level `env:` —
+        # see this job's own comment above), and `SCCACHE_DIR` pointing at
+        # a temp dir the runner wipes at job end (rust-cache takes over
+        # persistence).
         run: |
           curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.7.4/sccache-v0.7.4-x86_64-unknown-linux-musl.tar.gz \
             | tar -xz -C /tmp
@@ -171,9 +185,11 @@ jobs:
         with:
           version: 11
 
+      # pnpm 11 requires Node >= 22.13 (it crashes on startup, `node:sqlite`
+      # not existing yet, under Node 20) — keep these two in lockstep.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
           cache-dependency-path: client/desktop/pnpm-lock.yaml
 

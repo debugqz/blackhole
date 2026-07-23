@@ -1,9 +1,17 @@
+# `version`/`edition`/`publish`/`license` are literal here (not
+# `.workspace = true`) rather than inherited from the root workspace, even
+# though they'd match it — `crates/bh-network/fuzz` declares its own
+# standalone `[workspace]` and path-depends on this crate, and Dependabot's
+# isolated per-manifest resolution for that fuzz workspace can't walk up to
+# the real repo-root workspace to satisfy the inheritance, failing with
+# "failed to find a workspace root". A regular `cargo build --workspace`
+# from the repo root is unaffected either way.
 [package]
 name = "bh-network"
-version.workspace = true
-edition.workspace = true
-publish.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 libp2p = { version = "0.56.0", features = [

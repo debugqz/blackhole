@@ -1,9 +1,14 @@
+# Literal, not `.workspace = true` — see the identical comment in
+# crates/bh-network/Cargo.toml: `crates/bh-crypto/fuzz` path-depends on
+# this crate from inside its own standalone `[workspace]`, and Dependabot's
+# isolated resolution of that fuzz workspace can't reach the real
+# repo-root workspace to satisfy the inheritance.
 [package]
 name = "bh-crypto"
-version.workspace = true
-edition.workspace = true
-publish.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 thiserror = { workspace = true }
