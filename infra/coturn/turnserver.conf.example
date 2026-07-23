@@ -1,0 +1,53 @@
+# coturn config for a Blackhole TURN relay — for the systemd/bare-metal
+# deployment path (../systemd/). The docker-compose path
+# (../docker-compose.yml) passes the same settings as CLI flags to the
+# official coturn/coturn image instead of using this file directly.
+#
+# This matches what crates/bh-calls/src/transport.rs's
+# default_ice_servers() actually supports today: ONE static long-term-
+# credential username/password pair via BLACKHOLE_TURN_USERNAME/
+# BLACKHOLE_TURN_CREDENTIAL, not coturn's time-limited REST/
+# use-auth-secret scheme. If you later want short-lived, per-session TURN
+# credentials (generally the better production posture — a leaked static
+# credential is leaked forever), that needs a matching code change in
+# default_ice_servers() first; don't just flip lt-cred-mech to
+# use-auth-secret below without that.
+#
+# Copy to /etc/turnserver.conf on the coturn host and fill in the
+# placeholders. See https://github.com/coturn/coturn/blob/master/docker/coturn/turnserver.conf
+# for the exhaustive upstream reference.
+
+listening-port=3478
+tls-listening-port=5349
+
+# Replace with the coturn host's real public IP — needed so relay
+# candidates handed to clients behind NAT are actually reachable.
+external-ip=203.0.113.10
+
+realm=turn.example.org
+server-name=turn.example.org
+
+# Long-term credential mechanism, one static user — see the module doc
+# above for why not use-auth-secret yet.
+lt-cred-mech
+user=blackhole:change-me-to-a-real-random-secret
+
+# Relay port range for actual media — open this whole range on the host
+# firewall (UDP) alongside 3478/tcp+udp and 5349/tcp+udp.
+min-port=49152
+max-port=65535
+
+# No TLS cert configured in this example — add cert/pkey lines (e.g. from
+# Let's Encrypt) if you want turns:// (TLS) reachability rather than only
+# plain turn://. Both can coexist.
+# cert=/etc/letsencrypt/live/turn.example.org/fullchain.pem
+# pkey=/etc/letsencrypt/live/turn.example.org/privkey.pem
+
+# Blackhole's threat model (docs/THREAT_MODEL.md §3.11) already assumes
+# call transport has no anonymity property of its own — TURN doesn't
+# change that either way. These just harden the relay operationally.
+no-cli
+no-tlsv1
+no-tlsv1_1
+fingerprint
+stale-nonce=600

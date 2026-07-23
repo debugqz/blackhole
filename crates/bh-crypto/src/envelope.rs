@@ -135,6 +135,51 @@ pub enum Envelope {
         timer_secs: Option<i64>,
     },
     Call(CallSignal),
+    /// Invites the recipient into an MLS group they were just added to
+    /// (`bh-api::groups::add_contact_to_live_group`'s real-network path) —
+    /// sent through the same already-established 1:1 X3DH/Double-Ratchet
+    /// session as any other Direct-conversation envelope, since adding
+    /// someone to a group presupposes they're already a contact
+    /// (`AddMemberRequest::contact_id`). Carries the raw MLS `Welcome` plus
+    /// the group's public ratchet tree — everything
+    /// `bh_crypto::mls::MlsMember::join_group` needs — and `group_id`/
+    /// `name` so the recipient can materialize the local `groups`/
+    /// `conversations` rows `create_group` would otherwise have written on
+    /// the inviter's side.
+    GroupInvite {
+        group_id: String,
+        name: Option<String>,
+        welcome: Vec<u8>,
+        ratchet_tree: Vec<u8>,
+        /// Mirrors the group's own `broadcast_only` flag (SPEC.md §16) so
+        /// the recipient's local `groups` row enforces the same
+        /// owner-only-posts restriction the inviter's does — see
+        /// `bh_storage::Database::insert_group_message`'s doc comment.
+        broadcast_only: bool,
+    },
+    /// One message pushed to a linked device's own mailbox during a real
+    /// `bh-api::device_sync` push (`sync_device`'s real-network path,
+    /// gated on the device having a real published identity — see that
+    /// module's doc comment). Reuses the same 1:1 X3DH/Double-Ratchet
+    /// mailbox pipeline `Direct` messages use, just addressed to the
+    /// device's own identity (`Device.public_key || Device.
+    /// identity_agreement_key`) instead of a contact's — a pseudo-`Contact`
+    /// built from that `Device` row is all `message_crypto::
+    /// send_encrypted_over_network` needs, so no new transport code exists
+    /// for this, only this envelope variant. `peer_contact_id` is who the
+    /// synced message's conversation is *with* (not necessarily who sent
+    /// it — `sender_contact_id` is `None` for a message the primary itself
+    /// sent), letting the receiving device materialize/reuse the right
+    /// local `Direct` conversation via `ensure_direct_conversation`. Scoped
+    /// to `Direct` conversations only for this pass — group/self-notes
+    /// sync over the real network is a follow-up.
+    DeviceSyncMessage {
+        message_id: String,
+        peer_contact_id: String,
+        sender_contact_id: Option<String>,
+        body: Option<String>,
+        sent_at: i64,
+    },
     /// Ephemeral "is typing…" presence ping (opt-in — see
     /// `bh-api::presence`). Carries no payload beyond the variant tag
     /// itself: there is nothing to persist, nothing to read back later,
@@ -277,6 +322,60 @@ mod tests {
             panic!("expected Call(Offer) variant");
         };
         assert_eq!(transport_description.len(), 200_000);
+    }
+
+    #[test]
+    fn group_invite_envelope_roundtrips() {
+        let env = Envelope::GroupInvite {
+            group_id: "abcd1234".into(),
+            name: Some("Friends".into()),
+            welcome: vec![1, 2, 3],
+            ratchet_tree: vec![4, 5, 6],
+            broadcast_only: true,
+        };
+        let bytes = env.encode().unwrap();
+        let Envelope::GroupInvite {
+            group_id,
+            name,
+            welcome,
+            ratchet_tree,
+            broadcast_only,
+        } = Envelope::decode(&bytes).unwrap()
+        else {
+            panic!("expected GroupInvite variant");
+        };
+        assert_eq!(group_id, "abcd1234");
+        assert_eq!(name, Some("Friends".to_string()));
+        assert_eq!(welcome, vec![1, 2, 3]);
+        assert_eq!(ratchet_tree, vec![4, 5, 6]);
+        assert!(broadcast_only);
+    }
+
+    #[test]
+    fn device_sync_message_envelope_roundtrips() {
+        let env = Envelope::DeviceSyncMessage {
+            message_id: "m1".into(),
+            peer_contact_id: "contact-a".into(),
+            sender_contact_id: Some("contact-a".into()),
+            body: Some("hi".into()),
+            sent_at: 1234,
+        };
+        let bytes = env.encode().unwrap();
+        let Envelope::DeviceSyncMessage {
+            message_id,
+            peer_contact_id,
+            sender_contact_id,
+            body,
+            sent_at,
+        } = Envelope::decode(&bytes).unwrap()
+        else {
+            panic!("expected DeviceSyncMessage variant");
+        };
+        assert_eq!(message_id, "m1");
+        assert_eq!(peer_contact_id, "contact-a");
+        assert_eq!(sender_contact_id, Some("contact-a".to_string()));
+        assert_eq!(body, Some("hi".to_string()));
+        assert_eq!(sent_at, 1234);
     }
 
     #[test]

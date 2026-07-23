@@ -18,7 +18,7 @@ use bh_api::state::ProfileSession;
 use bh_api::AppState;
 use bh_crypto::mls_storage::PersistentMlsProvider;
 use bh_storage::keystore::{DB_KEY_LABEL, MLS_DB_KEY_LABEL, PAYMENTS_DB_KEY_LABEL};
-use bh_storage::models::{Contact, Message};
+use bh_storage::models::{Contact, Device, DeviceOwner, Message};
 use bh_storage::profiles::ProfileManager;
 use bh_storage::{Database, PaymentsDatabase};
 use http_body_util::BodyExt;
@@ -799,6 +799,284 @@ async fn safety_number_and_invites_round_trip() {
         .unwrap();
     let validity = body_json(response).await;
     assert_eq!(validity["validity"], json!("use_limit_reached"));
+}
+
+/// Creating an ephemeral identity also creates its locally-generated
+/// shadow contact + Direct conversation (see `ephemeral_identity.rs`
+/// module doc), and both are reachable through the normal `GET
+/// /ephemeral-identities` listing and local storage.
+#[tokio::test]
+async fn ephemeral_identity_create_lists_and_has_shadow_conversation() {
+    use_mock_keychain();
+    let dir = test_dir("ephemeral-create");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-ephemeral-create");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let db = session.db.clone();
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/ephemeral-identities",
+            json!({"label": "Craigslist buyer", "ttl_days": 7}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created = body_json(response).await;
+    assert_eq!(created["label"], json!("Craigslist buyer"));
+    let id = created["id"].as_str().unwrap().to_string();
+    let conversation_id = created["conversation_id"].as_str().unwrap().to_string();
+    assert_eq!(created["public_signing_key"].as_str().unwrap().len(), 64);
+
+    // ttl_days: 0 is rejected.
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/ephemeral-identities",
+            json!({"label": null, "ttl_days": 0}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(get_request("/ephemeral-identities"))
+        .await
+        .unwrap();
+    let listed = body_json(response).await;
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], json!(id));
+
+    // The shadow contact + conversation are real local rows, not just
+    // response-body fiction.
+    let conversation = db.get_conversation(&conversation_id).unwrap().unwrap();
+    assert_eq!(
+        conversation.ephemeral_identity_id.as_deref(),
+        Some(id.as_str())
+    );
+    let contact_id = conversation.contact_id.unwrap();
+    assert!(db.get_contact(&contact_id).unwrap().is_some());
+}
+
+/// An invite issued from an ephemeral identity embeds *that* identity's
+/// public keys, not the profile's real one — the whole point of the
+/// feature.
+#[tokio::test]
+async fn ephemeral_identity_invite_embeds_its_own_keys_not_the_real_identity() {
+    use_mock_keychain();
+    let dir = test_dir("ephemeral-invite");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-ephemeral-invite");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(json_request("POST", "/identity", json!({})))
+        .await
+        .unwrap();
+    let real_identity = body_json(response).await;
+    let real_signing_key = real_identity["public_signing_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/ephemeral-identities",
+            json!({"label": null, "ttl_days": 1}),
+        ))
+        .await
+        .unwrap();
+    let created = body_json(response).await;
+    let ephemeral_id = created["id"].as_str().unwrap().to_string();
+    let ephemeral_signing_key = created["public_signing_key"].as_str().unwrap().to_string();
+    assert_ne!(real_signing_key, ephemeral_signing_key);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/invites",
+            json!({"display_name": "burner", "ephemeral_identity_id": ephemeral_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let invite = body_json(response).await;
+    let link = invite["link"].as_str().unwrap().to_string();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/invites/decode",
+            json!({"link": link}),
+        ))
+        .await
+        .unwrap();
+    let decoded = body_json(response).await;
+    assert_eq!(
+        decoded["identity_signing_key"],
+        json!(ephemeral_signing_key)
+    );
+    assert_ne!(decoded["identity_signing_key"], json!(real_signing_key));
+
+    // Issuing an invite against an unknown/already-wiped ephemeral
+    // identity is a 404, not a silent fall-through to the real identity.
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/invites",
+            json!({"display_name": "x", "ephemeral_identity_id": "does-not-exist"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Revoking an ephemeral identity is a real, irreversible wipe: the
+/// identity itself, its shadow contact, its conversation, and every
+/// message in it are all gone afterward, and it can no longer be used to
+/// issue an invite.
+#[tokio::test]
+async fn ephemeral_identity_revoke_wipes_everything() {
+    use_mock_keychain();
+    let dir = test_dir("ephemeral-revoke");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-ephemeral-revoke");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let db = session.db.clone();
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/ephemeral-identities",
+            json!({"label": null, "ttl_days": 1}),
+        ))
+        .await
+        .unwrap();
+    let created = body_json(response).await;
+    let id = created["id"].as_str().unwrap().to_string();
+    let conversation_id = created["conversation_id"].as_str().unwrap().to_string();
+    let contact_id = db
+        .get_conversation(&conversation_id)
+        .unwrap()
+        .unwrap()
+        .contact_id
+        .unwrap();
+
+    // Send into the shadow conversation (local-storage fallback — no
+    // network attached) so there's real message history to wipe.
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/conversations/{conversation_id}/messages"),
+            json!({"body": "hi there"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(db.list_messages(&conversation_id, 10).unwrap().len(), 1);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/ephemeral-identities/{id}/revoke"))
+                .header("authorization", auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Revoking an already-revoked/unknown id is a 404, not a silent OK.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/ephemeral-identities/{id}/revoke"))
+                .header("authorization", auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(get_request("/ephemeral-identities"))
+        .await
+        .unwrap();
+    assert!(body_json(response).await.as_array().unwrap().is_empty());
+
+    assert!(db.get_conversation(&conversation_id).unwrap().is_none());
+    assert!(db.list_messages(&conversation_id, 10).unwrap().is_empty());
+    assert!(db.get_contact(&contact_id).unwrap().is_none());
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/invites",
+            json!({"display_name": "x", "ephemeral_identity_id": id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// The ephemeral-identity sweeper `AppState` actually spawns
+/// (`state.rs`'s `restart_ephemeral_identity_sweeper`) wipes an identity
+/// once its real `expires_at` has passed, on a real (test-scaled) timer —
+/// not just the sweeper function in isolation (already covered
+/// deterministically in `bh_storage::ephemeral_identity`'s own tests).
+#[tokio::test]
+async fn ephemeral_identity_sweeper_wipes_on_expiry() {
+    use_mock_keychain();
+    let dir = test_dir("ephemeral-sweep");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-ephemeral-sweep");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let db = session.db.clone();
+    let state = Arc::new(AppState::with_expiry_sweep_interval(
+        manager,
+        session,
+        Duration::from_millis(20),
+    ));
+
+    db.create_ephemeral_identity(&bh_storage::models::EphemeralIdentity {
+        id: "e1".into(),
+        label: None,
+        identity_public_key: vec![1; 64],
+        identity_private_key: vec![2; 64],
+        shadow_contact_id: None,
+        conversation_id: "conv1".into(),
+        created_at: 0,
+        expires_at: 1, // already in the past by the time the sweeper first ticks
+    })
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(db.get_ephemeral_identity("e1").unwrap().is_none());
+    let _ = &state; // keep the sweeper's owning AppState alive for the sleep above
 }
 
 /// Full 4-step device-linking simulation (see `device_link.rs` module
@@ -3154,6 +3432,299 @@ async fn push_registration_defaults_off_and_rotates_on_enable() {
     assert_eq!(status["enabled"], json!(false));
 }
 
+/// A fresh profile has no dead man's switch configured, and the `GET`
+/// status reflects that (disabled, no deadline).
+#[tokio::test]
+async fn dead_mans_switch_defaults_to_disabled() {
+    use_mock_keychain();
+    let dir = test_dir("dms-defaults");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-dms-defaults");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    let response = app.oneshot(get_request("/dead-mans-switch")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = body_json(response).await;
+    assert_eq!(status["enabled"], json!(false));
+    assert_eq!(status["next_deadline_at"], Value::Null);
+}
+
+/// Activating, updating the cadence while still enabled, and deactivating
+/// all round-trip through the HTTP layer; a zero/missing cadence while
+/// enabling is rejected.
+#[tokio::test]
+async fn dead_mans_switch_activate_update_deactivate_round_trips() {
+    use_mock_keychain();
+    let dir = test_dir("dms-activate");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-dms-activate");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    // Missing cadence while enabling -> 400.
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/dead-mans-switch",
+            json!({"enabled": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Zero cadence -> 400.
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/dead-mans-switch",
+            json!({"enabled": true, "cadence_days": 0}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Activate with a real cadence.
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/dead-mans-switch",
+            json!({"enabled": true, "cadence_days": 7}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = body_json(response).await;
+    assert_eq!(status["enabled"], json!(true));
+    assert_eq!(status["cadence_days"], json!(7));
+
+    // Update cadence while still enabled.
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/dead-mans-switch",
+            json!({"enabled": true, "cadence_days": 3}),
+        ))
+        .await
+        .unwrap();
+    let status = body_json(response).await;
+    assert_eq!(status["cadence_days"], json!(3));
+
+    // Deactivate.
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/dead-mans-switch",
+            json!({"enabled": false}),
+        ))
+        .await
+        .unwrap();
+    let status = body_json(response).await;
+    assert_eq!(status["enabled"], json!(false));
+}
+
+/// The explicit "check in now" endpoint moves `last_check_in_at` forward.
+#[tokio::test]
+async fn dead_mans_switch_check_in_resets_deadline() {
+    use_mock_keychain();
+    let dir = test_dir("dms-checkin");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-dms-checkin");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let db = session.db.clone();
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    app.clone()
+        .oneshot(json_request(
+            "POST",
+            "/dead-mans-switch",
+            json!({"enabled": true, "cadence_days": 1}),
+        ))
+        .await
+        .unwrap();
+    // Force the recorded check-in far into the past so the explicit
+    // check-in below is unambiguously a forward move, not noise from two
+    // calls landing in the same wall-clock second.
+    db.record_dead_mans_switch_check_in(0).unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/dead-mans-switch/check-in",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = body_json(response).await;
+    assert!(status["last_check_in_at"].as_i64().unwrap() > 0);
+}
+
+/// Release-message entries add/list/remove through the HTTP layer, joined
+/// with the contact's display name; adding one for a nonexistent contact
+/// is rejected.
+#[tokio::test]
+async fn dead_mans_switch_release_entries_add_list_remove() {
+    use_mock_keychain();
+    let dir = test_dir("dms-releases");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-dms-releases");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let db = session.db.clone();
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    db.upsert_contact(&Contact {
+        contact_id: "c1".into(),
+        identity_public_key: vec![1],
+        display_name: Some("Alice".into()),
+        verified: false,
+        blocked: false,
+        added_at: 0,
+    })
+    .unwrap();
+
+    // Nonexistent contact -> 404.
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/dead-mans-switch/releases",
+            json!({"contact_id": "ghost", "body": "hi"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/dead-mans-switch/releases",
+            json!({"contact_id": "c1", "body": "if you're reading this..."}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created = body_json(response).await;
+    assert_eq!(created["contact_display_name"], json!("Alice"));
+    let id = created["id"].as_i64().unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(get_request("/dead-mans-switch/releases"))
+        .await
+        .unwrap();
+    let listed = body_json(response).await;
+    assert_eq!(listed["releases"].as_array().unwrap().len(), 1);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/dead-mans-switch/releases/{id}"))
+                .header("authorization", auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(get_request("/dead-mans-switch/releases"))
+        .await
+        .unwrap();
+    let listed = body_json(response).await;
+    assert!(listed["releases"].as_array().unwrap().is_empty());
+}
+
+/// The core sweeper logic, deterministically clock-driven (no real waiting
+/// on wall-clock days): a switch that's within its cadence never fires;
+/// once the cadence elapses, `checkin_tick` sends the configured release
+/// message through the real `Direct`-conversation send path (local-storage
+/// fallback here, since no network is attached) exactly once, and does not
+/// re-fire on a later tick.
+#[tokio::test]
+async fn dead_mans_switch_fires_once_via_local_fallback_then_does_not_refire() {
+    use_mock_keychain();
+    let dir = test_dir("dms-fire");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-dms-fire");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let db = session.db.clone();
+    // No `.with_network(..)` attached — exercises the local-storage-only
+    // fallback path in `conversations::send_message`.
+    let state = Arc::new(AppState::new(manager, session));
+
+    db.upsert_contact(&Contact {
+        contact_id: "c1".into(),
+        identity_public_key: vec![1],
+        display_name: Some("Alice".into()),
+        verified: false,
+        blocked: false,
+        added_at: 0,
+    })
+    .unwrap();
+    db.add_dead_mans_switch_release("c1", "if you're reading this...", 0)
+        .unwrap();
+    db.activate_dead_mans_switch(1, 0).unwrap(); // 1-day cadence, armed at t=0
+
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let read_now = {
+        let clock = clock.clone();
+        move || clock.load(std::sync::atomic::Ordering::SeqCst)
+    };
+
+    // Still within cadence: no fire.
+    bh_api::dead_mans_switch::checkin_tick(state.clone(), read_now.clone()).await;
+    assert!(db
+        .get_dead_mans_switch()
+        .unwrap()
+        .unwrap()
+        .triggered_at
+        .is_none());
+
+    // Past the 1-day cadence.
+    clock.store(2 * 86_400, std::sync::atomic::Ordering::SeqCst);
+    bh_api::dead_mans_switch::checkin_tick(state.clone(), read_now.clone()).await;
+
+    let config = db.get_dead_mans_switch().unwrap().unwrap();
+    assert!(config.triggered_at.is_some());
+
+    // The release message landed in the Direct conversation via the
+    // local-storage fallback (no network attached).
+    let conversation = db
+        .get_direct_conversation_for_contact("c1")
+        .unwrap()
+        .unwrap();
+    let messages = db.list_messages(&conversation.conversation_id, 10).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].body.as_deref(),
+        Some("if you're reading this...")
+    );
+
+    // A later tick, still due by cadence, must NOT re-fire.
+    clock.store(4 * 86_400, std::sync::atomic::Ordering::SeqCst);
+    bh_api::dead_mans_switch::checkin_tick(state.clone(), read_now).await;
+    let messages_after = db.list_messages(&conversation.conversation_id, 10).unwrap();
+    assert_eq!(
+        messages_after.len(),
+        1,
+        "must not re-fire without disable/re-enable"
+    );
+}
+
 /// A voice message reuses the exact same attachment upload endpoint as a
 /// regular file, distinguished only by `duration_secs`: it stores with no
 /// message body (like a sticker), round-trips byte-for-byte on download,
@@ -3836,6 +4407,237 @@ async fn direct_message_travels_a_real_network_between_two_daemons_and_decrypts(
     );
 }
 
+/// Wires `bh-push-relay` into the real send path end-to-end (SPEC.md §5.6,
+/// `bh-api::push`/`message_crypto::wake_recipient_best_effort`): B enables
+/// push against a genuine, separately-listening `RelayServer` instance —
+/// a real TCP connection, not `oneshot`, since the daemon calls out to it
+/// over real HTTP via `reqwest` — which actually registers the token with
+/// the relay and publishes a signed `PushRelayRecord` to the DHT before
+/// `POST /push/register` even returns. When A then sends B a real message
+/// over the network, A must fetch and verify that record and call
+/// `POST {relay_url}/wake/{token}` — observed here via `RelayState::
+/// was_woken`, the test-observability hook that method's own doc comment
+/// describes.
+#[tokio::test]
+async fn sending_a_message_wakes_the_recipients_real_push_relay() {
+    use_mock_keychain();
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay_listener.local_addr().unwrap();
+    let relay_state = Arc::new(bh_push_relay::RelayState::new());
+    let relay_router = bh_push_relay::RelayServer::router(relay_state.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            relay_listener,
+            relay_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let relay_url = format!("http://{relay_addr}");
+
+    let dir_a = test_dir("wake-network-a");
+    let manager_a = ProfileManager::new(&dir_a, "bh-api-smoke-wake-a");
+    let profile_a = manager_a.create_profile("A", 0).unwrap();
+    let session_a = open_profile_session(&manager_a, &profile_a.id, true);
+    let network_a = bh_network::supervised::SupervisedNetwork::spawn(
+        "/ip4/127.0.0.1/tcp/0",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let state_a = Arc::new(AppState::new(manager_a, session_a).with_network(network_a));
+    let app_a = ApiServer::router(state_a.clone());
+
+    let dir_b = test_dir("wake-network-b");
+    let manager_b = ProfileManager::new(&dir_b, "bh-api-smoke-wake-b");
+    let profile_b = manager_b.create_profile("B", 0).unwrap();
+    let session_b = open_profile_session(&manager_b, &profile_b.id, true);
+    let network_b = bh_network::supervised::SupervisedNetwork::spawn(
+        "/ip4/127.0.0.1/tcp/0",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let state_b = Arc::new(AppState::new(manager_b, session_b).with_network(network_b));
+    let app_b = ApiServer::router(state_b.clone());
+
+    let a_addr = state_a
+        .network
+        .as_ref()
+        .unwrap()
+        .listen_addrs()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .with_p2p(state_a.network.as_ref().unwrap().peer_id())
+        .unwrap();
+    state_b
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(a_addr)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let identity_a: Value = body_json(
+        app_a
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let identity_b: Value = body_json(
+        app_b
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let signing_a = identity_a["public_signing_key"].as_str().unwrap();
+    let agreement_a = identity_a["public_agreement_key"].as_str().unwrap();
+    let signing_b = identity_b["public_signing_key"].as_str().unwrap();
+    let agreement_b = identity_b["public_agreement_key"].as_str().unwrap();
+
+    bh_api::message_receive::spawn_receive_loop(state_b.clone(), Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // B enables push against the real relay above — retried, same
+    // freshly-dialed-DHT-needs-a-few-round-trips shortcut every other
+    // real-network test in this file already takes for its first
+    // `put_record`.
+    let mut token = None;
+    for attempt in 0..30 {
+        let response = app_b
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/push/register",
+                json!({"enabled": true, "relay_url": relay_url}),
+            ))
+            .await
+            .unwrap();
+        if response.status() == StatusCode::OK {
+            let body = body_json(response).await;
+            token = Some(body["token"].as_str().unwrap().to_string());
+            break;
+        }
+        assert!(
+            attempt < 29,
+            "enabling push over a live network never succeeded after retries"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let token = token.unwrap();
+    assert!(
+        relay_state.is_registered(&token),
+        "the real relay must actually have the token, not just the daemon's local record of it"
+    );
+
+    let response = app_a
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/contacts",
+            json!({
+                "contact_id": signing_b,
+                "identity_public_key": format!("{signing_b}{agreement_b}"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = app_b
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/contacts",
+            json!({
+                "contact_id": signing_a,
+                "identity_public_key": format!("{signing_a}{agreement_a}"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let conversation: Value = body_json(
+        app_a
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/conversations",
+                json!({"contact_id": signing_b}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let conversation_id = conversation["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert!(
+        !relay_state.was_woken(&token),
+        "the relay must not see a wake before A has sent anything"
+    );
+
+    // Each iteration sends one more real message (retried, same DHT-
+    // convergence shortcut as `direct_message_travels_a_real_network_
+    // between_two_daemons_and_decrypts`) and then polls for the wake —
+    // `wake_recipient_best_effort` is itself best-effort/non-retrying
+    // within a single send, so this outer loop absorbs a rare transient
+    // DHT-lookup miss on the recipient's `PushRelayRecord` the same way
+    // the inner loop absorbs one on the message's own mailbox push.
+    let mut woken = false;
+    for send_attempt in 0..3 {
+        let mut send_status = StatusCode::SERVICE_UNAVAILABLE;
+        for attempt in 0..30 {
+            let response = app_a
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/conversations/{conversation_id}/messages"),
+                    json!({"body": format!("wake up {send_attempt}")}),
+                ))
+                .await
+                .unwrap();
+            send_status = response.status();
+            if send_status == StatusCode::OK {
+                break;
+            }
+            assert!(attempt < 29, "send_message never succeeded after retries");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            send_status,
+            StatusCode::OK,
+            "send_message over a live network must succeed"
+        );
+
+        for _ in 0..30 {
+            if relay_state.was_woken(&token) {
+                woken = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if woken {
+            break;
+        }
+    }
+    assert!(
+        woken,
+        "A's send must have fetched B's real push-relay record and called the real relay's /wake/:token"
+    );
+}
+
 /// The capstone test for real network call signaling (`calls.rs`'s
 /// `send_call_signal`/`handle_incoming_call_signal`): the same two
 /// genuinely independent `SupervisedNetwork`/`AppState` pair the message
@@ -4061,6 +4863,296 @@ async fn call_signaling_travels_a_real_network_between_two_daemons_and_connects(
     );
 }
 
+/// The capstone test for real group wiring (`conversations.rs`'s `Group`
+/// send arm, `message_receive.rs`'s group-mailbox polling phase,
+/// `groups.rs`'s real-network `add_member` path, and
+/// `bh-network::key_package_directory`): three genuinely independent
+/// daemons — A, B, C, each its own `AppState`/`SupervisedNetwork`/database
+/// — end up in the same real MLS group and exchange a real fanned-out
+/// message, with no shared process state anywhere. A creates the group
+/// empty, then adds B and C one at a time via `POST /groups/:id/members`;
+/// each add fetches the real member's real, DHT-published MLS key package
+/// (not a locally-simulated "shadow" member — see `groups.rs` module doc),
+/// commits it, fans the commit out over the group's shared mailbox, and
+/// delivers the `Welcome` to that member over their existing 1:1 mailbox
+/// as a real `Envelope::GroupInvite`. B and C's own receive loops process
+/// that invite, genuinely `join_group` from it, and materialize their own
+/// local `groups`/`conversations` rows — proving membership itself
+/// travelled the network, not just messages. Finally A sends a group
+/// message; B and C's receive loops independently pull it from the same
+/// shared group mailbox (`Mailbox::fan_out`'s counterpart) and decrypt it
+/// with their own real MLS state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn group_membership_and_messages_travel_a_real_network_between_three_daemons() {
+    use_mock_keychain();
+
+    async fn spawn_daemon(name: &str) -> (axum::Router, Arc<AppState>) {
+        let dir = test_dir(&format!("e2e-group-network-{name}"));
+        let manager = ProfileManager::new(&dir, format!("bh-api-smoke-e2e-group-{name}"));
+        let profile = manager.create_profile(name, 0).unwrap();
+        let session = open_profile_session(&manager, &profile.id, true);
+        let network = bh_network::supervised::SupervisedNetwork::spawn(
+            "/ip4/127.0.0.1/tcp/0",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(manager, session).with_network(network));
+        let app = ApiServer::router(state.clone());
+        (app, state)
+    }
+
+    let (app_a, state_a) = spawn_daemon("a").await;
+    let (app_b, state_b) = spawn_daemon("b").await;
+    let (app_c, state_c) = spawn_daemon("c").await;
+
+    // B and C each dial A directly (same one-directional-dial shortcut the
+    // two-daemon tests above use) — a real deployment would use
+    // `BLACKHOLE_BOOTSTRAP_PEERS` (see `daemon/src/main.rs`) instead.
+    let a_addr = state_a
+        .network
+        .as_ref()
+        .unwrap()
+        .listen_addrs()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .with_p2p(state_a.network.as_ref().unwrap().peer_id())
+        .unwrap();
+    state_b
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(a_addr.clone())
+        .await
+        .unwrap();
+    state_c
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(a_addr)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let identity_a: Value = body_json(
+        app_a
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let identity_b: Value = body_json(
+        app_b
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let identity_c: Value = body_json(
+        app_c
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let signing_a = identity_a["public_signing_key"].as_str().unwrap();
+    let agreement_a = identity_a["public_agreement_key"].as_str().unwrap();
+    let signing_b = identity_b["public_signing_key"].as_str().unwrap();
+    let agreement_b = identity_b["public_agreement_key"].as_str().unwrap();
+    let signing_c = identity_c["public_signing_key"].as_str().unwrap();
+    let agreement_c = identity_c["public_agreement_key"].as_str().unwrap();
+
+    // All three receive loops running before anything else: each tick also
+    // (best-effort) publishes this identity's prekey bundle *and* MLS key
+    // package (`mls_key_package::publish_own_key_package_best_effort`) —
+    // B/C's key packages must be on the DHT before A's `add_member` calls
+    // below can fetch them for real.
+    bh_api::message_receive::spawn_receive_loop(state_a.clone(), Duration::from_millis(150));
+    bh_api::message_receive::spawn_receive_loop(state_b.clone(), Duration::from_millis(150));
+    bh_api::message_receive::spawn_receive_loop(state_c.clone(), Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A adds B and C as contacts; B and C each add A back — same
+    // bidirectional requirement `direct_message_travels_a_real_network_
+    // between_two_daemons_and_decrypts` documents (the receive side's
+    // `find_contact_by_signing_key` only delivers from *known* senders,
+    // and a `GroupInvite` travels the same 1:1 channel a text message
+    // would).
+    for (app, their_signing, their_agreement) in [
+        (&app_a, signing_b, agreement_b),
+        (&app_a, signing_c, agreement_c),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/contacts",
+                json!({
+                    "contact_id": their_signing,
+                    "identity_public_key": format!("{their_signing}{their_agreement}"),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    for app in [&app_b, &app_c] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/contacts",
+                json!({
+                    "contact_id": signing_a,
+                    "identity_public_key": format!("{signing_a}{agreement_a}"),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // A creates the group empty, then adds B and C one at a time — each
+    // add exercises a full real DHT key-package fetch + network round
+    // trip, so each gets its own retry loop (same DHT-convergence
+    // shortcut every other real-network test in this file takes).
+    let created: Value = body_json(
+        app_a
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/groups",
+                json!({"name": "Three Real Daemons", "member_contact_ids": []}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let group_id = created["group"]["group_id"].as_str().unwrap().to_string();
+
+    for member_signing in [signing_b, signing_c] {
+        let mut add_status = StatusCode::SERVICE_UNAVAILABLE;
+        for attempt in 0..30 {
+            let response = app_a
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/groups/{group_id}/members"),
+                    json!({"contact_id": member_signing}),
+                ))
+                .await
+                .unwrap();
+            add_status = response.status();
+            if add_status == StatusCode::OK {
+                break;
+            }
+            assert!(attempt < 29, "add_member never succeeded after retries");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            add_status,
+            StatusCode::OK,
+            "adding a real member over a live network must succeed"
+        );
+    }
+
+    // B and C must each materialize the group locally (a real `GroupInvite`
+    // processed, not a pre-existing/shared conversation) before either can
+    // be sent a message.
+    async fn wait_for_group_conversation(app: &axum::Router, group_id: &str) -> String {
+        for _ in 0..150 {
+            let conversations: Value = body_json(
+                app.clone()
+                    .oneshot(get_request("/conversations"))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if let Some(conv) = conversations
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["group_id"] == json!(group_id))
+            {
+                return conv["conversation_id"].as_str().unwrap().to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("group conversation never materialized from a real GroupInvite");
+    }
+    let b_conversation_id = wait_for_group_conversation(&app_b, &group_id).await;
+    let c_conversation_id = wait_for_group_conversation(&app_c, &group_id).await;
+
+    // A sends a real group message — real MLS ciphertext fanned out via
+    // `Mailbox::fan_out`, not a local-only write (`conversations.rs`'s
+    // `Group` arm).
+    let a_conversation_id = created["conversation"]["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut send_status = StatusCode::SERVICE_UNAVAILABLE;
+    for attempt in 0..30 {
+        let response = app_a
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/conversations/{a_conversation_id}/messages"),
+                json!({"body": "hello real group"}),
+            ))
+            .await
+            .unwrap();
+        send_status = response.status();
+        if send_status == StatusCode::OK {
+            break;
+        }
+        assert!(
+            attempt < 29,
+            "group send_message never succeeded after retries"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        send_status,
+        StatusCode::OK,
+        "sending a group message over a live network must succeed"
+    );
+
+    // Both B and C must independently pull it from the shared group
+    // mailbox and decrypt it with their own real MLS state, attributing it
+    // to A by contact id (`Group::decrypt_with_sender`'s sender identity,
+    // mapped back via `find_contact_by_identity_public_key`).
+    async fn wait_for_group_message(app: &axum::Router, conversation_id: &str) -> Value {
+        for _ in 0..150 {
+            let messages: Value = body_json(
+                app.clone()
+                    .oneshot(get_request(&format!(
+                        "/conversations/{conversation_id}/messages"
+                    )))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if let Some(msg) = messages.as_array().unwrap().first() {
+                return msg.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("real fanned-out group message never arrived within the poll window");
+    }
+    let b_message = wait_for_group_message(&app_b, &b_conversation_id).await;
+    let c_message = wait_for_group_message(&app_c, &c_conversation_id).await;
+
+    assert_eq!(b_message["body"], json!("hello real group"));
+    assert_eq!(b_message["sender_contact_id"], json!(signing_a));
+    assert_eq!(c_message["body"], json!("hello real group"));
+    assert_eq!(c_message["sender_contact_id"], json!(signing_a));
+}
+
 /// Verifies the "first event is otherwise always missed" fix
 /// (`CallRegistry::record_event`/`subscribe_with_current_state`,
 /// `call_stream.rs`'s `handle_socket`): a real WebSocket client that opens
@@ -4162,4 +5254,471 @@ async fn call_ws_replays_the_last_known_state_to_a_late_subscriber() {
     assert_eq!(event, json!({"type": "connected"}));
 
     ws.close(None).await.unwrap();
+}
+
+/// The capstone test for real device-sync wiring (`device_sync.rs`'s
+/// `sync_device_over_network`/`message_receive.rs`'s `Envelope::
+/// DeviceSyncMessage` handling): three genuinely independent daemons — A
+/// (the primary), C (a contact A has a real `Direct` conversation with),
+/// and D (A's linked device) — with no shared process state. A sends C a
+/// real message over the network, then `GET /devices/:id/sync` on A
+/// pushes that message to D's real mailbox (D's `Device` row on A is
+/// populated directly here rather than via a full `device_link.rs`
+/// ceremony — see `device_sync.rs`'s module doc on why that's an accepted
+/// scope split from real device *linking*, which is a separate pass). D's
+/// own receive loop — the exact same `message_receive.rs` machinery every
+/// other real-network test in this file already exercises, with one more
+/// `Envelope` arm — independently decrypts it and materializes it in its
+/// own local `Direct` conversation with C.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn device_sync_pushes_a_real_message_to_a_linked_device_over_the_network() {
+    use_mock_keychain();
+
+    async fn spawn_daemon(name: &str) -> (axum::Router, Arc<AppState>) {
+        let dir = test_dir(&format!("e2e-devsync-network-{name}"));
+        let manager = ProfileManager::new(&dir, format!("bh-api-smoke-e2e-devsync-{name}"));
+        let profile = manager.create_profile(name, 0).unwrap();
+        let session = open_profile_session(&manager, &profile.id, true);
+        let network = bh_network::supervised::SupervisedNetwork::spawn(
+            "/ip4/127.0.0.1/tcp/0",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(manager, session).with_network(network));
+        let app = ApiServer::router(state.clone());
+        (app, state)
+    }
+
+    let (app_a, state_a) = spawn_daemon("a").await;
+    let (app_c, state_c) = spawn_daemon("c").await;
+    let (app_d, state_d) = spawn_daemon("d").await;
+
+    let a_addr = state_a
+        .network
+        .as_ref()
+        .unwrap()
+        .listen_addrs()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .with_p2p(state_a.network.as_ref().unwrap().peer_id())
+        .unwrap();
+    state_c
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(a_addr.clone())
+        .await
+        .unwrap();
+    state_d
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(a_addr)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let identity_a: Value = body_json(
+        app_a
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let identity_c: Value = body_json(
+        app_c
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let identity_d: Value = body_json(
+        app_d
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let signing_a = identity_a["public_signing_key"].as_str().unwrap();
+    let agreement_a = identity_a["public_agreement_key"].as_str().unwrap();
+    let signing_c = identity_c["public_signing_key"].as_str().unwrap();
+    let agreement_c = identity_c["public_agreement_key"].as_str().unwrap();
+    let signing_d = identity_d["public_signing_key"].as_str().unwrap();
+    let agreement_d = identity_d["public_agreement_key"].as_str().unwrap();
+
+    bh_api::message_receive::spawn_receive_loop(state_a.clone(), Duration::from_millis(150));
+    bh_api::message_receive::spawn_receive_loop(state_c.clone(), Duration::from_millis(150));
+    bh_api::message_receive::spawn_receive_loop(state_d.clone(), Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A <-> C, real contacts (needed for the Direct message exchange).
+    for (app, their_signing, their_agreement) in [(&app_a, signing_c, agreement_c)] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/contacts",
+                json!({
+                    "contact_id": their_signing,
+                    "identity_public_key": format!("{their_signing}{their_agreement}"),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let response = app_c
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/contacts",
+            json!({
+                "contact_id": signing_a,
+                "identity_public_key": format!("{signing_a}{agreement_a}"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // D needs both A and C as contacts: A because it's the sender of the
+    // sync push, C because the synced message's conversation is with C
+    // (`ensure_direct_conversation` needs a real `contacts` row — see
+    // `deliver_synced_message`'s doc comment on why contact sync itself
+    // isn't attempted in this pass).
+    for (their_signing, their_agreement) in [(signing_a, agreement_a), (signing_c, agreement_c)] {
+        let response = app_d
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/contacts",
+                json!({
+                    "contact_id": their_signing,
+                    "identity_public_key": format!("{their_signing}{their_agreement}"),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // A sends C a real Direct message over the network — same
+    // DHT-convergence retry shortcut every other real-network test here
+    // takes.
+    let conversation: Value = body_json(
+        app_a
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/conversations",
+                json!({"contact_id": signing_c}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let conversation_id = conversation["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut send_status = StatusCode::SERVICE_UNAVAILABLE;
+    for attempt in 0..30 {
+        let response = app_a
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/conversations/{conversation_id}/messages"),
+                json!({"body": "hello, sync this to my other device"}),
+            ))
+            .await
+            .unwrap();
+        send_status = response.status();
+        if send_status == StatusCode::OK {
+            break;
+        }
+        assert!(attempt < 29, "send_message never succeeded after retries");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(send_status, StatusCode::OK);
+
+    // A registers D as a linked device directly in storage (see this
+    // test's own doc comment on why — real linking is a separate pass),
+    // with D's real, network-published identity.
+    let device_id = signing_d.to_string();
+    state_a
+        .db()
+        .upsert_device(&Device {
+            device_id: device_id.clone(),
+            owner: DeviceOwner::Own,
+            contact_id: None,
+            name: Some("D".to_string()),
+            public_key: hex::decode(signing_d).unwrap(),
+            identity_agreement_key: Some(hex::decode(agreement_d).unwrap()),
+            linked_at: 0,
+            last_seen_at: None,
+            revoked_at: None,
+        })
+        .unwrap();
+
+    // Push the sync — retried, same DHT-convergence shortcut as every
+    // other real-network operation in this file.
+    let mut sync_status = StatusCode::SERVICE_UNAVAILABLE;
+    let mut sync_body = Value::Null;
+    for attempt in 0..30 {
+        let response = app_a
+            .clone()
+            .oneshot(get_request(&format!("/devices/{device_id}/sync?limit=10")))
+            .await
+            .unwrap();
+        sync_status = response.status();
+        if sync_status == StatusCode::OK {
+            sync_body = body_json(response).await;
+            // Only a successful push (`ratchet_roundtrip_ok: true` — see
+            // that field's repurposed meaning on the real-network path)
+            // means the cursor actually advanced; a transient DHT-miss
+            // failure still returns `200` with an empty-or-unpushed entry
+            // and leaves the pending message queued for the next attempt.
+            if sync_body["synced"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty() && a[0]["ratchet_roundtrip_ok"] == json!(true))
+            {
+                break;
+            }
+        }
+        assert!(
+            attempt < 29,
+            "device sync push never succeeded after retries"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(sync_status, StatusCode::OK);
+    assert_eq!(sync_body["synced"][0]["ratchet_roundtrip_ok"], json!(true));
+
+    // D's own receive loop must independently decrypt the push and
+    // materialize it in its own local Direct conversation with C.
+    let mut found_body = None;
+    for _ in 0..150 {
+        let conversations: Value = body_json(
+            app_d
+                .clone()
+                .oneshot(get_request("/conversations"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if let Some(conv) = conversations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["contact_id"] == json!(signing_c))
+        {
+            let conv_id = conv["conversation_id"].as_str().unwrap();
+            let messages: Value = body_json(
+                app_d
+                    .clone()
+                    .oneshot(get_request(&format!("/conversations/{conv_id}/messages")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if let Some(msg) = messages.as_array().unwrap().first() {
+                found_body = msg["body"].as_str().map(str::to_string);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        found_body,
+        Some("hello, sync this to my other device".to_string()),
+        "D's receive loop must have decrypted and stored the real synced message"
+    );
+}
+
+/// The capstone test for real device-linking wiring
+/// (`device_link.rs`'s relay-backed `accept_link`/`finish_link`,
+/// `bh_network::device_link_relay`): two genuinely independent daemons —
+/// P (the primary, already has an identity) and N (a fresh "new device,"
+/// no identity of its own yet) — complete the real 4-step linking
+/// ceremony end to end with zero shared process state. N's `scan_link`
+/// publishes its request to the relay (keyed by P's real identity,
+/// decoded from the link P generated); P's `accept_link` fetches it from
+/// there (no ciphertext passed in the HTTP body), decrypts it for real,
+/// and publishes its response to the relay keyed by N's ephemeral linking
+/// key; N's `finish_link` fetches *that* from the relay and decrypts it,
+/// recovering P's real account identity. Confirms the recovered identity
+/// matches P's real, independently-fetched `GET /identity` — the
+/// strongest possible proof this traveled the real network rather than a
+/// same-process shortcut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn device_linking_completes_a_real_ceremony_between_two_daemons_over_the_network() {
+    use_mock_keychain();
+
+    async fn spawn_daemon(name: &str) -> (axum::Router, Arc<AppState>) {
+        let dir = test_dir(&format!("e2e-devlink-network-{name}"));
+        let manager = ProfileManager::new(&dir, format!("bh-api-smoke-e2e-devlink-{name}"));
+        let profile = manager.create_profile(name, 0).unwrap();
+        let session = open_profile_session(&manager, &profile.id, true);
+        let network = bh_network::supervised::SupervisedNetwork::spawn(
+            "/ip4/127.0.0.1/tcp/0",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(manager, session).with_network(network));
+        let app = ApiServer::router(state.clone());
+        (app, state)
+    }
+
+    let (app_p, state_p) = spawn_daemon("p").await;
+    let (app_n, state_n) = spawn_daemon("n").await;
+
+    let p_addr = state_p
+        .network
+        .as_ref()
+        .unwrap()
+        .listen_addrs()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .with_p2p(state_p.network.as_ref().unwrap().peer_id())
+        .unwrap();
+    state_n
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(p_addr)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Only P bootstraps an identity — N is a genuinely fresh install,
+    // exactly what a real "new device" is before linking.
+    let identity_p: Value = body_json(
+        app_p
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let signing_p = identity_p["public_signing_key"].as_str().unwrap();
+    let agreement_p = identity_p["public_agreement_key"].as_str().unwrap();
+
+    // P begins the ceremony.
+    let begin: Value = body_json(
+        app_p
+            .clone()
+            .oneshot(json_request("POST", "/devices/link/begin", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let session_id = begin["session_id"].as_str().unwrap().to_string();
+    let link = begin["link"].as_str().unwrap().to_string();
+
+    // N scans it — publishes its request to the relay (no shared state
+    // with P at all).
+    let scanned: Value = body_json(
+        app_n
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/devices/link/scan",
+                json!({"link": link}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let new_device_session_id = scanned["new_device_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // P accepts — fetching the request from the relay (empty body, no
+    // `provisioning_request_b64`), same DHT-convergence retry shortcut
+    // every other real-network test in this file takes.
+    let mut accept_status = StatusCode::SERVICE_UNAVAILABLE;
+    let mut accept_body = Value::Null;
+    for attempt in 0..30 {
+        let response = app_p
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/devices/link/{session_id}/accept"),
+                json!({"device_name": "N"}),
+            ))
+            .await
+            .unwrap();
+        accept_status = response.status();
+        if accept_status == StatusCode::OK {
+            accept_body = body_json(response).await;
+            break;
+        }
+        assert!(attempt < 29, "accept_link never succeeded after retries");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(accept_status, StatusCode::OK);
+    let device_id_on_p = accept_body["device"]["device_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // N finishes — fetching the response from the relay the same way.
+    let mut finish_status = StatusCode::SERVICE_UNAVAILABLE;
+    let mut finish_body = Value::Null;
+    for attempt in 0..30 {
+        let response = app_n
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/devices/link/{new_device_session_id}/finish"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        finish_status = response.status();
+        if finish_status == StatusCode::OK {
+            finish_body = body_json(response).await;
+            break;
+        }
+        assert!(attempt < 29, "finish_link never succeeded after retries");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(finish_status, StatusCode::OK);
+
+    assert_eq!(finish_body["confirmed"], json!(true));
+    assert_eq!(finish_body["linked_signing_key_hex"], json!(signing_p));
+    assert_eq!(finish_body["linked_agreement_key_hex"], json!(agreement_p));
+    // Both daemons must agree on the linked device's own identity: what N
+    // reports as its own signing key must be exactly what P recorded.
+    assert_eq!(finish_body["device_signing_key_hex"], json!(device_id_on_p));
+
+    // P's `devices` table has a real row with a real agreement key on
+    // record (not `None`), directly usable by `device_sync.rs`'s
+    // real-network path.
+    let devices: Value = body_json(
+        app_p
+            .clone()
+            .oneshot(get_request("/devices"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let device = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["device_id"] == json!(device_id_on_p))
+        .expect("linked device must be listed on P");
+    assert_eq!(device["public_key"], json!(device_id_on_p));
 }

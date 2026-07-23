@@ -3,46 +3,43 @@
 //! new messages sent/received on the primary device should become
 //! visible on it too.
 //!
-//! Same constraint as `device_link.rs` and the same simulation pattern as
-//! `groups.rs`'s shadow MLS members: there is exactly one daemon/one
-//! database in this repo today, no live `bh-network`, and no real second
-//! physical device to push anything to. So instead of faking "delivery"
-//! by just echoing rows back, this module exercises the **real** Signal
-//! Protocol crypto path for it: on first sync for a given device it runs
-//! a genuine X3DH handshake (`bh_crypto::ratchet::x3dh_initiate` /
-//! `x3dh_respond`) between the primary device's real `IdentityKeyPair`
-//! and a freshly-generated, locally-scoped "shadow" identity representing
-//! *that device's* ratchet endpoint (not its real `device_signing_key`
-//! from `device_link.rs` — same "throwaway identity keyed by the peer's
-//! id" trick `groups.rs::ensure_shadow_member` uses for contacts, not the
-//! peer's real key material). Every message a `GET /devices/:id/sync`
-//! call reports as synced is really encrypted with the primary side's
-//! `Session::encrypt` and really decrypted with the device side's
-//! `Session::decrypt` — `ratchet_roundtrip_ok` on each entry is a live
-//! proof of that, exactly like `groups::mls_self_test` proves the MLS
-//! path works rather than asserting it by fiat.
+//! **Real cross-process push now exists**, gated on both a live
+//! `state.network` and the target `Device` row having a real
+//! `identity_agreement_key` on record (`schema.rs`'s `SCHEMA_V18` —
+//! `None` for a device linked before that column existed, or one whose
+//! agreement key hasn't been established yet): [`sync_device`] builds a
+//! throwaway in-memory `Contact` from the `Device` row
+//! (`device.public_key || device.identity_agreement_key` is the same
+//! 64-byte layout `Contact.identity_public_key` already uses) and pushes
+//! each pending `Direct`-conversation message to it via
+//! `message_crypto::send_encrypted_over_network` — the *exact* same real
+//! X3DH/Double-Ratchet-over-mailbox pipeline `conversations::send_message`
+//! uses for `Direct` messages, just addressed to a device's identity
+//! instead of a contact's, wrapped in a new `Envelope::DeviceSyncMessage`
+//! variant. The receiving device needs no new receive-side plumbing at
+//! all: `message_receive.rs`'s existing dispatch already polls this
+//! identity's own mailbox and now has one more `Envelope` arm for it. This
+//! pass only syncs `Direct` conversations (`Group`/`SelfNotes` sync over
+//! the real network is a follow-up, matching `message_crypto.rs`'s own
+//! staged-scope precedent), and assumes the receiving device already
+//! knows the relevant contact (contact sync itself is a separate
+//! follow-up, not attempted here).
 //!
-//! Two deliberate, documented simplifications:
-//! - **No real second device/process.** The daemon plays both ends of
-//!   the ratchet session against the same `AppState`, same as every
-//!   other "shadow" simulation in this crate.
-//! - **The live ratchet `Session` pair is not persisted** — mirrors
-//!   `groups.rs`'s in-memory-only MLS state (its own module doc explains
-//!   why: real persistence needs a proper storage provider, a follow-up
-//!   not attempted here). `[DeviceSyncRegistry]` holds it only for the
-//!   daemon's process lifetime; a restart silently re-establishes a
-//!   fresh handshake on next use. What *does* survive a restart (schema
-//!   v7, `device_sync_cursor`, see `bh-storage/src/schema.rs`) is the
-//!   delivery cursor — which messages a device has already pulled — so a
-//!   restart never re-delivers history, even though the session proving
-//!   the crypto round-trip gets rebuilt from scratch.
-//!
-//! What this explicitly does **not** do: push anything to a real second
-//! process, or use `bh-network` at all. `GET /devices/:id/sync` is a
-//! pull the client polls (mirroring how the desktop client already polls
-//! `/conversations/:id/messages`) — real push delivery to a genuinely
-//! separate device is a follow-up gated on `bh-network` being wired into
-//! message send/receive (see CLAUDE.md's `daemon/` entry).
+//! **Falls back to the pre-existing local simulation** whenever there's
+//! no live network or the device has no agreement key on record: this
+//! daemon plays both ends of a Double Ratchet session against a
+//! locally-generated, throwaway "shadow" identity representing *that
+//! device's* ratchet endpoint (same "throwaway identity keyed by the
+//! peer's id" trick `groups.rs::ensure_shadow_member` uses for contacts,
+//! not the peer's real key material) — a real, if locally simulated,
+//! crypto round-trip (`ratchet_roundtrip_ok`), exactly like
+//! `groups::mls_self_test` proves the MLS path works rather than
+//! asserting it by fiat. The live ratchet `Session` pair for this shadow
+//! path is not persisted — mirrors `groups.rs`'s in-memory-only MLS
+//! state; `[DeviceSyncRegistry]` holds it only for the daemon's process
+//! lifetime. What *does* survive a restart either way (schema v7,
+//! `device_sync_cursor`) is the delivery cursor, so a restart never
+//! re-delivers history.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -51,8 +48,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use bh_crypto::envelope::Envelope;
 use bh_crypto::identity::IdentityKeyPair;
 use bh_crypto::ratchet::{self, PreKeyBundle, Session, SignedPreKey};
+use bh_storage::models::{Contact, ConversationKind};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
@@ -159,12 +158,16 @@ pub struct SyncedMessage {
     pub sender_contact_id: Option<String>,
     pub body: Option<String>,
     pub sent_at: i64,
-    /// Whether this message's plaintext really round-tripped through a
-    /// Double Ratchet encrypt (primary side) / decrypt (device side) —
-    /// see module doc. `false` would mean the shadow crypto path itself
-    /// is broken, not that the message failed to sync (a broken
-    /// round-trip still advances the cursor rather than the device
-    /// getting stuck forever on one bad message).
+    /// Shadow (local-simulation) path: whether this message's plaintext
+    /// really round-tripped through a Double Ratchet encrypt (primary
+    /// side) / decrypt (device side) — see module doc. `false` would mean
+    /// the shadow crypto path itself is broken, not that the message
+    /// failed to sync (a broken round-trip still advances the cursor
+    /// rather than the device getting stuck forever on one bad message).
+    /// Real-network path: whether this message was actually pushed to the
+    /// device's real mailbox (delivery/decryption is async from the
+    /// caller's point of view there, so this can't report a decrypt
+    /// result synchronously the way the shadow path does).
     pub ratchet_roundtrip_ok: bool,
 }
 
@@ -184,6 +187,136 @@ pub struct SyncQuery {
 
 fn default_limit() -> i64 {
     100
+}
+
+/// The real-network half of [`sync_device`] (see module doc): pushes each
+/// pending `Direct`-conversation message to `device`'s real mailbox
+/// instead of encrypting-and-immediately-decrypting in-process. Stops at
+/// the first push failure (rather than skipping it and continuing) so the
+/// cursor never advances past a message the device might not actually
+/// have received.
+async fn sync_device_over_network(
+    state: &AppState,
+    network: &bh_network::supervised::SupervisedNetwork,
+    device: &bh_storage::models::Device,
+    agreement_key: Vec<u8>,
+    limit: i64,
+) -> Result<Json<DeviceSyncResponse>, StatusCode> {
+    let pseudo_contact = Contact {
+        contact_id: device.device_id.clone(),
+        identity_public_key: [device.public_key.clone(), agreement_key].concat(),
+        display_name: device.name.as_deref().map(|n| format!("[device] {n}")),
+        verified: false,
+        blocked: false,
+        added_at: 0,
+    };
+    // `message_crypto::send_encrypted_over_network` persists the session
+    // it establishes via `sessions.contact_id`, which has a `NOT NULL
+    // REFERENCES contacts(contact_id)` foreign key — reusing that
+    // machinery for a device (rather than inventing a parallel per-device
+    // session store, a real follow-up the module doc for `message_crypto`
+    // already flags) means this pseudo-contact needs a real backing row.
+    // Idempotent: only inserted if missing, never overwrites a real
+    // contact that happens to share this id (impossible in practice —
+    // `device.device_id` is this device's own hex signing key, a disjoint
+    // namespace from any contact's).
+    if state
+        .db()
+        .get_contact(&pseudo_contact.contact_id)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        state
+            .db()
+            .upsert_contact(&pseudo_contact)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let (cursor_sent_at, cursor_message_id) = state
+        .db()
+        .get_device_sync_cursor(&device.device_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .unwrap_or((0, None));
+
+    let pending = state
+        .db()
+        .list_messages_since(cursor_sent_at, cursor_message_id.as_deref(), limit)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut synced = Vec::new();
+    let mut new_cursor = (cursor_sent_at, cursor_message_id);
+    for message in &pending {
+        // Only `Direct` conversations sync over the real network this pass
+        // — see module doc.
+        let Ok(Some(conversation)) = state.db().get_conversation(&message.conversation_id) else {
+            continue;
+        };
+        if conversation.kind != ConversationKind::Direct {
+            continue;
+        }
+        let Some(peer_contact_id) = conversation.contact_id.clone() else {
+            continue;
+        };
+
+        let envelope_bytes = Envelope::DeviceSyncMessage {
+            message_id: message.message_id.clone(),
+            peer_contact_id,
+            sender_contact_id: message.sender_contact_id.clone(),
+            body: message.body.clone(),
+            sent_at: message.sent_at,
+        }
+        .encode()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let pushed = match crate::message_crypto::send_encrypted_over_network(
+            state,
+            network,
+            &pseudo_contact,
+            &message.message_id,
+            &envelope_bytes,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(?err, "device sync: push to real mailbox failed");
+                false
+            }
+        };
+
+        synced.push(SyncedMessage {
+            message_id: message.message_id.clone(),
+            conversation_id: message.conversation_id.clone(),
+            sender_contact_id: message.sender_contact_id.clone(),
+            body: message.body.clone(),
+            sent_at: message.sent_at,
+            // Repurposed for the real path: whether this entry was
+            // actually pushed to the device's real mailbox (delivery
+            // itself is async from here, unlike the shadow path's
+            // synchronous decrypt-and-verify) — see this field's own doc
+            // comment.
+            ratchet_roundtrip_ok: pushed,
+        });
+        if !pushed {
+            break;
+        }
+        new_cursor = (message.sent_at, Some(message.message_id.clone()));
+    }
+
+    if let (sent_at, Some(message_id)) = &new_cursor {
+        state
+            .db()
+            .advance_device_sync_cursor(&device.device_id, *sent_at, message_id, now())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(DeviceSyncResponse {
+        device_id: device.device_id.clone(),
+        synced,
+        cursor_sent_at: new_cursor.0,
+        cursor_message_id: new_cursor.1,
+    }))
 }
 
 /// Pulls every message sent since this device's last sync, encrypting
@@ -206,6 +339,13 @@ pub async fn sync_device(
     }
     if device.revoked_at.is_some() {
         return Err(StatusCode::GONE);
+    }
+
+    if let (Some(network), Some(agreement_key)) =
+        (state.network.clone(), device.identity_agreement_key.clone())
+    {
+        return sync_device_over_network(&state, &network, &device, agreement_key, query.limit)
+            .await;
     }
 
     ensure_shadow_session(&state, &device_id)?;

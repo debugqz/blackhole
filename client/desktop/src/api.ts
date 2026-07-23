@@ -105,6 +105,16 @@ export interface CreateInviteResponse {
   expires_at: number | null;
 }
 
+export interface EphemeralIdentityView {
+  id: string;
+  label: string | null;
+  public_signing_key: string;
+  public_agreement_key: string;
+  created_at: number;
+  expires_at: number;
+  conversation_id: string;
+}
+
 export type MessageRequestStatus = "pending" | "accepted" | "declined";
 
 export interface MessageRequest {
@@ -400,6 +410,29 @@ export interface GroupCallStartedResponse {
   participant_tags: number[];
 }
 
+export interface NetworkCallSummary {
+  call_id: string;
+  contact_id: string;
+}
+
+// ---------------- dead man's switch ----------------
+
+export interface DeadMansSwitchStatus {
+  enabled: boolean;
+  cadence_days: number;
+  last_check_in_at: number;
+  next_deadline_at: number | null;
+  triggered_at: number | null;
+}
+
+export interface DeadMansSwitchReleaseView {
+  id: number;
+  contact_id: string;
+  contact_display_name: string | null;
+  body: string;
+  created_at: number;
+}
+
 export const api = {
   health: () => call<{ status: string; version: string }>("GET", "/health"),
 
@@ -448,7 +481,20 @@ export const api = {
     call<void>("POST", `/contacts/${encodeURIComponent(contactId)}/verify`, { verified }),
 
   decodeInvite: (link: string) => call<DecodedInvite>("POST", "/invites/decode", { link }),
-  createInvite: () => call<CreateInviteResponse>("POST", "/invites", {}),
+  createInvite: (ephemeralIdentityId?: string) =>
+    call<CreateInviteResponse>("POST", "/invites", {
+      ephemeral_identity_id: ephemeralIdentityId ?? null,
+    }),
+
+  // ---------------- ephemeral identities ----------------
+  listEphemeralIdentities: () => call<EphemeralIdentityView[]>("GET", "/ephemeral-identities"),
+  createEphemeralIdentity: (label: string | undefined, ttlDays: number) =>
+    call<EphemeralIdentityView>("POST", "/ephemeral-identities", {
+      label: label || null,
+      ttl_days: ttlDays,
+    }),
+  revokeEphemeralIdentity: (id: string) =>
+    call<void>("POST", `/ephemeral-identities/${encodeURIComponent(id)}/revoke`, {}),
   revokeInvite: (token: string) => call<void>("POST", `/invites/${encodeURIComponent(token)}/revoke`),
 
   blockContact: (contactId: string) => call<void>("POST", `/contacts/${encodeURIComponent(contactId)}/block`),
@@ -607,6 +653,25 @@ export const api = {
   setPushRegistration: (enabled: boolean) =>
     call<{ enabled: boolean; token?: string }>("POST", "/push/register", { enabled }),
 
+  // ---------------- dead man's switch ----------------
+  getDeadMansSwitch: () => call<DeadMansSwitchStatus>("GET", "/dead-mans-switch"),
+  setDeadMansSwitch: (enabled: boolean, cadenceDays?: number) =>
+    call<DeadMansSwitchStatus>("POST", "/dead-mans-switch", {
+      enabled,
+      cadence_days: cadenceDays ?? null,
+    }),
+  deadMansSwitchCheckIn: () =>
+    call<DeadMansSwitchStatus>("POST", "/dead-mans-switch/check-in", {}),
+  listDeadMansSwitchReleases: () =>
+    call<{ releases: DeadMansSwitchReleaseView[] }>("GET", "/dead-mans-switch/releases"),
+  addDeadMansSwitchRelease: (contactId: string, body: string) =>
+    call<DeadMansSwitchReleaseView>("POST", "/dead-mans-switch/releases", {
+      contact_id: contactId,
+      body,
+    }),
+  removeDeadMansSwitchRelease: (id: number) =>
+    call<void>("DELETE", `/dead-mans-switch/releases/${id}`),
+
   // ---------------- typing indicators (opt-in) ----------------
   getTypingIndicatorSetting: () =>
     call<{ enabled: boolean }>("GET", "/settings/typing-indicators"),
@@ -670,13 +735,23 @@ export const api = {
     call<void>("DELETE", `/attachments/${encodeURIComponent(contentHash)}`),
 
   // ---------------- calls (1:1, group, screen-share) ----------------
-  startCall: (callId: string, video: boolean) =>
-    call<CallSignalResponse>("POST", "/calls", { call_id: callId, video }),
+  // `contactId`, when present, routes the offer through the real X3DH/
+  // Double-Ratchet mailbox to that contact's daemon (`bh-api::calls::
+  // start_call`'s `contact_id` field) instead of the same-daemon demo
+  // path — see `main.ts`'s call-button handlers.
+  startCall: (callId: string, video: boolean, contactId?: string) =>
+    call<CallSignalResponse>("POST", "/calls", { call_id: callId, video, contact_id: contactId }),
   acceptCall: (offer: CallSignal) =>
     call<CallSignalResponse>("POST", "/calls/incoming", { offer }),
   completeCall: (callId: string, answer: CallSignal) =>
     call<void>("POST", `/calls/${encodeURIComponent(callId)}/complete`, { answer }),
   hangupCall: (callId: string) => call<void>("POST", `/calls/${encodeURIComponent(callId)}/hangup`),
+  // Polled for minimal "a real-network call just went live" visibility —
+  // see `main.ts`'s incoming-call banner. There's no "ringing, not yet
+  // answered" state to notify on (the daemon auto-accepts an incoming
+  // offer immediately), so this only ever reports calls that are already
+  // connected.
+  listNetworkCalls: () => call<NetworkCallSummary[]>("GET", "/calls/network"),
 
   startCamera: (callId: string, fps?: number) =>
     call<void>("POST", `/calls/${encodeURIComponent(callId)}/camera/start`, { fps }),

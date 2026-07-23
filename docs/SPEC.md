@@ -202,7 +202,7 @@ Implementadas sobre la base de v0.1, sin tocar ninguno de los no-negociables (§
 - **Llamadas de voz/video E2EE** (`bh-calls`, nuevo crate):
   - *Señalización y acuerdo de claves* (`bh_crypto::call_keys`, `bh_calls::signaling`): ECDH efímero por llamada + HKDF, independiente de las claves de sesión a largo plazo (forward secrecy específico de la llamada). El offer/answer/candidatos viaja como `Envelope::Call` dentro de la sesión cifrada existente — mismo principio que los recibos.
   - *Cifrado de medios* (`bh_crypto::call_keys::SframeContext`): capa SFrame (estilo draft-ietf-sframe) sobre el audio/video ya codificado, con ratcheting de época — una segunda capa de cifrado independiente de DTLS-SRTP, así que ni siquiera un relay/TURN comprometido puede ver el contenido.
-  - *Transporte* (`bh_calls::transport`): WebRTC real vía `webrtc-rs` (ICE/DTLS/SRTP) — sin STUN/TURN todavía (mismo estado que `bh-network`), validado con dos `RTCPeerConnection` locales reales en los tests.
+  - *Transporte* (`bh_calls::transport`): WebRTC real vía `webrtc-rs` (ICE/DTLS/SRTP) — STUN y TURN son configurables (`BLACKHOLE_STUN_SERVERS`/`BLACKHOLE_TURN_SERVERS`+`_USERNAME`+`_CREDENTIAL`, un STUN público por defecto), pero no hay servidor TURN desplegado para este proyecto (mismo estado que los nodos de bootstrap de `bh-network`), validado con dos `RTCPeerConnection` locales reales en los tests.
   - *Audio* (`bh_calls::audio`): Opus (`audiopus`, bindings sobre libopus) + captura/reproducción real con `cpal`. El roundtrip de codec está testeado con PCM sintético; captura/reproducción de hardware real no se ejercita en CI (sin micrófono/altavoces).
   - *Video* (`bh_calls::video`): captura de cámara (`nokhwa`) + codificación VP8 (`vpx-encode`, sobre libvpx). **Decodificación VP8 deliberadamente fuera de alcance**: no existe un crate Rust seguro de decodificación VP8, y escribir bindings FFI propios contra libvpx es exactamente el tipo de código no auditado que este proyecto evita escribir (mismo principio que §2.2, aplicado a códecs en vez de a criptografía) — se deja al cliente Tauri, que puede decodificar con las APIs nativas del webview.
   - Requiere en tiempo de compilación `opus`, `libvpx` y `pkg-config` del sistema (vía Homebrew/apt/etc.) — ver comentarios en `crates/bh-calls/Cargo.toml`.
@@ -283,16 +283,27 @@ correspondiente salvo donde se indica lo contrario.
   este es un componente de servidor nuevo, no una función del daemon
   local. Su único trabajo es reenviar un token opaco de "despertar" — sin
   contenido, sin identidad del remitente, sin id de conversación ni de
-  contacto. `POST /register` acepta el token; `POST /wake/:token` (que el
-  código de buzones del daemon llamaría una vez conectado — hoy un
-  `// TODO(real-push)` marcado explícitamente, no implementado) dispararía
+  contacto. `POST /register` acepta el token; `POST /wake/:token` dispara
   un push sin contenido hacia APNs/FCM/UnifiedPush, en sí mismo todavía un
-  stub. Sin base de datos, sin logging más allá de lo operacionalmente
-  necesario. El registro del lado del daemon
-  (`bh-storage::push`/`bh-api::push`) guarda solo un token opaco rotativo
-  + on/off — opt-in, apagado por defecto, ya que incluso un push opaco
-  tiene un costo de metadata ("algún cliente, más o menos ahora, quiere
-  despertar") que un usuario totalmente offline/manual no paga.
+  stub (`// TODO(real-push)`, necesita credenciales de plataforma que este
+  repo no puede provisionar). Sin base de datos, sin logging más allá de
+  lo operacionalmente necesario. El registro del lado del daemon
+  (`bh-storage::push`/`bh-api::push`) guarda un token opaco rotativo +
+  on/off + `relay_url` — opt-in, apagado por defecto, ya que incluso un
+  push opaco tiene un costo de metadata ("algún cliente, más o menos
+  ahora, quiere despertar") que un usuario totalmente offline/manual no
+  paga. **El wiring real ya está hecho**, no solo el registro local: al
+  activar push con un `relay_url` y una red viva, el daemon llama de
+  verdad al `POST /register` del relay y publica (firmado, contra la
+  misma `identity_public_key` ya confiada vía X3DH — evita que un nodo DHT
+  malicioso inyecte una `relay_url` atacante-controlada) un
+  `PushRelayRecord` en la DHT (`bh-network::push_relay_directory`); del
+  lado del envío, `bh-api::message_crypto::wake_recipient_best_effort`
+  llama de verdad a `POST {relay_url}/wake/{token}` justo después de que
+  un mensaje real llega al buzón del destinatario — ver CLAUDE.md para el
+  detalle completo. Sigue sin haber una instancia de `bh-push-relay`
+  desplegada para usuarios reales; eso queda para quien opere un nodo,
+  igual que los nodos de bootstrap del DHT o un servidor TURN.
 - **Mensajes de voz**: reutiliza exactamente el mismo camino de adjuntos
   con chunking y cifrado por chunk de §5.5/`bh-files` — la única
   diferencia es un `attachment_kind: voice` y una duración en segundos.

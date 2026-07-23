@@ -16,21 +16,23 @@ fn row_to_device(row: &rusqlite::Row) -> rusqlite::Result<Device> {
         linked_at: row.get(5)?,
         last_seen_at: row.get(6)?,
         revoked_at: row.get(7)?,
+        identity_agreement_key: row.get(8)?,
     })
 }
 
-const SELECT_COLUMNS: &str =
-    "device_id, owner, contact_id, name, public_key, linked_at, last_seen_at, revoked_at";
+const SELECT_COLUMNS: &str = "device_id, owner, contact_id, name, public_key, linked_at, \
+     last_seen_at, revoked_at, identity_agreement_key";
 
 impl Database {
     pub fn upsert_device(&self, device: &Device) -> Result<(), StorageError> {
         self.conn()?.execute(
-            "INSERT INTO devices (device_id, owner, contact_id, name, public_key, linked_at, last_seen_at, revoked_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO devices (device_id, owner, contact_id, name, public_key, linked_at, last_seen_at, revoked_at, identity_agreement_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(device_id) DO UPDATE SET
                 name = excluded.name,
                 last_seen_at = excluded.last_seen_at,
-                revoked_at = excluded.revoked_at",
+                revoked_at = excluded.revoked_at,
+                identity_agreement_key = excluded.identity_agreement_key",
             params![
                 device.device_id,
                 device.owner.as_str(),
@@ -40,7 +42,25 @@ impl Database {
                 device.linked_at,
                 device.last_seen_at,
                 device.revoked_at,
+                device.identity_agreement_key,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Records `device_id`'s own X25519 agreement key after the fact —
+    /// used when the device's real transport identity is established
+    /// separately from the initial `upsert_device` call (e.g. the linked
+    /// device publishing it once it comes online for the first time,
+    /// rather than the primary already knowing it at link time).
+    pub fn set_device_agreement_key(
+        &self,
+        device_id: &str,
+        agreement_key: &[u8],
+    ) -> Result<(), StorageError> {
+        self.conn()?.execute(
+            "UPDATE devices SET identity_agreement_key = ?1 WHERE device_id = ?2",
+            params![agreement_key, device_id],
         )?;
         Ok(())
     }

@@ -1,0 +1,38 @@
+
+# Bare-metal/VM alternative to infra/docker-compose.yml's push-relay
+# service. See ../README.md for the full walkthrough — this still needs a
+# TLS-terminating reverse proxy (nginx/Caddy) in front of it for a real
+# https:// relay_url; this unit only runs the plain HTTP relay itself.
+#
+# Install:
+#   cargo build --release --locked -p bh-push-relay
+#   sudo install -m 755 target/release/bh-push-relay /usr/local/bin/
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin blackhole-push-relay
+#   sudo cp infra/systemd/blackhole-push-relay.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now blackhole-push-relay
+
+[Unit]
+Description=Blackhole opaque push relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blackhole-push-relay
+Group=blackhole-push-relay
+Environment=BLACKHOLE_PUSH_RELAY_PORT=47900
+ExecStart=/usr/local/bin/bh-push-relay
+Restart=on-failure
+RestartSec=5
+
+# In-memory only by design (crates/bh-push-relay's own module doc) — no
+# state directory needed, so hardening can be tighter than the
+# bootstrap-node unit above.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

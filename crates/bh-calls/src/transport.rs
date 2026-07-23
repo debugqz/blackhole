@@ -5,10 +5,14 @@
 //! handed to (or read from) the RTP (de)packetizers here, so the payload
 //! stays confidential end-to-end even from a coerced/malicious relay.
 //!
-//! No STUN/TURN is wired in yet (mirrors `bh-network`'s current state —
-//! see `docs/SPEC.md`), so this only actually connects two peers who can
-//! reach each other directly (LAN, or same machine, as in this module's
-//! own tests) until that's added.
+//! STUN is wired in via [`default_ice_servers`] (a public server by
+//! default, configurable via `BLACKHOLE_STUN_SERVERS`). TURN is now
+//! configurable too, via `BLACKHOLE_TURN_SERVERS` (comma-separated
+//! `turn:`/`turns:` URLs) plus `BLACKHOLE_TURN_USERNAME`/
+//! `BLACKHOLE_TURN_CREDENTIAL` — but no TURN server is deployed for this
+//! project, so unless an operator sets all three, a symmetric NAT on
+//! either side still won't connect; STUN alone only resolves the more
+//! common NAT types.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -28,9 +32,73 @@ fn to_call_error(err: impl std::fmt::Display) -> CallError {
     CallError::Transport(err.to_string())
 }
 
+fn parse_url_list(env_var: &str) -> Vec<String> {
+    std::env::var(env_var)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Default ICE server list: `BLACKHOLE_STUN_SERVERS` (comma-separated
+/// `stun:host:port` URLs) if set, otherwise a single public STUN server
+/// (Google's, widely used as a default by other WebRTC apps — no account
+/// or credentials needed for STUN, unlike TURN). A second `RTCIceServer`
+/// entry for TURN is appended when `BLACKHOLE_TURN_SERVERS` (comma-
+/// separated `turn:`/`turns:` URLs) *and* both `BLACKHOLE_TURN_USERNAME`/
+/// `BLACKHOLE_TURN_CREDENTIAL` are set — all three are required together
+/// (a TURN entry with urls but no credentials would otherwise fail later,
+/// inside `webrtc-rs`'s own `RTCIceServer::validate()`, with a much less
+/// obvious error at connection time, so this checks it upfront and warns
+/// instead).
+pub fn default_ice_servers() -> Vec<webrtc::ice_transport::ice_server::RTCIceServer> {
+    use webrtc::ice_transport::ice_server::RTCIceServer;
+
+    let stun_urls = {
+        let urls = parse_url_list("BLACKHOLE_STUN_SERVERS");
+        if urls.is_empty() {
+            vec!["stun:stun.l.google.com:19302".to_owned()]
+        } else {
+            urls
+        }
+    };
+
+    let mut servers = vec![RTCIceServer {
+        urls: stun_urls,
+        ..Default::default()
+    }];
+
+    let turn_urls = parse_url_list("BLACKHOLE_TURN_SERVERS");
+    if !turn_urls.is_empty() {
+        let username = std::env::var("BLACKHOLE_TURN_USERNAME").unwrap_or_default();
+        let credential = std::env::var("BLACKHOLE_TURN_CREDENTIAL").unwrap_or_default();
+        if username.is_empty() || credential.is_empty() {
+            tracing::warn!(
+                "BLACKHOLE_TURN_SERVERS is set but BLACKHOLE_TURN_USERNAME/_CREDENTIAL are \
+                 missing — skipping TURN, calls will only work for NAT types STUN alone can \
+                 traverse"
+            );
+        } else {
+            servers.push(RTCIceServer {
+                urls: turn_urls,
+                username,
+                credential,
+            });
+        }
+    }
+
+    servers
+}
+
 /// Builds a fresh peer connection with Opus/VP8 (and the rest of
-/// webrtc-rs's default codec set) registered. `ice_servers` is empty by
-/// default (see module doc) — pass STUN/TURN URLs once that's wired up.
+/// webrtc-rs's default codec set) registered. Pass [`default_ice_servers`]
+/// for the normal STUN-enabled configuration, or an explicit list (e.g.
+/// `vec![]` in tests that only need same-machine loopback connectivity).
 pub async fn new_peer_connection(
     ice_servers: Vec<webrtc::ice_transport::ice_server::RTCIceServer>,
 ) -> Result<Arc<RTCPeerConnection>, CallError> {
@@ -181,6 +249,115 @@ mod tests {
 
     use crate::media_crypto::{FrameDecryptor, FrameEncryptor};
     use crate::signaling::{IncomingCall, OutgoingCall, CALLER_SENDER_TAG};
+
+    // `cargo test` runs tests in this file concurrently by default, and
+    // the tests below mutate the same process-wide `BLACKHOLE_STUN_SERVERS`/
+    // `BLACKHOLE_TURN_*` env vars — without this lock they race, causing
+    // sporadic failures unrelated to any test's actual logic (same
+    // reasoning `daemon_lifecycle.rs`'s own env-var tests rely on).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var(name).ok();
+            // SAFETY: every caller holds `ENV_LOCK` for the duration of the
+            // test that uses this guard.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => unsafe { std::env::set_var(self.name, v) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    #[test]
+    fn default_ice_servers_falls_back_to_a_public_stun_server_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("BLACKHOLE_STUN_SERVERS").ok();
+        // SAFETY: serialized against the other test in this module via
+        // `ENV_LOCK`, and the var is restored before returning.
+        unsafe { std::env::remove_var("BLACKHOLE_STUN_SERVERS") };
+        let servers = default_ice_servers();
+        match previous {
+            Some(v) => unsafe { std::env::set_var("BLACKHOLE_STUN_SERVERS", v) },
+            None => unsafe { std::env::remove_var("BLACKHOLE_STUN_SERVERS") },
+        }
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].urls, vec!["stun:stun.l.google.com:19302"]);
+    }
+
+    #[test]
+    fn default_ice_servers_honors_the_env_var_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("BLACKHOLE_STUN_SERVERS").ok();
+        unsafe {
+            std::env::set_var(
+                "BLACKHOLE_STUN_SERVERS",
+                " stun:a.example:3478 , stun:b.example:3478 ",
+            );
+        }
+        let servers = default_ice_servers();
+        match previous {
+            Some(v) => unsafe { std::env::set_var("BLACKHOLE_STUN_SERVERS", v) },
+            None => unsafe { std::env::remove_var("BLACKHOLE_STUN_SERVERS") },
+        }
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0].urls,
+            vec!["stun:a.example:3478", "stun:b.example:3478"]
+        );
+    }
+
+    #[test]
+    fn default_ice_servers_adds_no_turn_entry_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = EnvVarGuard::set("BLACKHOLE_STUN_SERVERS", "stun:stun.example:3478");
+        // SAFETY: serialized via `ENV_LOCK`.
+        unsafe { std::env::remove_var("BLACKHOLE_TURN_SERVERS") };
+        let servers = default_ice_servers();
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn default_ice_servers_adds_a_turn_entry_when_fully_configured() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _stun = EnvVarGuard::set("BLACKHOLE_STUN_SERVERS", "stun:stun.example:3478");
+        let _turn_urls = EnvVarGuard::set("BLACKHOLE_TURN_SERVERS", "turn:turn.example:3478");
+        let _turn_user = EnvVarGuard::set("BLACKHOLE_TURN_USERNAME", "alice");
+        let _turn_cred = EnvVarGuard::set("BLACKHOLE_TURN_CREDENTIAL", "s3cret");
+
+        let servers = default_ice_servers();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[1].urls, vec!["turn:turn.example:3478"]);
+        assert_eq!(servers[1].username, "alice");
+        assert_eq!(servers[1].credential, "s3cret");
+    }
+
+    #[test]
+    fn default_ice_servers_skips_turn_when_credentials_are_missing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _stun = EnvVarGuard::set("BLACKHOLE_STUN_SERVERS", "stun:stun.example:3478");
+        let _turn_urls = EnvVarGuard::set("BLACKHOLE_TURN_SERVERS", "turn:turn.example:3478");
+        // SAFETY: serialized via `ENV_LOCK`.
+        unsafe {
+            std::env::remove_var("BLACKHOLE_TURN_USERNAME");
+            std::env::remove_var("BLACKHOLE_TURN_CREDENTIAL");
+        }
+
+        let servers = default_ice_servers();
+        assert_eq!(servers.len(), 1);
+    }
 
     async fn wait_connected(pc: &Arc<RTCPeerConnection>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);

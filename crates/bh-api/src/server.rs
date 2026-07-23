@@ -10,10 +10,10 @@ use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::{
-    call_stream, calls, contacts, conversations, cosmetics, device_link, device_sync, export,
-    files, groups, identity, invites, local_auth, moderation, network, panic_wipe,
-    payment_requests, presence, profiles, push, reactions, receipts, safety_number, search,
-    security, stickers, ApiError, AppState,
+    call_stream, calls, contacts, conversations, cosmetics, dead_mans_switch, device_link,
+    device_sync, ephemeral_identity, export, files, groups, identity, invites, local_auth,
+    moderation, network, panic_wipe, payment_requests, presence, profiles, push, reactions,
+    receipts, safety_number, search, security, stickers, ApiError, AppState,
 };
 
 /// Rejects any request carrying a browser-set `Origin` header.
@@ -294,9 +294,34 @@ impl ApiServer {
                 "/push/register",
                 get(push::get_push_registration).post(push::set_push_registration),
             )
+            .route(
+                "/dead-mans-switch",
+                get(dead_mans_switch::get_status).post(dead_mans_switch::set_dead_mans_switch),
+            )
+            .route(
+                "/dead-mans-switch/check-in",
+                post(dead_mans_switch::check_in),
+            )
+            .route(
+                "/dead-mans-switch/releases",
+                get(dead_mans_switch::list_releases).post(dead_mans_switch::add_release),
+            )
+            .route(
+                "/dead-mans-switch/releases/:id",
+                delete(dead_mans_switch::remove_release),
+            )
+            .route(
+                "/ephemeral-identities",
+                get(ephemeral_identity::list).post(ephemeral_identity::create),
+            )
+            .route(
+                "/ephemeral-identities/:id/revoke",
+                post(ephemeral_identity::revoke),
+            )
             .route("/search", get(search::search_messages))
             .route("/calls", post(calls::start_call))
             .route("/calls/:call_id", get(calls::call_status))
+            .route("/calls/network", get(calls::list_network_calls))
             .route("/calls/incoming", post(calls::accept_call))
             .route("/calls/:call_id/complete", post(calls::complete_call))
             .route("/calls/:call_id/hangup", post(calls::hangup_call))

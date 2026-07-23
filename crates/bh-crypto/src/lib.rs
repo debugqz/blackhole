@@ -18,6 +18,7 @@ pub mod mls;
 pub mod mls_storage;
 pub mod payment_address;
 pub mod pq_hybrid;
+pub mod push_relay;
 pub mod qr;
 pub mod ratchet;
 pub mod safety_number;

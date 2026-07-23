@@ -27,6 +27,11 @@ base64 = "0.22"
 getrandom = "0.4"
 ed25519-dalek = "3"
 x25519-dalek = { version = "3", features = ["static_secrets", "getrandom"] }
+# Only HTTP client dependency in any daemon-side crate — used to call an
+# operator-configured `bh-push-relay` instance's `POST /register`/
+# `/wake/:token` (see push.rs/message_crypto.rs). `rustls-tls` avoids
+# pulling in a second TLS stack alongside libp2p's own.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Needed to name the concrete MlsMember<OpenMlsRustCrypto> the group registry
 # uses for shadow members (bh-crypto::mls::MlsMember is generic over the
@@ -43,3 +48,4 @@ http-body-util = "0.1"
 keyring = "3"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+bh-push-relay = { workspace = true }

@@ -526,7 +526,7 @@ impl PendingOutgoingCall {
         video: bool,
     ) -> Result<(Self, CallSignal), CallError> {
         let call_id = call_id.into();
-        let pc = transport::new_peer_connection(vec![]).await?;
+        let pc = transport::new_peer_connection(transport::default_ice_servers()).await?;
         let audio_track = transport::new_audio_track(&call_id);
         pc.add_track(audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
             .await
@@ -591,7 +591,7 @@ pub async fn accept_incoming_call(
     offer: &CallSignal,
 ) -> Result<(CallSession, bh_crypto::call_keys::SframeContext, CallSignal), CallError> {
     let incoming = IncomingCall::from_offer(offer)?;
-    let pc = transport::new_peer_connection(vec![]).await?;
+    let pc = transport::new_peer_connection(transport::default_ice_servers()).await?;
     let audio_track = transport::new_audio_track(&incoming.call_id);
     pc.add_track(audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
         .await

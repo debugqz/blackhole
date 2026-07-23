@@ -35,15 +35,15 @@ Concretely:
 | Kademlia DHT, node selection, Sybil/Eclipse resistance | ✅ Implemented, tested against local multi-node scenarios — **now with routing-table admission control per subnet** (max 4 peers per /24 IPv4 or /48 IPv6, THREAT_MODEL.md §3.5) |
 | Mailboxes (store-and-forward) + sealed sender | ✅ Implemented, tested — manifest race now closed (read-merge-write-verify retry + jittered backoff); PoW now enforced server-side |
 | Cover traffic, anti-spam PoW | ✅ Implemented, tested, **PoW now verified server-side by mailbox nodes** |
-| `bh-network` spawned by the daemon | ✅ Listening and supervised (auto-respawns on the live `yamux` CVE panic) — **now wired into Direct message send/receive**: `bh-api::message_crypto::send_encrypted_over_network` does real X3DH/Double Ratchet + mailbox push; `message_receive::spawn_receive_loop` polls/decrypts/delivers (**previously only exercised by this crate's own test — the real daemon binary never actually started it; `daemon/src/main.rs` now spawns it for real**); proven by a genuine two-daemon integration test (`bh-api/tests/api_smoke.rs::direct_message_travels_a_real_network_between_two_daemons_and_decrypts`). **Group conversations not wired yet** — MLS fan-out via `Mailbox::fan_out` is a separate follow-up. Real call signaling (`bh-api::calls`) now shares this same wiring — see the calls row below. |
+| `bh-network` spawned by the daemon | ✅ Listening and supervised (auto-respawns on the live `yamux` CVE panic), now with an optional `BLACKHOLE_BOOTSTRAP_PEERS` dial list (re-dialed after any respawn) — **wired into both Direct and Group message send/receive**: `bh-api::message_crypto::send_encrypted_over_network` does real X3DH/Double Ratchet + mailbox push for `Direct`; `groups.rs` does real MLS + `Mailbox::fan_out` for `Group`, including fetching a real member's real DHT-published MLS key package (`bh_network::key_package_directory`) before falling back to a locally-simulated one; `message_receive::spawn_receive_loop` polls/decrypts/delivers both. Proven by genuine multi-daemon integration tests (`bh-api/tests/api_smoke.rs::direct_message_travels_a_real_network_between_two_daemons_and_decrypts` and `::group_membership_and_messages_travel_a_real_network_between_three_daemons`). Real call signaling (`bh-api::calls`) shares the Direct wiring — see the calls row below. |
 | Local encrypted storage (SQLCipher), OS keystore, panic wipe | ✅ Implemented, tested — optional PIN layer in front of the DB key, **now also reachable via a WebAuthn passkey's PRF-derived secret** (hardware-backed, not TOTP — THREAT_MODEL.md §3.7) |
 | File chunking, per-chunk E2EE, resumable download | ✅ Implemented, tested — **attachments now swept by the disappearing-message timer** (expiry sweeper deletes orphaned chunk directories from disk, not just DB rows) |
 | Daemon localhost API (`bh-api`) | ✅ ~90 real endpoints across 28 modules, verified via live HTTP smoke tests + an in-process integration suite — **now with bearer-token auth** (`Authorization: Bearer <token>`, token in 0600 file, THREAT_MODEL.md §3.9) |
 | Desktop client (Tauri) | ✅ Real product UI ("Event Horizon") — see [Feature set](#feature-set) below for the full list — **now with full calls UI** (1:1 audio/video/screen-share, group audio, VP8 decode via WebCodecs, `Vp8CanvasRenderer` in `calls.ts`) |
-| Voice/video calls, 1:1 (`bh-calls`) | ✅ Real WebRTC + SFrame media encryption, tested — no STUN/TURN yet, **client UI now exists** (Tauri event bridge for `/calls/:call_id/ws`, `call_stream_bridge.rs`); **1:1 call signaling now travels over the real network too**: `POST /calls`'s optional `contact_id` pushes the offer through the same X3DH/Double-Ratchet mailbox `Direct` messages use (`Envelope::Call`, `bh-api::calls::send_call_signal`/`handle_incoming_call_signal`), the receiving daemon auto-answers, and hangup propagates back the same way — proven by a real two-daemon integration test; the desktop client doesn't pass `contact_id` yet, so its own call UI still only exercises the same-daemon demo path |
-| Group calls (full-mesh, MLS-exporter-keyed) | ✅ Implemented, tested — same STUN/TURN gap, **client UI now exists** (audio-only participant grid, `MAX_GROUP_CALL_PARTICIPANTS = 6`) |
-| Screen sharing (same VP8/SFrame pipeline as camera) | ✅ Implemented, tested — same STUN/TURN gap, **client UI now exists** (parallel "screen" track, same VP8 decode path) |
-| Device sync (keep a linked device's history current) | ✅ Real X3DH/Double Ratchet round-trip — peer is a locally-simulated shadow device, not a real second process yet |
+| Voice/video calls, 1:1 (`bh-calls`) | ✅ Real WebRTC + SFrame media encryption, tested — STUN now wired in (`default_ice_servers`, public server by default, `BLACKHOLE_STUN_SERVERS`-configurable; TURN still absent), **client UI now exists** (Tauri event bridge for `/calls/:call_id/ws`, `call_stream_bridge.rs`); **1:1 call signaling travels the real network, end to end including the client**: `POST /calls`'s optional `contact_id` pushes the offer through the same X3DH/Double-Ratchet mailbox `Direct` messages use (`Envelope::Call`, `bh-api::calls::send_call_signal`/`handle_incoming_call_signal`), the receiving daemon auto-answers, and hangup propagates back the same way — proven by a real two-daemon integration test; the desktop client's "Call"/"Video" buttons now pass the open conversation's real `contact_id`, with a minimal incoming-call banner (`GET /calls/network`) for calls it didn't place itself |
+| Group calls (full-mesh, MLS-exporter-keyed) | ✅ Implemented, tested — STUN now applies here too (same `default_ice_servers` every mesh edge uses), TURN still absent; **client UI now exists** (audio-only participant grid, `MAX_GROUP_CALL_PARTICIPANTS = 6`) — signaling itself is still same-daemon only, `bh-api::calls` doesn't route `GroupOffer`/`GroupAnswer` over the network yet |
+| Screen sharing (same VP8/SFrame pipeline as camera) | ✅ Implemented, tested — same STUN-yes/TURN-no state as calls above, **client UI now exists** (parallel "screen" track, same VP8 decode path) |
+| Device sync (keep a linked device's history current) | ✅ Real X3DH/Double Ratchet round-trip — **now pushes real `Direct` messages to a real second daemon's real mailbox** when the linked device has a real network identity on record, falling back to the same-daemon shadow simulation otherwise |
 | Cosmetics store, sticker packs | ✅ Implemented, tested — payment *confirmation* deliberately requires a real BTCPay webhook, not reachable from the client |
 | Opaque wake-push relay (`bh-push-relay`) | ✅ New, separate, internet-facing binary — real register/wake contract, tested; not yet wired to a real APNs/FCM/UnifiedPush backend or to the daemon's mailbox code |
 | Client-side link previews | ✅ Implemented — opt-in (off by default), deliberately bypasses the daemon entirely |
@@ -198,7 +198,7 @@ before group calls/screen sharing were added — see
 | Expiring / single-use invites | ✅ | `bh-crypto::invite`, `bh-storage::invites` |
 | Encrypted conversation export/import | ✅ | `bh-api::export` |
 | Multi-account profiles | ✅ | `bh-storage::profiles` |
-| Device linking (local simulation) | ✅ | `bh-api::device_link` |
+| Device linking (real over the network, falls back to local simulation) | ✅ | `bh-api::device_link`, `bh-network::device_link_relay` |
 | **Device sync** (keep a linked device's history current) | ✅ | `bh-api::device_sync` |
 | Passkey/TOTP local unlock | ✅ | `bh-api::local_auth` |
 | **Database lock via WebAuthn PRF** (gates daemon spawn, not just UI) | ✅ | `client/desktop/src-tauri/src/daemon_lifecycle.rs`, `prf_unlock.rs` |
@@ -764,12 +764,23 @@ cross-references stay stable). The genuinely still-**open** ones today:
     disappearing-message timer now, but uploads are still fully
     synchronous with nothing to resume without a live `bh-network` peer
     (§3.11).
-11. **Device linking and device sync are same-daemon simulations**, not
-    real cross-device/cross-process behavior yet (§3.11/§3.12).
-12. **`Group` conversations not wired to `bh-network`** — `Direct` messages
-    travel over the real P2P network (proven by a two-daemon integration
-    test), but MLS fan-out via `Mailbox::fan_out` hasn't been connected
-    yet (§17, `message_crypto.rs` module doc).
+11. **FIXED — device linking and device sync now travel the real
+    network** — both proven by genuine two-daemon integration tests with
+    no shared process state (`device_linking_completes_a_real_ceremony_
+    between_two_daemons_over_the_network`,
+    `device_sync_pushes_a_real_message_to_a_linked_device_over_the_
+    network`), falling back to the pre-existing same-daemon simulation
+    whenever there's no live network. Still deliberately out of scope: a
+    real linked device doesn't install the transferred account identity
+    as its own (would collide mailbox addressing with the primary — see
+    `device_link.rs`'s module doc) — general multi-device messaging
+    beyond sync pushes needs that resolved first, a real follow-up.
+12. **FIXED — `Group` conversations now wired to `bh-network`** — both
+    `Direct` and `Group` messages travel the real P2P network now (proven
+    by two-daemon and three-daemon integration tests respectively); real
+    membership travels the network too (real DHT-published MLS key
+    packages, real `GroupInvite` delivery), not just messages — see
+    `groups.rs`/`key_package_directory.rs`.
 
 Several other historically-tracked items are now **FIXED**: PQ hybrid is
 integrated into every live X3DH session (was #4 above), PoW is verified
@@ -809,7 +820,8 @@ brew install opus libvpx pkg-config
 
 On Linux, screen sharing's `scap` dependency additionally needs
 `libpipewire-0.3-dev`/`libdbus-1-dev` (its xdg-desktop-portal/PipeWire
-screencast backend) — see `.github/workflows/ci.yml` for the exact
+screencast backend), and audio capture's `cpal` dependency needs
+`libasound2-dev` (ALSA) — see `.github/workflows/ci.yml` for the exact
 `apt-get` line. macOS/Windows use native platform capture APIs and need
 nothing extra.
 
@@ -833,7 +845,13 @@ cargo build --workspace
 cargo test --workspace
 
 # run the daemon (binds 127.0.0.1:47853 by default,
-# override with BLACKHOLE_DAEMON_PORT)
+# override with BLACKHOLE_DAEMON_PORT). Two daemons only find each other on
+# the DHT if at least one dials the other — set BLACKHOLE_BOOTSTRAP_PEERS to
+# a comma-separated list of "/ip4/.../tcp/<port>/p2p/<PeerId>" multiaddrs
+# (read a running daemon's own address+peer id from GET /network/status) to
+# have this daemon dial them on startup and re-dial after any respawn. No
+# public bootstrap nodes are deployed for this project yet, so this is
+# unset/empty by default.
 cargo run -p bh-daemon
 
 # desktop client (in a separate terminal, daemon must be running)

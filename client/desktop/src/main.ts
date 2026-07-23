@@ -7,6 +7,7 @@ import {
   type FileMetaPublic,
   type GroupDTO,
   type Message,
+  type NetworkCallSummary,
   type PaymentAsset,
   type PaymentRequestView,
   type ProfileMeta,
@@ -574,16 +575,23 @@ async function openConversation(conversationId: string) {
 }
 
 // ---------------- calls ----------------
-// No real signaling delivery is wired between two separate devices yet
-// (calls.rs's module doc: a client gets a real offer/answer/SFrame call
-// session out of the API, but is responsible for ferrying the signal JSON
-// to the other party itself, over a channel that doesn't exist here). So,
-// like the existing "device linking (local simulation, labeled as such in
-// the UI)" and groups' locally-generated "shadow" MLS members, every call
-// this UI starts plays both the caller and callee role against this same
-// daemon — a real WebRTC connection, real media capture/encode, and real
-// SFrame end-to-end encryption, just between two sessions on one machine
-// instead of two separate ones.
+// 1:1 calls (`call-audio`/`call-video`) now pass the open conversation's
+// real `contact_id` to `POST /calls`, which routes the offer over the real
+// X3DH/Double-Ratchet mailbox the same way `Direct` chat messages do
+// (`bh-api::calls::start_call`/`handle_incoming_call_signal`) — a real
+// WebRTC connection, real media capture/encode, and real SFrame end-to-end
+// encryption, genuinely between two separate daemons/devices when both are
+// reachable on the network. There is still no unprompted "incoming call"
+// UI on the callee side — the daemon auto-answers server-side the moment
+// an `Offer` arrives, so a real callee's own client only becomes aware of
+// the call once its media starts flowing, not before. Falls back to the
+// old same-daemon demo path (this client plays both caller and callee
+// roles) whenever the open conversation has no resolved `contact_id` (e.g.
+// "Notes to self") — same fallback shape as `conversations::send_message`'s
+// `Direct` arm already uses when no live network is attached. Group calls
+// (`call-group`) are unchanged and still same-daemon-only: `bh-api::calls`
+// deliberately doesn't route `GroupOffer`/`GroupAnswer` over the network
+// yet (see that module's own doc comment).
 
 function setCallStatus(text: string) {
   $<HTMLParagraphElement>("call-status").textContent = text;
@@ -687,14 +695,74 @@ async function attachCallStream(callId: string) {
   });
 }
 
-async function startTestCall(video: boolean) {
-  const callId = crypto.randomUUID();
-  openCallOverlay(video ? "Video call (local test)" : "Call (local test)", false);
+// Minimal visibility for a real-network call this client didn't place
+// itself (`GET /calls/network`, `bh-api::calls::list_network_calls`) —
+// there's no "ringing, not yet answered" state to notify on, since the
+// daemon auto-accepts an incoming `Offer` immediately, so this only ever
+// surfaces calls that are already connected (a banner + a way to attach to
+// the stream), not a full pre-accept ringing UI.
+const seenNetworkCallIds = new Set<string>();
+
+function showIncomingCallBanner(summary: NetworkCallSummary) {
+  const name = contactsById.get(summary.contact_id)?.display_name || "Someone";
+  const banner = $<HTMLDivElement>("incoming-call-banner");
+  $<HTMLSpanElement>("incoming-call-banner-text").textContent = `Call with ${name}`;
+  banner.hidden = false;
+
+  const joinBtn = $<HTMLButtonElement>("incoming-call-banner-join");
+  const dismissBtn = $<HTMLButtonElement>("incoming-call-banner-dismiss");
+  const cleanup = () => {
+    banner.hidden = true;
+    joinBtn.removeEventListener("click", onJoin);
+    dismissBtn.removeEventListener("click", onDismiss);
+  };
+  const onJoin = () => {
+    cleanup();
+    openCallOverlay(`Call with ${name}`, false);
+    void attachCallStream(summary.call_id);
+  };
+  const onDismiss = () => cleanup();
+  joinBtn.addEventListener("click", onJoin);
+  dismissBtn.addEventListener("click", onDismiss);
+}
+
+async function pollIncomingNetworkCalls() {
+  let calls: NetworkCallSummary[];
   try {
-    const offer = await api.startCall(callId, video);
-    const answer = await api.acceptCall(offer.signal);
-    await api.completeCall(callId, answer.signal);
-    await attachCallStream(callId);
+    calls = await api.listNetworkCalls();
+  } catch {
+    return; // best-effort — daemon not reachable yet, or a transient error
+  }
+  for (const summary of calls) {
+    if (summary.call_id === activeCallId || seenNetworkCallIds.has(summary.call_id)) continue;
+    seenNetworkCallIds.add(summary.call_id);
+    showIncomingCallBanner(summary);
+  }
+}
+
+async function startCall(video: boolean) {
+  const callId = crypto.randomUUID();
+  // This client placed the call itself — never show it its own incoming-
+  // call banner once `pollIncomingNetworkCalls` sees it in the same list.
+  seenNetworkCallIds.add(callId);
+  const contactId = currentConversation()?.contact_id ?? undefined;
+  openCallOverlay(video ? "Video call" : "Call", false);
+  try {
+    const offer = await api.startCall(callId, video, contactId);
+    if (contactId) {
+      // Real network call: `bh-api::calls::start_call` already pushed the
+      // offer through the contact's mailbox, and their daemon auto-answers
+      // on its own — nothing left to do here but attach to this call's
+      // stream and wait for a "connected" event (`handleCallEvent`).
+      await attachCallStream(callId);
+    } else {
+      // No contact in scope for the open conversation (e.g. "Notes to
+      // self", or a conversation with no resolved contact) — fall back to
+      // the same-daemon demo path this UI has always used.
+      const answer = await api.acceptCall(offer.signal);
+      await api.completeCall(callId, answer.signal);
+      await attachCallStream(callId);
+    }
   } catch (err) {
     setCallStatus(`Failed to start call: ${errorMessage(err)}`);
   }
@@ -714,8 +782,8 @@ async function startTestGroupCall() {
   }
 }
 
-$<HTMLButtonElement>("call-audio").addEventListener("click", () => void startTestCall(false));
-$<HTMLButtonElement>("call-video").addEventListener("click", () => void startTestCall(true));
+$<HTMLButtonElement>("call-audio").addEventListener("click", () => void startCall(false));
+$<HTMLButtonElement>("call-video").addEventListener("click", () => void startCall(true));
 $<HTMLButtonElement>("call-group").addEventListener("click", () => void startTestGroupCall());
 $<HTMLButtonElement>("close-call").addEventListener("click", () => void hangupActiveCall());
 $<HTMLButtonElement>("call-hangup").addEventListener("click", () => void hangupActiveCall());
@@ -1861,6 +1929,12 @@ $<HTMLButtonElement>("open-security").addEventListener("click", async () => {
     // Leave the checkbox at its last known state rather than blocking the
     // rest of the security overlay on this.
   }
+  try {
+    await refreshDeadMansSwitchStatus();
+    await refreshDeadMansSwitchReleases();
+  } catch {
+    // Leave the panel at its last known state.
+  }
   await Promise.all([renderDevicesList(), renderLocalAuthStatus()]);
 });
 $<HTMLInputElement>("typing-indicator-toggle").addEventListener("change", async (event) => {
@@ -1883,6 +1957,139 @@ $<HTMLInputElement>("push-toggle").addEventListener("change", async (event) => {
 });
 $<HTMLButtonElement>("close-security").addEventListener("click", () => {
   $<HTMLDivElement>("screen-security").hidden = true;
+});
+
+// ---------------- dead man's switch ----------------
+function formatDmsTimestamp(secs: number | null): string {
+  return secs === null ? "—" : new Date(secs * 1000).toLocaleString();
+}
+
+async function refreshDeadMansSwitchStatus() {
+  const status = await api.getDeadMansSwitch();
+  $<HTMLInputElement>("dms-toggle").checked = status.enabled;
+  $<HTMLInputElement>("dms-cadence").value = String(status.cadence_days || 30);
+  $<HTMLElement>("dms-last-checkin").textContent = formatDmsTimestamp(
+    status.last_check_in_at || null,
+  );
+  $<HTMLElement>("dms-deadline").textContent = formatDmsTimestamp(status.next_deadline_at);
+  $<HTMLParagraphElement>("dms-triggered-note").hidden = status.triggered_at === null;
+}
+
+async function refreshDeadMansSwitchReleases() {
+  const { releases } = await api.listDeadMansSwitchReleases();
+  const list = $<HTMLDivElement>("dms-release-list");
+  list.replaceChildren();
+  const select = $<HTMLSelectElement>("dms-add-contact");
+  select.replaceChildren();
+  for (const contact of contacts) {
+    const option = el("option", undefined, contact.display_name || contact.contact_id);
+    option.value = contact.contact_id;
+    select.append(option);
+  }
+  if (releases.length === 0) {
+    list.append(el("div", "empty-note", "No release messages configured."));
+    return;
+  }
+  for (const release of releases) {
+    const row = el("div", "device-row");
+    const info = el("div");
+    info.append(el("div", "name", release.contact_display_name || release.contact_id));
+    info.append(el("div", "meta mono", release.body));
+    row.append(info);
+    const removeBtn = el("button", "chip-btn", "Remove");
+    removeBtn.type = "button";
+    removeBtn.addEventListener("click", async () => {
+      try {
+        await api.removeDeadMansSwitchRelease(release.id);
+        await refreshDeadMansSwitchReleases();
+      } catch (err) {
+        window.alert(errorMessage(err));
+      }
+    });
+    row.append(removeBtn);
+    list.append(row);
+  }
+}
+
+$<HTMLInputElement>("dms-toggle").addEventListener("change", async (event) => {
+  const checkbox = event.target as HTMLInputElement;
+  const statusEl = $<HTMLParagraphElement>("dms-status");
+  if (checkbox.checked) {
+    const confirmed = window.confirm(
+      "If you don't check in for the configured number of days, Blackhole " +
+        "will automatically send your predefined release messages to their " +
+        "contacts. Make sure you've added at least one release message " +
+        "before relying on this. Continue?",
+    );
+    if (!confirmed) {
+      checkbox.checked = false;
+      return;
+    }
+  }
+  const cadence = parseInt($<HTMLInputElement>("dms-cadence").value, 10) || 30;
+  try {
+    await api.setDeadMansSwitch(checkbox.checked, checkbox.checked ? cadence : undefined);
+    statusEl.textContent = "";
+    await refreshDeadMansSwitchStatus();
+  } catch (err) {
+    checkbox.checked = !checkbox.checked;
+    statusEl.textContent = errorMessage(err);
+  }
+});
+
+$<HTMLInputElement>("dms-cadence").addEventListener("change", async (event) => {
+  const input = event.target as HTMLInputElement;
+  if (!$<HTMLInputElement>("dms-toggle").checked) return; // cadence only meaningful while enabled
+  const cadence = parseInt(input.value, 10);
+  const statusEl = $<HTMLParagraphElement>("dms-status");
+  if (!cadence || cadence < 1) {
+    statusEl.textContent = "Cadence must be at least 1 day.";
+    return;
+  }
+  try {
+    await api.setDeadMansSwitch(true, cadence);
+    statusEl.textContent = "";
+    await refreshDeadMansSwitchStatus();
+  } catch (err) {
+    statusEl.textContent = errorMessage(err);
+  }
+});
+
+$<HTMLButtonElement>("dms-checkin-now").addEventListener("click", async () => {
+  const statusEl = $<HTMLParagraphElement>("dms-status");
+  try {
+    await api.deadMansSwitchCheckIn();
+    statusEl.textContent = "Checked in.";
+    await refreshDeadMansSwitchStatus();
+  } catch (err) {
+    statusEl.textContent = errorMessage(err);
+  }
+});
+
+$<HTMLButtonElement>("dms-add-release").addEventListener("click", async () => {
+  const errorBox = $<HTMLParagraphElement>("dms-release-error");
+  errorBox.hidden = true;
+  errorBox.textContent = "";
+  const contactId = $<HTMLSelectElement>("dms-add-contact").value;
+  const body = $<HTMLTextAreaElement>("dms-add-body").value.trim();
+  if (!contactId) {
+    errorBox.hidden = false;
+    errorBox.textContent = "Add a contact first.";
+    return;
+  }
+  if (!body) {
+    errorBox.hidden = false;
+    errorBox.textContent = "Enter a message body.";
+    return;
+  }
+  try {
+    await api.addDeadMansSwitchRelease(contactId, body);
+    $<HTMLTextAreaElement>("dms-add-body").value = "";
+    await refreshDeadMansSwitchReleases();
+  } catch (err) {
+    errorBox.hidden = false;
+    errorBox.textContent = errorMessage(err);
+  }
 });
 
 $<HTMLButtonElement>("panic-wipe").addEventListener("click", async () => {
@@ -2054,11 +2261,16 @@ $<HTMLButtonElement>("create-profile").addEventListener("click", async (event) =
 });
 
 // ---------------- add contact overlay ----------------
-$<HTMLButtonElement>("add-contact").addEventListener("click", () => {
+$<HTMLButtonElement>("add-contact").addEventListener("click", async () => {
   $<HTMLDivElement>("screen-add-contact").hidden = false;
   $<HTMLTextAreaElement>("invite-input").value = "";
   $<HTMLDivElement>("invite-preview").hidden = true;
   $<HTMLDivElement>("invite-created").hidden = true;
+  try {
+    await refreshEphemeralIdentities();
+  } catch {
+    // Leave the list/select at their last known state.
+  }
 });
 $<HTMLButtonElement>("close-add-contact").addEventListener("click", () => {
   $<HTMLDivElement>("screen-add-contact").hidden = true;
@@ -2131,7 +2343,8 @@ $<HTMLButtonElement>("invite-create").addEventListener("click", async (event) =>
   created.hidden = false;
   created.replaceChildren(el("div", "row", "Generating…"));
   try {
-    const invite = await api.createInvite();
+    const identityId = $<HTMLSelectElement>("invite-identity-select").value || undefined;
+    const invite = await api.createInvite(identityId);
     created.replaceChildren();
 
     const linkRow = el("div", "row");
@@ -2166,6 +2379,88 @@ $<HTMLButtonElement>("invite-create").addEventListener("click", async (event) =>
     created.append(actions);
   } catch (err) {
     created.replaceChildren(el("div", "error-text", errorMessage(err)));
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// ---------------- ephemeral identities ----------------
+async function refreshEphemeralIdentities() {
+  const identities = await api.listEphemeralIdentities();
+
+  const select = $<HTMLSelectElement>("invite-identity-select");
+  const previousValue = select.value;
+  select.replaceChildren();
+  const realOption = el("option", undefined, "My real identity");
+  realOption.value = "";
+  select.append(realOption);
+  for (const identity of identities) {
+    const option = el(
+      "option",
+      undefined,
+      identity.label ? `${identity.label} (expires ${formatEphemeralExpiry(identity.expires_at)})` : `Ephemeral (expires ${formatEphemeralExpiry(identity.expires_at)})`,
+    );
+    option.value = identity.id;
+    select.append(option);
+  }
+  if (identities.some((i) => i.id === previousValue)) {
+    select.value = previousValue;
+  }
+
+  const list = $<HTMLDivElement>("ephemeral-identity-list");
+  list.replaceChildren();
+  if (identities.length === 0) {
+    list.append(el("div", "empty-note", "No ephemeral identities yet."));
+    return;
+  }
+  for (const identity of identities) {
+    const row = el("div", "device-row");
+    const info = el("div");
+    info.append(el("div", "name", identity.label || "Ephemeral identity"));
+    info.append(el("div", "meta mono", `expires ${formatEphemeralExpiry(identity.expires_at)}`));
+    row.append(info);
+    const revokeBtn = el("button", "chip-btn danger", "Revoke");
+    revokeBtn.type = "button";
+    revokeBtn.addEventListener("click", async () => {
+      if (revokeBtn.disabled) return;
+      revokeBtn.disabled = true;
+      try {
+        await api.revokeEphemeralIdentity(identity.id);
+        await refreshEphemeralIdentities();
+      } catch (err) {
+        revokeBtn.disabled = false;
+        window.alert(errorMessage(err));
+      }
+    });
+    row.append(revokeBtn);
+    list.append(row);
+  }
+}
+
+function formatEphemeralExpiry(secs: number): string {
+  return new Date(secs * 1000).toLocaleDateString();
+}
+
+$<HTMLButtonElement>("ephemeral-identity-create").addEventListener("click", async (event) => {
+  const button = event.currentTarget as HTMLButtonElement;
+  if (button.disabled) return;
+  const errorBox = $<HTMLParagraphElement>("ephemeral-identity-error");
+  errorBox.hidden = true;
+  const label = $<HTMLInputElement>("ephemeral-identity-label").value.trim();
+  const ttlDays = parseInt($<HTMLInputElement>("ephemeral-identity-ttl").value, 10);
+  if (!ttlDays || ttlDays < 1) {
+    errorBox.hidden = false;
+    errorBox.textContent = "TTL must be at least 1 day.";
+    return;
+  }
+  button.disabled = true;
+  try {
+    await api.createEphemeralIdentity(label || undefined, ttlDays);
+    $<HTMLInputElement>("ephemeral-identity-label").value = "";
+    await refreshEphemeralIdentities();
+  } catch (err) {
+    errorBox.hidden = false;
+    errorBox.textContent = errorMessage(err);
   } finally {
     button.disabled = false;
   }
@@ -2633,5 +2928,6 @@ $<HTMLButtonElement>("enroll-passkey").addEventListener("click", async () => {
 window.addEventListener("DOMContentLoaded", () => {
   installBlurOnUnfocus($("app"));
   setInterval(pruneExpiredMessages, 5_000);
+  setInterval(() => void pollIncomingNetworkCalls(), 3_000);
   boot();
 });

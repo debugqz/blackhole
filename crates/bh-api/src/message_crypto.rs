@@ -17,25 +17,30 @@
 //! - One long-term signed prekey that never rotates, no one-time
 //!   prekeys — see `bh-storage::schema`'s `SCHEMA_V15` doc comment for why
 //!   this is an accepted trade rather than a bug.
-//! - Only `Direct` conversations get real network wiring here. `Group`
-//!   still stores locally-only (see `conversations.rs`) — real MLS
-//!   ciphertext fan-out via `Mailbox::fan_out` is a separate follow-up,
-//!   not attempted in this pass.
+//! - `Direct` conversations get real network wiring here, keyed by 1:1
+//!   X3DH/Double Ratchet sessions. `Group` conversations get their own
+//!   real wiring too, but through `groups.rs`/`Mailbox::fan_out` instead
+//!   of this module (MLS group state, not a per-contact ratchet session,
+//!   is what encrypts a group message) — see `groups.rs`'s module doc.
+//!   `send_encrypted_over_network` (below) is still reused as-is for
+//!   `Group`'s `Envelope::GroupInvite` delivery, since inviting someone
+//!   presupposes an existing 1:1 session with them.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use bh_crypto::identity::{recipient_key_hash, IdentityKeyPair};
 use bh_crypto::pq_hybrid::HybridSecretKey;
+use bh_crypto::push_relay::PushRelayRecord;
 use bh_crypto::ratchet::{
     self, session_associated_data, InitialMessage, PreKeyBundle, RatchetMessage, Session,
     SignedPreKey,
 };
 use bh_network::mailbox::Mailbox;
 use bh_network::supervised::SupervisedNetwork;
-use bh_network::{prekey_directory, sealed_sender};
+use bh_network::{prekey_directory, push_relay_directory, sealed_sender};
 use bh_storage::models::{Contact, OwnPrekey, Session as StoredSession};
-use ed25519_dalek::Signature;
+use ed25519_dalek::{Signature, VerifyingKey};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
 use crate::AppState;
@@ -44,7 +49,7 @@ use crate::AppState;
 /// — independent of (and shorter than) `Mailbox::push`'s hard cap, chosen
 /// generously enough that a recipient offline for a few days still gets
 /// it, without pretending to be permanent storage.
-const MAILBOX_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub(crate) const MAILBOX_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 /// This identity's one non-rotating signed prekey id (see module doc).
 const OWN_SIGNED_PREKEY_ID: u32 = 1;
@@ -231,6 +236,81 @@ pub(crate) async fn publish_own_bundle_best_effort(
     }
 }
 
+/// Best-effort: this window (this method's timeout, plus the round trip to
+/// fetch+verify the recipient's `PushRelayRecord`) sits after the mailbox
+/// push has already genuinely succeeded, so it should never block a send
+/// for long — a hung or malicious relay only delays this side effect, not
+/// message delivery itself.
+const WAKE_RELAY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The signing-key half of a `Contact::identity_public_key`/an identity's
+/// `public_identity_bytes()` — the same 64-byte `signing_key ||
+/// agreement_key` layout `contact_agreement_key` below reads the other
+/// half of.
+fn identity_public_signing_key(identity_public_key: &[u8]) -> Result<VerifyingKey, ()> {
+    let bytes: [u8; 32] = identity_public_key
+        .get(..32)
+        .ok_or(())?
+        .try_into()
+        .map_err(|_| ())?;
+    VerifyingKey::from_bytes(&bytes).map_err(|_| ())
+}
+
+/// After a message has already been genuinely delivered to `their_key_hash`'s
+/// mailbox, best-effort wakes the recipient via their published push relay
+/// (SPEC.md §5.6) — if they have one. Fetches and verifies their
+/// `PushRelayRecord` (signed by `recipient_identity_public_key`, the same
+/// already-locally-trusted key X3DH itself relies on — see
+/// `bh_crypto::push_relay`'s module doc for why verification matters here),
+/// then calls `POST {relay_url}/wake/{token}`. Never propagates a failure —
+/// same "log and swallow" contract as [`publish_own_bundle_best_effort`],
+/// since the send this follows has already succeeded regardless of whether
+/// a wake ever reaches the relay.
+async fn wake_recipient_best_effort(
+    network: &SupervisedNetwork,
+    recipient_identity_public_key: &[u8],
+    their_key_hash: &[u8],
+) {
+    let record_bytes =
+        match push_relay_directory::fetch_registration(&network.dht(), their_key_hash).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::debug!(%err, "wake: failed to fetch recipient's push-relay registration");
+                return;
+            }
+        };
+    let record = match PushRelayRecord::from_bytes(&record_bytes) {
+        Ok(record) => record,
+        Err(err) => {
+            tracing::warn!(%err, "wake: malformed push-relay registration record");
+            return;
+        }
+    };
+    let Ok(signing_key) = identity_public_signing_key(recipient_identity_public_key) else {
+        tracing::warn!("wake: recipient identity key has the wrong length");
+        return;
+    };
+    if !record.verify(&signing_key) {
+        tracing::warn!("wake: recipient's push-relay record failed signature verification");
+        return;
+    }
+
+    let url = format!(
+        "{}/wake/{}",
+        record.relay_url.trim_end_matches('/'),
+        record.token
+    );
+    if let Err(err) = crate::push::http_client()
+        .post(url)
+        .timeout(WAKE_RELAY_TIMEOUT)
+        .send()
+        .await
+    {
+        tracing::debug!(%err, "wake: failed to reach recipient's push relay");
+    }
+}
+
 fn contact_agreement_key(contact: &Contact) -> Result<X25519PublicKey, StatusCode> {
     let bytes: [u8; 32] = contact
         .identity_public_key
@@ -360,5 +440,6 @@ pub(crate) async fn send_encrypted_over_network(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     publish_own_bundle_best_effort(network, &identity, &signed_prekey).await;
+    wake_recipient_best_effort(network, &contact.identity_public_key, &their_key_hash).await;
     Ok(())
 }

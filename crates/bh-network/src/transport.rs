@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::StreamExt;
+use libp2p::identity::Keypair;
 use libp2p::kad;
 use libp2p::kad::store::{MemoryStore, MemoryStoreConfig};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
@@ -80,9 +81,32 @@ pub struct Node {
 
 impl Node {
     /// Starts a node listening on `listen_addr` (e.g.
-    /// `/ip4/127.0.0.1/tcp/0` to let the OS pick a free port).
+    /// `/ip4/127.0.0.1/tcp/0` to let the OS pick a free port), with a fresh,
+    /// random libp2p identity — the default for every ordinary daemon,
+    /// consistent with today's "no durable network-layer identity" privacy
+    /// posture. See [`Node::spawn_with_keypair`] for the alternative a
+    /// stable-address deployment (a DHT bootstrap node) needs.
     pub async fn spawn(listen_addr: &str) -> Result<Self, NetworkError> {
-        let mut swarm = SwarmBuilder::with_new_identity()
+        Self::spawn_with_keypair(listen_addr, Keypair::generate_ed25519()).await
+    }
+
+    /// Same as [`Node::spawn`], but with a caller-supplied libp2p identity
+    /// instead of a fresh random one. Exists so a long-lived, publicly
+    /// addressed node (a DHT bootstrap node, `daemon`'s
+    /// `BLACKHOLE_PERSISTENT_NETWORK_IDENTITY` opt-in) can keep the same
+    /// [`PeerId`] — and therefore the same `/p2p/<PeerId>` multiaddr every
+    /// other node's `BLACKHOLE_BOOTSTRAP_PEERS` points at — across restarts
+    /// and across `SupervisedNetwork`'s own respawn-on-panic path. An
+    /// ordinary end-user daemon has no reason to opt into this: nothing
+    /// today addresses a peer by this identity (messages route by
+    /// `recipient_key_hash`, derived from the X3DH identity key, not the
+    /// libp2p `PeerId`), so keeping it ephemeral costs nothing and avoids
+    /// adding a new durable, cross-restart-linkable network handle.
+    pub async fn spawn_with_keypair(
+        listen_addr: &str,
+        keypair: Keypair,
+    ) -> Result<Self, NetworkError> {
+        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),

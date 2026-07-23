@@ -561,6 +561,38 @@ pub async fn call_status(
     Json(CallStatusResponse { status })
 }
 
+#[derive(Serialize)]
+pub struct NetworkCallSummary {
+    pub call_id: String,
+    pub contact_id: String,
+}
+
+/// Every currently-active call that has a real network peer attached
+/// (`network_peers` — populated for both an outgoing `start_call` with a
+/// `contact_id` and an incoming `Offer` handled by
+/// `handle_incoming_call_signal`). There's no separate "ringing, not yet
+/// answered" state today — `handle_incoming_call_signal` auto-accepts an
+/// incoming offer immediately (see its own doc comment) — so this is
+/// deliberately minimal: a client polls it to notice "a call with this
+/// contact just went live" and surface *some* visibility, not a full
+/// pre-accept ringing UI. A client that already knows about a given
+/// `call_id` (e.g. one it placed itself) just ignores that entry.
+pub async fn list_network_calls(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<NetworkCallSummary>> {
+    let active = state.calls.active.lock().await;
+    let peers = state.calls.network_peers.lock().await;
+    let calls = peers
+        .iter()
+        .filter(|(call_id, _)| active.contains_key(*call_id))
+        .map(|(call_id, contact)| NetworkCallSummary {
+            call_id: call_id.clone(),
+            contact_id: contact.contact_id.clone(),
+        })
+        .collect();
+    Json(calls)
+}
+
 #[derive(Deserialize)]
 pub struct IncomingCallRequest {
     pub offer: CallSignal,

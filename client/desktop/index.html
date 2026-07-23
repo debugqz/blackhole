@@ -10,6 +10,11 @@
 
   <body>
     <div id="app">
+      <div id="incoming-call-banner" class="incoming-call-banner" hidden>
+        <span id="incoming-call-banner-text"></span>
+        <button id="incoming-call-banner-join" class="chip-btn" type="button">Join</button>
+        <button id="incoming-call-banner-dismiss" class="chip-btn" type="button">Dismiss</button>
+      </div>
       <section id="screen-unlock" class="screen unlock">
         <div class="orbit" aria-hidden="true"></div>
         <h1 class="mark">Blackhole</h1>
@@ -140,10 +145,10 @@
               <span id="thread-verify" class="verify-chip"></span>
             </div>
             <div id="thread-toolbar" class="thread-toolbar">
-              <button id="call-audio" class="chip-btn" type="button" title="Start a local test call">
+              <button id="call-audio" class="chip-btn" type="button" title="Call this contact">
                 📞 Call
               </button>
-              <button id="call-video" class="chip-btn" type="button" title="Start a local test video call">
+              <button id="call-video" class="chip-btn" type="button" title="Video call this contact">
                 🎥 Video
               </button>
               <button id="call-group" class="chip-btn" type="button" hidden title="Start a local test group call">
@@ -359,6 +364,56 @@
               </p>
             </section>
             <section>
+              <h3>Dead man's switch</h3>
+              <label class="toggle-row">
+                <input id="dms-toggle" type="checkbox" />
+                Release messages if I don't check in
+              </label>
+              <div class="row">
+                <span>Check in every</span>
+                <input
+                  id="dms-cadence"
+                  type="number"
+                  min="1"
+                  class="field mono"
+                  style="width: 5em"
+                />
+                <span>days</span>
+              </div>
+              <p class="trust-note">
+                Last check-in: <span id="dms-last-checkin" class="mono">—</span><br />
+                Deadline: <span id="dms-deadline" class="mono">—</span>
+              </p>
+              <p id="dms-triggered-note" class="trust-note" hidden>
+                This switch has already fired. Disable and re-enable it to
+                re-arm.
+              </p>
+              <button id="dms-checkin-now" class="btn-outline wide" type="button">
+                Check in now
+              </button>
+              <p id="dms-status" class="trust-note"></p>
+
+              <h4>Release messages</h4>
+              <div id="dms-release-list" class="device-list"></div>
+              <div class="row">
+                <select id="dms-add-contact" class="field"></select>
+              </div>
+              <textarea
+                id="dms-add-body"
+                class="field mono"
+                rows="3"
+                placeholder="Message body"
+              ></textarea>
+              <button id="dms-add-release" class="btn-outline wide" type="button">
+                Add release message
+              </button>
+              <p id="dms-release-error" class="error-text" hidden></p>
+              <p class="trust-note">
+                Text only — one message per contact. Delivered exactly like
+                a normal encrypted message the moment this switch fires.
+              </p>
+            </section>
+            <section>
               <h3>Panic wipe</h3>
               <button id="panic-wipe" class="wipe-btn" type="button">
                 Wipe this device
@@ -458,10 +513,46 @@
             </section>
             <section>
               <h3>Create my own invite</h3>
+              <div class="row">
+                <select id="invite-identity-select" class="field">
+                  <option value="">My real identity</option>
+                </select>
+              </div>
               <button id="invite-create" class="btn-outline wide" type="button">
                 Generate invite link
               </button>
               <div id="invite-created" class="invite-preview" hidden></div>
+            </section>
+            <section>
+              <h3>Ephemeral identities</h3>
+              <p class="trust-note">
+                A throwaway identity you can hand out via an invite instead
+                of your real one, for a one-off interaction with a
+                stranger. Fully wiped — keys, conversation, and messages —
+                once it expires or you revoke it.
+              </p>
+              <div id="ephemeral-identity-list" class="device-list"></div>
+              <div class="row">
+                <input
+                  id="ephemeral-identity-label"
+                  class="field"
+                  placeholder="Label (optional)"
+                  autocomplete="off"
+                />
+                <input
+                  id="ephemeral-identity-ttl"
+                  type="number"
+                  min="1"
+                  class="field mono"
+                  style="width: 5em"
+                  value="7"
+                />
+                <span>days</span>
+              </div>
+              <button id="ephemeral-identity-create" class="btn-outline wide" type="button">
+                Create ephemeral identity
+              </button>
+              <p id="ephemeral-identity-error" class="error-text" hidden></p>
             </section>
           </div>
         </div>

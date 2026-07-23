@@ -88,6 +88,14 @@ pub struct AppState {
     /// overridable via [`AppState::with_expiry_sweep_interval`] so tests
     /// can observe a sweep without waiting a real 60 seconds.
     expiry_sweep_interval: Duration,
+    /// Wipes ephemeral identities (`bh_storage::ephemeral_identity`) past
+    /// their `expires_at`, for whichever profile is currently active —
+    /// same per-profile-restart shape as `expiry_sweeper` above and for the
+    /// same reason (an ephemeral identity is profile-scoped). Reuses
+    /// `expiry_sweep_interval` rather than a second configurable field:
+    /// both are lightweight, DB-only sweeps with no reason to run on
+    /// different cadences.
+    ephemeral_identity_sweeper: Mutex<Option<JoinHandle<()>>>,
     /// In-memory, not-per-profile call state (see `calls.rs` module doc
     /// for why calls live outside the profile/database split).
     pub calls: Arc<CallRegistry>,
@@ -137,6 +145,19 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// Auto check-in for the dead man's switch (`bh-api::dead_mans_switch`):
+/// called every time a profile becomes the active one — daemon boot for
+/// the boot profile (via [`AppState::with_expiry_sweep_interval`]) and
+/// every later [`AppState::switch_active`] call — since either moment
+/// means "this profile is demonstrably in use again." A safe no-op if the
+/// profile has no switch configured or it's currently disabled (see
+/// `Database::record_dead_mans_switch_check_in`'s own doc comment).
+fn record_boot_check_in(active: &ProfileSession) {
+    if let Err(err) = active.db.record_dead_mans_switch_check_in(now()) {
+        tracing::warn!(%err, "dead man's switch: failed to record automatic check-in");
+    }
+}
+
 impl AppState {
     pub fn new(manager: ProfileManager, active: ProfileSession) -> Self {
         Self::with_expiry_sweep_interval(manager, active, EXPIRY_SWEEP_INTERVAL)
@@ -162,11 +183,13 @@ impl AppState {
             hex::encode(bytes)
         });
 
+        record_boot_check_in(&active);
         let state = Self {
             manager,
             active: RwLock::new(active),
             expiry_sweeper: Mutex::new(None),
             expiry_sweep_interval,
+            ephemeral_identity_sweeper: Mutex::new(None),
             calls: Arc::new(CallRegistry::default()),
             device_link: Arc::new(DeviceLinkRegistry::default()),
             local_auth: Arc::new(LocalAuthRegistry::default()),
@@ -175,6 +198,7 @@ impl AppState {
             api_token,
         };
         state.restart_expiry_sweeper();
+        state.restart_ephemeral_identity_sweeper();
         state
     }
 
@@ -218,6 +242,26 @@ impl AppState {
             .expiry_sweeper
             .lock()
             .expect("expiry sweeper handle lock poisoned");
+        if let Some(old) = guard.replace(handle) {
+            old.abort();
+        }
+    }
+
+    /// (Re)spawns the ephemeral-identity sweeper against whichever profile
+    /// is currently active — same rationale/shape as
+    /// [`AppState::restart_expiry_sweeper`], since an ephemeral identity is
+    /// profile-scoped too.
+    fn restart_ephemeral_identity_sweeper(&self) {
+        let db = self.read_active().db;
+        let handle = bh_storage::ephemeral_identity::spawn_ephemeral_identity_sweeper(
+            db,
+            self.expiry_sweep_interval,
+            now,
+        );
+        let mut guard = self
+            .ephemeral_identity_sweeper
+            .lock()
+            .expect("ephemeral identity sweeper handle lock poisoned");
         if let Some(old) = guard.replace(handle) {
             old.abort();
         }
@@ -286,7 +330,9 @@ impl AppState {
     /// profile's (and only the new profile's) data; nothing from the
     /// previous profile stays reachable through `AppState` afterwards.
     pub fn switch_active(&self, session: ProfileSession) {
+        record_boot_check_in(&session);
         *self.active.write().expect("active profile lock poisoned") = session;
         self.restart_expiry_sweeper();
+        self.restart_ephemeral_identity_sweeper();
     }
 }

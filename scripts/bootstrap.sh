@@ -50,7 +50,13 @@ fi
 log "node $(node --version), pnpm $(pnpm --version)"
 
 # --- System dependencies (bh-storage's SQLCipher/OpenSSL link, ---------
-# --- bh-calls' opus/libvpx codecs, scap's Linux screen-capture deps) ---
+# --- bh-calls' opus/libvpx codecs, cpal's Linux ALSA audio backend, ---
+# --- scap's Linux screen-capture deps) ----------------------------------
+# ALSA (Linux only — cpal uses CoreAudio on macOS, nothing extra needed
+# there) was missing from this list until building a from-scratch minimal
+# Docker image (infra/bootstrap-node/Dockerfile) surfaced it: a real dev
+# machine or CI runner with a fuller default package set had it already,
+# silently masking the gap.
 case "$pkg_manager" in
   brew)
     pkgs=(openssl@3 opus libvpx pkg-config)
@@ -66,22 +72,23 @@ case "$pkg_manager" in
     fi
     ;;
   apt)
-    log "Installing via apt (sudo required): libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev"
+    log "Installing via apt (sudo required): libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev libasound2-dev"
     sudo apt-get update
-    sudo apt-get install -y libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev
+    sudo apt-get install -y libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev libasound2-dev
     ;;
   pacman)
-    log "Installing via pacman (sudo required): openssl pkgconf opus libvpx clang pipewire dbus"
-    sudo pacman -Sy --needed openssl pkgconf opus libvpx clang pipewire dbus
+    log "Installing via pacman (sudo required): openssl pkgconf opus libvpx clang pipewire dbus alsa-lib"
+    sudo pacman -Sy --needed openssl pkgconf opus libvpx clang pipewire dbus alsa-lib
     ;;
   dnf)
-    log "Installing via dnf (sudo required): openssl-devel pkgconf-pkg-config opus-devel libvpx-devel clang-devel pipewire-devel dbus-devel"
-    sudo dnf install -y openssl-devel pkgconf-pkg-config opus-devel libvpx-devel clang-devel pipewire-devel dbus-devel
+    log "Installing via dnf (sudo required): openssl-devel pkgconf-pkg-config opus-devel libvpx-devel clang-devel pipewire-devel dbus-devel alsa-lib-devel"
+    sudo dnf install -y openssl-devel pkgconf-pkg-config opus-devel libvpx-devel clang-devel pipewire-devel dbus-devel alsa-lib-devel
     ;;
   *)
     warn "No known package manager detected — install OpenSSL, opus, libvpx, pkg-config"
-    warn "(and on Linux: libclang, libpipewire, libdbus) yourself; see README.md's"
-    warn "'Building & running' section for the exact package names per distro."
+    warn "(and on Linux: libclang, libpipewire, libdbus, ALSA dev headers) yourself;"
+    warn "see README.md's 'Building & running' section for the exact package names"
+    warn "per distro."
     ;;
 esac
 

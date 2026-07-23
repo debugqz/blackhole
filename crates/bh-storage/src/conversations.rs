@@ -31,11 +31,12 @@ fn row_to_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
         group_id: row.get(3)?,
         created_at: row.get(4)?,
         disappearing_timer_secs: row.get(5)?,
+        ephemeral_identity_id: row.get(6)?,
     })
 }
 
-const SELECT_COLUMNS: &str =
-    "conversation_id, kind, contact_id, group_id, created_at, disappearing_timer_secs";
+const SELECT_COLUMNS: &str = "conversation_id, kind, contact_id, group_id, created_at, \
+     disappearing_timer_secs, ephemeral_identity_id";
 
 impl Database {
     pub fn create_direct_conversation(
@@ -49,6 +50,34 @@ impl Database {
              VALUES (?1, 'direct', ?2, NULL, ?3)
              ON CONFLICT(conversation_id) DO NOTHING",
             params![conversation_id, contact_id, created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Like [`Database::create_direct_conversation`], but tags the new
+    /// conversation as belonging to an ephemeral identity's shadow contact
+    /// (`Conversation::ephemeral_identity_id`) rather than the profile's
+    /// real identity — kept as its own function rather than widening
+    /// `create_direct_conversation`'s signature, so every existing call
+    /// site is untouched. See `bh-api::ephemeral_identity`'s module doc.
+    pub fn create_ephemeral_identity_conversation(
+        &self,
+        ephemeral_identity_id: &str,
+        conversation_id: &str,
+        contact_id: &str,
+        created_at: i64,
+    ) -> Result<(), StorageError> {
+        self.conn()?.execute(
+            "INSERT INTO conversations
+                (conversation_id, kind, contact_id, group_id, created_at, ephemeral_identity_id)
+             VALUES (?1, 'direct', ?2, NULL, ?3, ?4)
+             ON CONFLICT(conversation_id) DO NOTHING",
+            params![
+                conversation_id,
+                contact_id,
+                created_at,
+                ephemeral_identity_id
+            ],
         )?;
         Ok(())
     }
@@ -80,6 +109,29 @@ impl Database {
             "SELECT {SELECT_COLUMNS} FROM conversations WHERE kind = 'direct' AND contact_id = ?1"
         );
         conn.query_row(&sql, params![contact_id], row_to_conversation)
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// Looks up the conversation backing `group_id`, if one has already
+    /// been created locally (either by this profile creating the group, or
+    /// by processing a real `GroupInvite` once received) — the reverse of
+    /// [`Database::get_group_for_conversation`]. Used by the mailbox
+    /// receive loop's group-message dispatch, which only ever has a
+    /// `group_id` to work from (it comes from `Mailbox::pull`'s key, not an
+    /// HTTP path parameter).
+    pub fn get_conversation_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<Conversation>, StorageError> {
+        let conn = self.conn()?;
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM conversations WHERE kind = 'group' AND group_id = ?1"
+        );
+        conn.query_row(&sql, params![group_id], row_to_conversation)
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),

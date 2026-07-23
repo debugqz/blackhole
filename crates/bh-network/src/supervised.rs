@@ -26,7 +26,8 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use libp2p::PeerId;
+use libp2p::identity::Keypair;
+use libp2p::{Multiaddr, PeerId};
 
 use crate::dht::Dht;
 use crate::mailbox::Mailbox;
@@ -56,41 +57,115 @@ impl Stack {
 pub struct SupervisedNetwork {
     stack: Arc<RwLock<Stack>>,
     listen_addr: String,
+    bootstrap_peers: Arc<Vec<Multiaddr>>,
+    keypair: Keypair,
 }
 
 impl SupervisedNetwork {
     /// Spawns a `Node` listening on `listen_addr` and a background task
     /// that checks its health every `health_check_interval` and respawns
-    /// on death.
+    /// on death. Equivalent to [`SupervisedNetwork::spawn_with_bootstrap`]
+    /// with an empty peer list — nobody is dialed proactively, matching
+    /// this method's original behavior for every existing caller/test.
     ///
-    /// **Identity caveat**: `Node::spawn` (`SwarmBuilder::with_new_identity`)
-    /// generates a fresh random libp2p keypair every call — this repo does
-    /// not yet persist a stable libp2p peer identity across restarts (of
-    /// the daemon, or of a respawn triggered by this supervisor). A
-    /// respawned node is therefore a *new* peer from the rest of the
-    /// network's point of view, not a reconnection as the same one. Making
-    /// that identity durable (load/store the keypair the same way
-    /// `keystore.rs` handles the SQLCipher key) is a real follow-up, not
-    /// done here — this module's job is containing the yamux blast radius,
-    /// not node identity persistence.
+    /// Uses a fresh random libp2p identity, same as plain [`Node::spawn`] —
+    /// see [`SupervisedNetwork::spawn_with_bootstrap_and_keypair`] for the
+    /// stable-identity alternative a DHT bootstrap node needs.
     pub async fn spawn(
         listen_addr: impl Into<String>,
         health_check_interval: Duration,
     ) -> Result<Self, NetworkError> {
+        Self::spawn_with_bootstrap(listen_addr, health_check_interval, Vec::new()).await
+    }
+
+    /// Same as [`SupervisedNetwork::spawn`], but also dials every address
+    /// in `bootstrap_peers` right after the node comes up (best-effort —
+    /// a dial failure is logged, not fatal, same posture as the daemon's
+    /// own "network is best-effort" spawn-failure handling) and again
+    /// after any future respawn. This is what closes the gap `dial`'s own
+    /// doc comment describes: "real deployments need a bootstrap-node
+    /// list." Uses a fresh random identity every call — see
+    /// [`SupervisedNetwork::spawn_with_bootstrap_and_keypair`] if the
+    /// caller needs that identity to survive a restart.
+    pub async fn spawn_with_bootstrap(
+        listen_addr: impl Into<String>,
+        health_check_interval: Duration,
+        bootstrap_peers: Vec<Multiaddr>,
+    ) -> Result<Self, NetworkError> {
+        Self::spawn_with_bootstrap_and_keypair(
+            listen_addr,
+            health_check_interval,
+            bootstrap_peers,
+            Keypair::generate_ed25519(),
+        )
+        .await
+    }
+
+    /// Same as [`SupervisedNetwork::spawn_with_bootstrap`], but with a
+    /// caller-supplied libp2p identity instead of a fresh random one — the
+    /// same identity is reused across every future respawn this
+    /// supervisor performs, unlike the plain `spawn*` constructors above.
+    /// This is the fix `spawn`'s previous doc comment flagged as a real
+    /// follow-up ("making [network] identity durable... is a real
+    /// follow-up, not done here"): a respawned or restarted node using
+    /// this constructor keeps the same [`PeerId`], so every other node's
+    /// `BLACKHOLE_BOOTSTRAP_PEERS` entry pointing at it (`/p2p/<PeerId>`)
+    /// stays valid instead of silently going stale. Intended for
+    /// deliberately public, stable-address nodes (a DHT bootstrap node);
+    /// see `daemon/src/main.rs`'s `BLACKHOLE_PERSISTENT_NETWORK_IDENTITY`
+    /// for the opt-in gate — an ordinary end-user daemon has no reason to
+    /// use this (see [`Node::spawn_with_keypair`]'s doc comment for why).
+    pub async fn spawn_with_bootstrap_and_keypair(
+        listen_addr: impl Into<String>,
+        health_check_interval: Duration,
+        bootstrap_peers: Vec<Multiaddr>,
+        keypair: Keypair,
+    ) -> Result<Self, NetworkError> {
         let listen_addr = listen_addr.into();
-        let node = Node::spawn(&listen_addr).await?;
+        let node = Node::spawn_with_keypair(&listen_addr, keypair.clone()).await?;
         let stack = Arc::new(RwLock::new(Stack::from_node(node)));
+        let bootstrap_peers = Arc::new(bootstrap_peers);
 
         let supervised = Self {
             stack: stack.clone(),
             listen_addr: listen_addr.clone(),
+            bootstrap_peers: bootstrap_peers.clone(),
+            keypair: keypair.clone(),
         };
-        tokio::spawn(supervise(stack, listen_addr, health_check_interval));
+        supervised.dial_bootstrap_peers().await;
+        tokio::spawn(supervise(
+            stack,
+            listen_addr,
+            health_check_interval,
+            bootstrap_peers,
+            keypair,
+        ));
         Ok(supervised)
+    }
+
+    /// Dials every configured bootstrap peer, logging (not failing on)
+    /// each individual dial error — one unreachable bootstrap entry
+    /// shouldn't stop the others from being tried.
+    async fn dial_bootstrap_peers(&self) {
+        for addr in self.bootstrap_peers.iter() {
+            if let Err(err) = self.dial(addr.clone()).await {
+                tracing::warn!(%addr, %err, "failed to dial bootstrap peer");
+            }
+        }
     }
 
     pub fn peer_id(&self) -> PeerId {
         self.stack.read().expect(LOCK_POISON_MSG).node.peer_id()
+    }
+
+    /// The identity every current and future respawn of this node uses —
+    /// random per call unless the caller went through
+    /// [`SupervisedNetwork::spawn_with_bootstrap_and_keypair`]. Exposed so
+    /// a caller that generated its own keypair (e.g. `daemon`'s
+    /// `load_or_create_network_identity`) can confirm what's actually live
+    /// without re-deriving `peer_id()` by hand.
+    pub fn keypair(&self) -> &Keypair {
+        &self.keypair
     }
 
     /// The multiaddr new/respawned nodes listen on — not necessarily where
@@ -135,7 +210,13 @@ impl SupervisedNetwork {
     }
 }
 
-async fn supervise(stack: Arc<RwLock<Stack>>, listen_addr: String, interval: Duration) {
+async fn supervise(
+    stack: Arc<RwLock<Stack>>,
+    listen_addr: String,
+    interval: Duration,
+    bootstrap_peers: Arc<Vec<Multiaddr>>,
+    keypair: Keypair,
+) {
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await; // skip the immediate first tick, node just started
 
@@ -148,10 +229,26 @@ async fn supervise(stack: Arc<RwLock<Stack>>, listen_addr: String, interval: Dur
         }
 
         tracing::warn!("network event loop died (see docs/THREAT_MODEL.md §3.10) — respawning");
-        match Node::spawn(&listen_addr).await {
+        match Node::spawn_with_keypair(&listen_addr, keypair.clone()).await {
             Ok(node) => {
                 *stack.write().expect(LOCK_POISON_MSG) = Stack::from_node(node);
                 tracing::info!("network node respawned after failure");
+                // A respawned node keeps the same identity (see
+                // `spawn_with_bootstrap_and_keypair`'s doc comment) but
+                // always starts with an empty Kademlia routing table —
+                // without this, a respawn would silently strand the node
+                // with no path back to the peers it's configured to know
+                // about.
+                for addr in bootstrap_peers.iter() {
+                    let node = stack.read().expect(LOCK_POISON_MSG).node.clone();
+                    if let Err(err) = node.dial(addr.clone()).await {
+                        tracing::warn!(
+                            %addr,
+                            %err,
+                            "failed to re-dial bootstrap peer after respawn"
+                        );
+                    }
+                }
             }
             Err(err) => {
                 tracing::error!(%err, "failed to respawn network node — will retry next tick");
@@ -218,13 +315,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_with_bootstrap_dials_configured_peers_without_a_manual_dial_call() {
+        let a = SupervisedNetwork::spawn("/ip4/127.0.0.1/tcp/0", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let a_addr = a
+            .listen_addrs()
+            .await
+            .into_iter()
+            .next()
+            .unwrap()
+            .with_p2p(a.peer_id())
+            .unwrap();
+
+        // Unlike `two_independently_spawned_networks_can_dial_and_see_each_
+        // others_records`, this test never calls `b.dial(...)` itself — the
+        // bootstrap list passed to `spawn_with_bootstrap` is what's
+        // responsible for the connection existing at all.
+        let b = SupervisedNetwork::spawn_with_bootstrap(
+            "/ip4/127.0.0.1/tcp/0",
+            Duration::from_secs(60),
+            vec![a_addr],
+        )
+        .await
+        .unwrap();
+
+        for attempt in 0..20 {
+            match a
+                .dht()
+                .publish(b"bootstrap-test-key", b"bootstrap-test-value".to_vec())
+                .await
+            {
+                Ok(()) => break,
+                Err(_) if attempt < 19 => tokio::time::sleep(Duration::from_millis(200)).await,
+                Err(e) => panic!("publish failed after retries: {e}"),
+            }
+        }
+        let seen = b.dht().lookup(b"bootstrap-test-key").await.unwrap();
+        assert_eq!(seen, Some(b"bootstrap-test-value".to_vec()));
+    }
+
+    #[tokio::test]
     async fn supervisor_detects_a_dead_node_and_respawns_a_working_one() {
         let dead = Node::dead_handle_for_test();
         assert!(!dead.is_alive());
         let stack = Arc::new(RwLock::new(Stack::from_node(dead)));
+        let keypair = Keypair::generate_ed25519();
         let net = SupervisedNetwork {
             stack: stack.clone(),
             listen_addr: "/ip4/127.0.0.1/tcp/0".to_string(),
+            bootstrap_peers: Arc::new(Vec::new()),
+            keypair: keypair.clone(),
         };
         assert!(!net.is_alive(), "sanity check: starts dead");
 
@@ -232,6 +373,8 @@ mod tests {
             stack,
             "/ip4/127.0.0.1/tcp/0".to_string(),
             Duration::from_millis(20),
+            Arc::new(Vec::new()),
+            keypair.clone(),
         ));
 
         // Give the supervisor a couple of ticks to notice and respawn.
@@ -254,5 +397,25 @@ mod tests {
             .expect("lookup should not hang")
             .unwrap();
         assert_eq!(ok, None);
+
+        // The whole point of supplying a keypair: a respawn must not
+        // silently mint a new PeerId out from under every peer that
+        // dialed this node's old one.
+        assert_eq!(net.peer_id(), PeerId::from(keypair.public()));
+    }
+
+    #[tokio::test]
+    async fn spawn_with_bootstrap_and_keypair_uses_the_supplied_identity() {
+        let keypair = Keypair::generate_ed25519();
+        let expected = PeerId::from(keypair.public());
+        let net = SupervisedNetwork::spawn_with_bootstrap_and_keypair(
+            "/ip4/127.0.0.1/tcp/0",
+            Duration::from_secs(60),
+            Vec::new(),
+            keypair,
+        )
+        .await
+        .unwrap();
+        assert_eq!(net.peer_id(), expected);
     }
 }

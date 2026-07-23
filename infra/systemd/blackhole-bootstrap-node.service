@@ -1,0 +1,45 @@
+
+# Bare-metal/VM alternative to infra/docker-compose.yml's bootstrap-node
+# service. See ../README.md for the full walkthrough.
+#
+# Install:
+#   cargo build --release --locked -p bh-daemon
+#   sudo install -m 755 target/release/blackhole-daemon /usr/local/bin/
+#   sudo useradd --system --create-home --home-dir /var/lib/blackhole --shell /usr/sbin/nologin blackhole
+#   sudo mkdir -p /etc/blackhole && sudo cp infra/systemd/bootstrap-node.env.example /etc/blackhole/bootstrap-node.env
+#   # edit /etc/blackhole/bootstrap-node.env, then:
+#   sudo cp infra/systemd/blackhole-bootstrap-node.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now blackhole-bootstrap-node
+
+[Unit]
+Description=Blackhole DHT bootstrap node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blackhole
+Group=blackhole
+EnvironmentFile=/etc/blackhole/bootstrap-node.env
+ExecStart=/usr/local/bin/blackhole-daemon
+Restart=on-failure
+RestartSec=5
+# Persisted profile data + (with BLACKHOLE_PERSISTENT_NETWORK_IDENTITY=1)
+# the libp2p keypair keeping this node's PeerId stable across restarts —
+# do not point this at a tmpfs or anything else that doesn't survive a
+# reboot, or every restart silently mints a new identity
+# (docs/THREAT_MODEL.md §3.5).
+StateDirectory=blackhole
+WorkingDirectory=/var/lib/blackhole
+
+# Standard hardening — this process only needs network + its own state
+# directory, nothing else on the host.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/blackhole
+
+[Install]
+WantedBy=multi-user.target

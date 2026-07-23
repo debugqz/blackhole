@@ -1,15 +1,36 @@
 //! Multi-device linking (SPEC.md §4), backed by `bh-crypto::device_link`.
 //!
-//! There is exactly one daemon/one database in this repo today — no real
-//! second physical device exists to hand a QR scan to. This module exposes
-//! the real 4-step protocol (`begin` on the already-trusted device, then
-//! `scan`, `accept`, and `finish` completing the handoff) as granular
-//! endpoints, with the daemon playing both roles against the same
-//! `AppState`. The client UI must label this a **local simulation** — it
-//! genuinely exercises the ECDH/HKDF/AEAD path and adds a real second row
-//! to the `devices` table, but it does not model a second process, and it
-//! never transfers the SQLCipher database key (only the shared *account*
-//! identity, exactly as the real protocol does between two real devices).
+//! **Real cross-process linking now exists** when `state.network` is
+//! attached: `scan_link` (the new device) publishes its
+//! `ProvisioningRequest` to `bh_network::device_link_relay` instead of
+//! only returning it in the HTTP response, keyed by the primary's real
+//! identity (`bh_crypto::device_link::LinkingSession::begin`'s doc
+//! comment on why the link itself now embeds that); `accept_link` (the
+//! primary) fetches it from the relay when the caller doesn't supply
+//! `provisioning_request_b64` directly, and — symmetrically — publishes
+//! its response to the relay keyed by the new device's ephemeral linking
+//! key; `finish_link` (the new device) fetches that response the same
+//! way when not given `response_ciphertext_b64` directly. Every endpoint
+//! still accepts the ciphertext inline too — the pre-existing same-daemon
+//! demo (both roles against the same `AppState`, no live network needed)
+//! keeps working completely unchanged.
+//!
+//! **Deliberately still out of scope**: this only proves the *ceremony*
+//! travels the real network — a real new device's `finish_link` does
+//! *not* install the transferred account identity as its own
+//! `own_identity` (would make its `recipient_key_hash` collide with the
+//! primary's, and this codebase's `Direct`-message mailbox is
+//! delete-on-read/single-consumer, unlike `Group`'s `Mailbox::fan_out` —
+//! two daemons racing to pull-and-delete the same account's incoming
+//! mailbox would silently drop messages for whichever loses the race).
+//! Making a real second device a fully-synced peer for ordinary messaging
+//! is `device_sync.rs`'s job, which already works over the real network
+//! independently (see that module's doc comment) — it doesn't need this
+//! module's identity transfer at all, only a `Device` row with a real
+//! `identity_agreement_key`, which `accept_link` already writes here.
+//! Resolving the mailbox-sharing question for *general* multi-device
+//! messaging (not just sync pushes) is a real follow-up, not attempted in
+//! this pass.
 //!
 //! Ceremony state (the in-progress `LinkingSession`/`NewDevice` handles)
 //! lives only in memory for the daemon's process lifetime, same convention
@@ -124,7 +145,9 @@ pub struct BeginLinkResponse {
 pub async fn begin_link(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<BeginLinkResponse>, StatusCode> {
-    let session = LinkingSession::begin();
+    let identity = own_identity_keypair(&state)?;
+    let own_key_hash = bh_crypto::identity::recipient_key_hash(&identity.public_identity_bytes());
+    let session = LinkingSession::begin(own_key_hash);
     let link = session.link();
     let qr_svg = bh_crypto::qr::to_svg(&link).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -153,7 +176,9 @@ pub struct ScanLinkResponse {
 }
 
 /// The "new device"'s side: scans the link shown by `begin_link` and
-/// produces a provisioning request to hand back.
+/// produces a provisioning request to hand back — and, if a live network
+/// is attached, also publishes it to the relay so a genuinely separate
+/// primary daemon can find it (see module doc).
 pub async fn scan_link(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ScanLinkRequest>,
@@ -163,7 +188,19 @@ pub async fn scan_link(
 
     let mut blob = request.new_device_ephemeral_public.as_bytes().to_vec();
     blob.extend_from_slice(&request.ciphertext);
-    let provisioning_request_b64 = BASE64.encode(blob);
+    let provisioning_request_b64 = BASE64.encode(&blob);
+
+    if let Some(network) = state.network.as_ref() {
+        if let Err(err) = bh_network::device_link_relay::publish_request(
+            &network.dht(),
+            &new_device.primary_key_hash,
+            blob.clone(),
+        )
+        .await
+        {
+            tracing::warn!(%err, "failed to publish device-link request to the relay");
+        }
+    }
 
     let new_device_session_id = uuid::Uuid::new_v4().to_string();
     state
@@ -181,7 +218,11 @@ pub async fn scan_link(
 
 #[derive(Deserialize)]
 pub struct AcceptLinkRequest {
-    pub provisioning_request_b64: String,
+    /// `None` means: fetch the request from the real network relay
+    /// instead (see module doc) — only valid when `state.network` is
+    /// attached.
+    #[serde(default)]
+    pub provisioning_request_b64: Option<String>,
     pub device_name: Option<String>,
 }
 
@@ -206,9 +247,23 @@ pub async fn accept_link(
         .remove(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let blob = BASE64
-        .decode(&req.provisioning_request_b64)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let identity = own_identity_keypair(&state)?;
+
+    let blob = match req.provisioning_request_b64 {
+        Some(b64) => BASE64.decode(&b64).map_err(|_| StatusCode::BAD_REQUEST)?,
+        None => {
+            let own_key_hash =
+                bh_crypto::identity::recipient_key_hash(&identity.public_identity_bytes());
+            let network = state
+                .network
+                .as_ref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            bh_network::device_link_relay::fetch_request(&network.dht(), &own_key_hash)
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+                .ok_or(StatusCode::NOT_FOUND)?
+        }
+    };
     if blob.len() < 32 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -221,17 +276,18 @@ pub async fn accept_link(
         ciphertext: ciphertext.to_vec(),
     };
 
-    let identity = own_identity_keypair(&state)?;
-    let (device_signing_key, response) = session
+    let (device_identity_public, response) = session
         .accept(&request, &identity)
         .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    let (device_signing_bytes, device_agreement_bytes) = device_identity_public.split_at(32);
 
     let device = Device {
-        device_id: hex::encode(device_signing_key.to_bytes()),
+        device_id: hex::encode(device_signing_bytes),
         owner: DeviceOwner::Own,
         contact_id: None,
         name: req.device_name,
-        public_key: device_signing_key.to_bytes().to_vec(),
+        public_key: device_signing_bytes.to_vec(),
+        identity_agreement_key: Some(device_agreement_bytes.to_vec()),
         linked_at: now(),
         last_seen_at: None,
         revoked_at: None,
@@ -241,6 +297,20 @@ pub async fn accept_link(
         .upsert_device(&device)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    if let Some(network) = state.network.as_ref() {
+        let device_ephemeral_key_hash =
+            bh_crypto::identity::recipient_key_hash(request.new_device_ephemeral_public.as_bytes());
+        if let Err(err) = bh_network::device_link_relay::publish_response(
+            &network.dht(),
+            &device_ephemeral_key_hash,
+            response.clone(),
+        )
+        .await
+        {
+            tracing::warn!(%err, "failed to publish device-link response to the relay");
+        }
+    }
+
     Ok(Json(AcceptLinkResponse {
         response_ciphertext_b64: BASE64.encode(response),
         device: device.into(),
@@ -249,18 +319,38 @@ pub async fn accept_link(
 
 #[derive(Deserialize)]
 pub struct FinishLinkRequest {
-    pub response_ciphertext_b64: String,
+    /// `None` means: fetch the response from the real network relay
+    /// instead (see module doc) — only valid when `state.network` is
+    /// attached.
+    #[serde(default)]
+    pub response_ciphertext_b64: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct FinishLinkResponse {
     pub confirmed: bool,
     pub device_signing_key_hex: String,
+    /// The transferred account identity's own public keys — present
+    /// whenever `confirmed` is `true`, letting a genuinely separate new
+    /// device (with no `own_identity` of its own yet to compare against
+    /// — see module doc on why this daemon doesn't install it) verify the
+    /// ceremony recovered the *expected* primary identity, by comparing
+    /// against whatever it already knows out-of-band (e.g. the primary's
+    /// own `GET /identity` response).
+    pub linked_signing_key_hex: String,
+    pub linked_agreement_key_hex: String,
 }
 
-/// The "new device" decrypts the response, completing the link — confirmed
-/// by checking the transferred identity matches this daemon's own (since
-/// both roles run against the same profile here).
+/// The "new device" decrypts the response, completing the link. On the
+/// same-daemon demo path (both roles sharing a profile — `own_identity`
+/// already set), `confirmed` re-checks the transferred identity matches
+/// this daemon's own. On a genuinely separate new device (no
+/// `own_identity` yet), there's nothing local to compare against — see
+/// module doc for why this daemon deliberately doesn't install the
+/// transferred identity as its own — so `confirmed` there just means
+/// "decryption succeeded," and the caller compares
+/// `linked_signing_key_hex`/`linked_agreement_key_hex` against the
+/// primary's known identity itself.
 pub async fn finish_link(
     State(state): State<Arc<AppState>>,
     Path(new_device_session_id): Path<String>,
@@ -274,23 +364,49 @@ pub async fn finish_link(
         .remove(&new_device_session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let ciphertext = BASE64
-        .decode(&req.response_ciphertext_b64)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let ciphertext = match req.response_ciphertext_b64 {
+        Some(b64) => BASE64.decode(&b64).map_err(|_| StatusCode::BAD_REQUEST)?,
+        None => {
+            let device_ephemeral_key_hash =
+                bh_crypto::identity::recipient_key_hash(new_device.ephemeral_public().as_bytes());
+            let network = state
+                .network
+                .as_ref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            bh_network::device_link_relay::fetch_response(
+                &network.dht(),
+                &device_ephemeral_key_hash,
+            )
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .ok_or(StatusCode::NOT_FOUND)?
+        }
+    };
     let linked_identity = new_device
         .accept_response(&ciphertext)
         .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
-    let own_identity = own_identity_keypair(&state)?;
-    let confirmed = linked_identity.public_signing_key().to_bytes()
-        == own_identity.public_signing_key().to_bytes()
-        && linked_identity.public_agreement_key().as_bytes()
-            == own_identity.public_agreement_key().as_bytes();
+    let confirmed = match own_identity_keypair(&state) {
+        Ok(own_identity) => {
+            linked_identity.public_signing_key().to_bytes()
+                == own_identity.public_signing_key().to_bytes()
+                && linked_identity.public_agreement_key().as_bytes()
+                    == own_identity.public_agreement_key().as_bytes()
+        }
+        // No `own_identity` on this daemon yet — a genuinely separate new
+        // device, not the same-daemon demo. Decryption already succeeded
+        // above (an `UNPROCESSABLE_ENTITY` would have short-circuited
+        // otherwise), which is the real proof for this case.
+        Err(StatusCode::PRECONDITION_FAILED) => true,
+        Err(other) => return Err(other),
+    };
 
     Ok(Json(FinishLinkResponse {
         confirmed,
         device_signing_key_hex: hex::encode(
-            new_device.device_signing_key.verifying_key().to_bytes(),
+            new_device.device_identity.public_signing_key().to_bytes(),
         ),
+        linked_signing_key_hex: hex::encode(linked_identity.public_signing_key().to_bytes()),
+        linked_agreement_key_hex: hex::encode(linked_identity.public_agreement_key().as_bytes()),
     }))
 }

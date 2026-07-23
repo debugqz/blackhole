@@ -1,0 +1,8 @@
+# TLS termination in front of bh-push-relay — see ../README.md "Why
+# Caddy". Caddy gets a Let's Encrypt cert automatically for
+# PUSH_RELAY_DOMAIN the first time it starts, as long as that domain's DNS
+# already points at this host and ports 80/443 are reachable from the
+# internet (ACME HTTP-01/TLS-ALPN-01 challenges need that).
+{$PUSH_RELAY_DOMAIN} {
+	reverse_proxy push-relay:47900
+}

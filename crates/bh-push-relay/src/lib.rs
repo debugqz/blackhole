@@ -16,11 +16,12 @@
 //! - `POST /register` — a client submits an opaque, rotating token it (or,
 //!   in practice, its own daemon — see `bh-api::push`) generated itself.
 //!   The relay remembers "this token is currently registered," full stop.
-//! - `POST /wake/:token` — called by *that same identity's own* daemon
-//!   (via its `bh-network` mailbox code, once that integration is wired
-//!   up — see the `// TODO(real-push)` marker next to
-//!   `bh_network::mailbox::Mailbox::push`) when a new mailbox item shows
-//!   up for a recipient who has push enabled. If the token is registered,
+//! - `POST /wake/:token` — called by *the sender's* daemon
+//!   (`bh-api::message_crypto::wake_recipient_best_effort`, after a real
+//!   mailbox push actually succeeds) once it fetches and verifies the
+//!   recipient's signed `PushRelayRecord` from the DHT
+//!   (`bh-network::push_relay_directory`,
+//!   `bh_crypto::push_relay::PushRelayRecord`). If the token is registered,
 //!   the relay immediately hands off a *content-free* wake signal to
 //!   whatever downstream push provider is configured, and forgets the
 //!   request happened. It does not queue, retry, or store anything about

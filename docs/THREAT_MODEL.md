@@ -251,6 +251,33 @@ guarantee.
 - **Denial of service**: Kademlia's own protocol-level bounds (bucket
   sizes, query concurrency limits) apply as shipped by `rust-libp2p`;
   nothing Blackhole-specific has been added or reviewed here.
+- **FIXED — DHT bootstrap nodes can now keep a stable `PeerId` across
+  restarts**: `Node::spawn` previously always called `SwarmBuilder::
+  with_new_identity()`, generating a fresh random libp2p keypair on every
+  call — including every restart of the daemon process *and* every
+  respawn `supervised.rs`'s own auto-restart (§3.10) performs after an
+  event-loop panic. A node meant to be a long-lived, publicly-addressed
+  DHT bootstrap entry (the `/p2p/<PeerId>` other nodes put in
+  `BLACKHOLE_BOOTSTRAP_PEERS`) would silently mint a new identity on
+  every one of those events, quietly invalidating every other node's
+  configured address with no signal to anyone. `Node::spawn_with_keypair`
+  / `SupervisedNetwork::spawn_with_bootstrap_and_keypair` now accept a
+  caller-supplied `Keypair` that's reused across every future respawn
+  too (`supervisor_detects_a_dead_node_and_respawns_a_working_one` now
+  asserts `peer_id()` is unchanged after a forced respawn). Deliberately
+  **opt-in only**, via `daemon/src/main.rs`'s
+  `BLACKHOLE_PERSISTENT_NETWORK_IDENTITY` — an ordinary end-user daemon
+  still gets a fresh random identity every run, same as before this
+  existed: nothing today addresses a peer by libp2p `PeerId` (messages
+  route by `recipient_key_hash`, derived from the X3DH identity key), so
+  making it durable by default would add a new cross-restart-linkable
+  network-layer handle for zero benefit to a regular client, only to a
+  deliberately-public bootstrap node. When enabled, the keypair itself is
+  stored via the same `bh-storage::keystore::Keystore` (a new
+  `NETWORK_IDENTITY_KEY_LABEL`) every other long-term secret in this repo
+  already goes through — including, for a headless bootstrap-node
+  deployment, the `BLACKHOLE_KEYSTORE_BACKEND=file` fallback documented
+  in §3.7.
 
 ### 3.6 Mailboxes & sealed sender (`bh-network::mailbox`, `sealed_sender`)
 
@@ -306,6 +333,31 @@ guarantee.
 - **Key management**: the database key and device signing key live in the
   OS credential store (Keychain/Credential Manager/Secret Service via
   `keystore.rs`), never on disk in plaintext next to the database.
+- **Known tradeoff, opt-in — headless/server deployments have no OS
+  keychain to use**: the Linux `keyring` backend is a pure D-Bus Secret
+  Service client (verified against `keyring` 3.x's actual
+  `CredentialBuilderApi::build()` path, not just its feature-flag name —
+  the `linux-native-sync-persistent` feature's in-kernel `keyutils` half
+  turns out to be unreachable through the `Entry::new` API this repo
+  uses), so it needs gnome-keyring/kwallet reachable over a session bus.
+  A `daemon` running as a DHT bootstrap node in a minimal container has
+  neither, and previously would unconditionally `panic!` on first key
+  access with no escape hatch short of bundling a full D-Bus +
+  keyring-daemon sidecar in the image. `BLACKHOLE_KEYSTORE_BACKEND=file`
+  (`keystore.rs`'s `Backend::File`) now provides one: key material is
+  hex-encoded into individual `chmod 600` files under
+  `<data_dir>/keystore-file-backend/` instead. This is a genuine,
+  labeled downgrade, not a free fix — the key sits on the same disk as
+  the SQLCipher ciphertext it protects, so read access to that directory
+  (a misconfigured volume mount, host compromise, an unencrypted backup)
+  compromises both at once, the exact separation the OS-keychain default
+  exists to provide. Off by default, and the module doc/`tracing::warn!`
+  at startup both call this out explicitly. Acceptable specifically for
+  a bootstrap node (holds no real contacts/messages, only its own P2P
+  routing identity — see §3.5's `BLACKHOLE_PERSISTENT_NETWORK_IDENTITY`
+  entry) with the operational mitigations `infra/README.md` documents
+  (dedicated volume, host-level disk encryption, restrictive
+  permissions); not recommended for a real end-user profile.
 - **Elevation of privilege / DoS mitigation**: `panic_wipe` gives a tested,
   irreversible emergency destruction path
   (`panic_wipe_removes_keys_and_data_dir`), confirmed end-to-end through
@@ -540,14 +592,22 @@ Reviewed 2026-07-20, covering everything added in SPEC.md §15.
   `expiry_sweeper_follows_profile_switches` — an expired message on the
   starting profile gets purged, then after switching to a second profile,
   an expired message *there* gets purged too, without a restart.
-- **Calls — no STUN/TURN (`bh-calls::transport`)**: mirrors §3.4/general
-  network state — only peers that can reach each other directly connect
-  today. Unlike the messaging path, there's also no onion routing over
-  call signaling or media; `Envelope::Call` gets the same sealed-sender-
-  via-session protection as any other envelope, but the WebRTC media
-  itself flows directly between the two endpoints once connected (by
-  design — SFrame end-to-end encryption, not anonymity, is the property
-  calls get; see SPEC.md §15).
+- **Calls — STUN present, TURN absent (`bh-calls::transport`)**: a STUN
+  server (`transport::default_ice_servers` — a public server by default,
+  `BLACKHOLE_STUN_SERVERS`-configurable) now helps two peers behind
+  ordinary NATs discover their own reflexive address and connect directly;
+  a peer behind a symmetric NAT still won't connect without a TURN relay,
+  which remains unimplemented (would need a relay server this project
+  would have to host — out of scope, mirrors §3.4/general network state on
+  not having deployed infrastructure). Unlike the messaging path, there's
+  also no onion routing over call signaling or media, and the STUN server
+  itself learns each caller's public IP as an inherent property of how
+  STUN works (it's told "what's my reflexive address," not given any call
+  content or identity) — `Envelope::Call` gets the same sealed-sender-via-
+  session protection as any other envelope, but the WebRTC media itself
+  flows directly between the two endpoints once connected (by design —
+  SFrame end-to-end encryption, not anonymity, is the property calls get;
+  see SPEC.md §15).
 - **Calls — VP8 decode intentionally unimplemented (`bh-calls::video`)**:
   by design (SPEC.md §15) rather than an oversight — no audited safe-Rust
   VP8 decoder exists on crates.io, and hand-rolling one against libvpx's
@@ -803,10 +863,20 @@ storage or synthetic tests.
   (`direct_message_travels_a_real_network_between_two_daemons_and_
   decrypts`) — two independent `AppState`s, two independent identities,
   no shared process state — not a same-process shadow-session test the
-  way device sync/groups still are (§3.11, §3.12). `Group` conversations
-  are **not** wired to this yet — `send_message`'s `Group` arm still
-  only writes locally, so everything in §3.2 about MLS group state
-  remaining process-local still applies there specifically.
+  way device sync still is (§3.11). `Group` conversations are now wired
+  the same way: `send_message`'s `Group` arm encrypts with real MLS and
+  fans the ciphertext out over `Mailbox::fan_out`, and real membership
+  (not just messages) travels the network too — `groups::add_member`
+  fetches a real member's real, DHT-published MLS key package
+  (`bh_network::key_package_directory`) before falling back to the
+  locally-simulated "shadow member" described in §3.2, and delivers the
+  resulting `Welcome`/commit for real. Proven by a genuine three-daemon
+  integration test
+  (`group_membership_and_messages_travel_a_real_network_between_three_
+  daemons`) — three independent `AppState`s, no shared process state,
+  same standard the Direct-message test above sets. §3.2's "MLS group
+  state remaining process-local" characterization now only applies to the
+  shadow-member fallback path, not the real one.
 - **Elevation of privilege (call state/video streaming needs the same
   auth `require_bearer_token` provides everywhere else)**: `GET
   /calls/:call_id/ws` sits behind the same `require_bearer_token`
@@ -901,9 +971,15 @@ now describes what closed it, not that the number was removed.
    on-disk profile.
 9. **`glib` GTK vulnerability** (§3.10) — still open, dormant until a
    Linux build ships, needs upstream Tauri/gtk-rs-core to bump first.
-10. **Calls have no STUN/TURN and no anonymity properties** (§3.11) — still
-    open, same class of gap as #1/#2, now also applicable to call media,
-    not just messaging.
+10. **MITIGATED — calls now have STUN, still no TURN or anonymity
+    properties** (§3.11). `transport::default_ice_servers` adds a
+    (configurable) public STUN server, letting ordinary-NAT peers connect
+    directly without one side needing a public/forwarded address — closes
+    the "nobody behind any NAT could connect" version of this gap. A
+    symmetric NAT on either side still won't connect (needs TURN, not
+    implemented — would require hosting a relay), and call transport still
+    has no onion-routing-equivalent anonymity property, same class of gap
+    as #1/#2, now also applicable to call media, not just messaging.
 11. **MITIGATED — envelope ciphertext-length side channel** (§3.11). Same
     bucket-padding fix as #1, applied to `Envelope::encode`/`decode`;
     same "buckets, not perfectly constant" caveat applies.
@@ -977,8 +1053,10 @@ now describes what closed it, not that the number was removed.
     severity even before this (there was exactly one way to send a
     message, through this one function) but
     worth tracking before this code is refactored.
-20. **Group calls and screen sharing inherit calls' no-STUN/TURN and
-    no-anonymity gaps** (§3.12, same underlying issue as #10) — now also
+20. **Group calls and screen sharing inherit calls' no-TURN and
+    no-anonymity gaps** (§3.12, same underlying issue as #10 — STUN now
+    applies here too, via the same `default_ice_servers` every
+    `new_peer_connection` call site uses, mesh edges included) — now also
     applicable to a full mesh of connections and to shared-screen pixel
     data specifically, plus a new, layer-independent concern: nothing
     technical stops a user from screen-sharing something they didn't mean

@@ -10,9 +10,10 @@
 //! leaving networking silently dead until a manual restart. It's
 //! reachable through `AppState::network` and exposed read-only via
 //! `GET /network/status`; `bh-api::conversations::send_message` also
-//! uses it directly for `Direct` conversations (`message_crypto.rs`),
-//! falling back to local-storage-only behavior when no network is
-//! attached — `Group` conversations aren't wired to it yet. The receive
+//! uses it directly for both `Direct` conversations (`message_crypto.rs`,
+//! X3DH/Double Ratchet) and `Group` conversations (`groups.rs`, MLS +
+//! `Mailbox::fan_out`), falling back to local-storage-only behavior when
+//! no network is attached either way. The receive
 //! side of that same wiring (`bh_api::message_receive::spawn_receive_loop`)
 //! is spawned below, once the network/state are set up — it previously
 //! existed only as code this crate's own integration test exercised
@@ -60,6 +61,12 @@ const MESSAGE_RECEIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// long-lived daemon needs to periodically republish the same way
 /// `prekey_directory`'s own doc comment already notes for prekey bundles.
 const TREE_HEAD_PUBLISH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// How often the dead man's switch sweeper
+/// (`bh_api::dead_mans_switch::checkin_tick`) checks whether the configured
+/// cadence has been exceeded. Coarser than `MESSAGE_RECEIVE_INTERVAL` is
+/// fine — cadences here are measured in days, so a several-minute check
+/// granularity costs nothing meaningful in "how late could it fire."
+const DEAD_MANS_SWITCH_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 fn data_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("BLACKHOLE_DATA_DIR") {
@@ -141,6 +148,33 @@ fn load_or_create_db_key(keystore: &Keystore, label: &str) -> [u8; 32] {
     }
 }
 
+/// Loads a persisted libp2p network identity keypair from the keystore,
+/// generating and storing one on first run — the fix
+/// `bh_network::supervised::SupervisedNetwork::spawn_with_bootstrap_and_keypair`'s
+/// doc comment points at. Only called when
+/// `BLACKHOLE_PERSISTENT_NETWORK_IDENTITY` opts in (see below); an ordinary
+/// daemon never calls this and keeps generating a fresh random identity
+/// every run.
+fn load_or_create_network_identity(keystore: &Keystore) -> bh_network::identity::Keypair {
+    match keystore
+        .load_key(bh_storage::keystore::NETWORK_IDENTITY_KEY_LABEL)
+        .expect("keystore access failed")
+    {
+        Some(bytes) => bh_network::identity::Keypair::from_protobuf_encoding(&bytes)
+            .expect("stored network identity key is corrupted"),
+        None => {
+            let keypair = bh_network::identity::Keypair::generate_ed25519();
+            let bytes = keypair
+                .to_protobuf_encoding()
+                .expect("failed to encode freshly generated network identity key");
+            keystore
+                .store_key(bh_storage::keystore::NETWORK_IDENTITY_KEY_LABEL, &bytes)
+                .expect("failed to store new network identity key in platform keystore");
+            keypair
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -210,21 +244,69 @@ async fn main() {
     // a single point of failure for the whole local HTTP API.
     let network_listen_addr = std::env::var("BLACKHOLE_NETWORK_LISTEN_ADDR")
         .unwrap_or_else(|_| DEFAULT_NETWORK_LISTEN_ADDR.to_string());
-    let network =
-        match SupervisedNetwork::spawn(network_listen_addr, NETWORK_HEALTH_CHECK_INTERVAL).await {
-            Ok(network) => {
-                tracing::info!(peer_id = %network.peer_id(), "P2P network stack started");
-                Some(network)
-            }
+    // Real deployments need a bootstrap-node list to find any peer at all —
+    // Kademlia's routing table only fills in reactively, after a connection
+    // already exists (see `bh_network::supervised::SupervisedNetwork::dial`'s
+    // own doc comment). Comma-separated `Multiaddr`s in `.../p2p/<PeerId>`
+    // form; empty/unset by default since no public bootstrap nodes are
+    // deployed for this project yet — a malformed entry is logged and
+    // skipped rather than failing daemon startup.
+    let bootstrap_peers: Vec<bh_network::Multiaddr> = std::env::var("BLACKHOLE_BOOTSTRAP_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.parse() {
+            Ok(addr) => Some(addr),
             Err(err) => {
-                tracing::error!(
-                    %err,
-                    "failed to start P2P network stack — continuing without it; \
-                     local API/database are unaffected"
-                );
+                tracing::warn!(addr = s, %err, "skipping malformed BLACKHOLE_BOOTSTRAP_PEERS entry");
                 None
             }
-        };
+        })
+        .collect();
+    // Off by default: an ordinary end-user daemon has no reason to want a
+    // network-layer identity that survives a restart (see
+    // `bh_network::transport::Node::spawn_with_keypair`'s doc comment for
+    // why that's a privacy tradeoff, not a free win). A DHT bootstrap
+    // node is the opposite case — its whole job is being a stable address
+    // every other node's `BLACKHOLE_BOOTSTRAP_PEERS` can keep pointing at,
+    // so it opts in here and gets a keypair that's generated once and
+    // reused (via the platform keystore, or `BLACKHOLE_KEYSTORE_BACKEND
+    // =file` in a headless container) across every future restart and
+    // supervisor respawn alike.
+    let persistent_network_identity = std::env::var("BLACKHOLE_PERSISTENT_NETWORK_IDENTITY")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let network_spawn = if persistent_network_identity {
+        let keypair = load_or_create_network_identity(&keystore);
+        SupervisedNetwork::spawn_with_bootstrap_and_keypair(
+            network_listen_addr,
+            NETWORK_HEALTH_CHECK_INTERVAL,
+            bootstrap_peers,
+            keypair,
+        )
+        .await
+    } else {
+        SupervisedNetwork::spawn_with_bootstrap(
+            network_listen_addr,
+            NETWORK_HEALTH_CHECK_INTERVAL,
+            bootstrap_peers,
+        )
+        .await
+    };
+    let network = match network_spawn {
+        Ok(network) => {
+            tracing::info!(peer_id = %network.peer_id(), "P2P network stack started");
+            Some(network)
+        }
+        Err(err) => {
+            tracing::error!(
+                %err,
+                "failed to start P2P network stack — continuing without it; \
+                 local API/database are unaffected"
+            );
+            None
+        }
+    };
 
     // Self-destructing messages (SPEC.md §7) get swept on a timer rather
     // than only purged lazily on read. `AppState::new` spawns this against
@@ -262,6 +344,12 @@ async fn main() {
     // network").
     bh_api::message_receive::spawn_receive_loop(state.clone(), MESSAGE_RECEIVE_INTERVAL);
 
+    // Dead man's switch (`bh_api::dead_mans_switch`): follows whichever
+    // profile is active on every tick (reads `state.db()` fresh, same
+    // shape as the receive loop above), so — like that loop — it never
+    // needs restarting across a profile switch.
+    bh_api::dead_mans_switch::spawn_checkin_sweeper(state.clone(), DEAD_MANS_SWITCH_SWEEP_INTERVAL);
+
     // Key Transparency tree-head gossip (docs/THREAT_MODEL.md §3.1):
     // periodically (re-)publishes whichever profile is active *at daemon
     // startup*'s tree head — unlike the expiry sweeper, this doesn't yet
@@ -280,6 +368,25 @@ async fn main() {
             loop {
                 ticker.tick().await;
                 bh_api::tree_head::publish_own_tree_head(&state_for_tree_head, &network).await;
+            }
+        });
+    }
+
+    // Push-relay registration republish (SPEC.md §5.6,
+    // `bh_api::push::republish_own_registration_best_effort`): same
+    // "Kademlia records expire, redo it periodically" reasoning as the
+    // tree-head loop directly above — reuses its interval, since neither
+    // has a differentiating freshness requirement. A no-op tick whenever
+    // push isn't enabled with a `relay_url` on record.
+    if let Some(network) = state.network.clone() {
+        let state_for_push = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(TREE_HEAD_PUBLISH_INTERVAL);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                bh_api::push::republish_own_registration_best_effort(&state_for_push, &network)
+                    .await;
             }
         });
     }

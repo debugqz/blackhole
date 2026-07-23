@@ -66,13 +66,19 @@ jobs:
       # setting OPENSSL_DIR by hand. bh-calls (SPEC.md §15) needs real
       # system libopus/libvpx (its Opus/VP8 codec bindings aren't bundled —
       # see crates/bh-calls/Cargo.toml) plus libclang for the bindgen pass
-      # env-libvpx-sys runs against whatever libvpx version is installed.
-      # Screen sharing's `scap` dependency additionally needs libpipewire +
-      # libdbus headers on Linux (its xdg-desktop-portal/PipeWire screencast
-      # backend) — macOS/Windows use native platform capture APIs instead
-      # and need nothing extra here.
+      # env-libvpx-sys runs against whatever libvpx version is installed,
+      # plus libasound2-dev for its `cpal` audio-capture dependency's ALSA
+      # backend on Linux — this one was previously undeclared here and CI
+      # still passed only because ubuntu-latest's runner image happens to
+      # ship it already; building infra/bootstrap-node/Dockerfile from a
+      # minimal `rust:1-bookworm` base (no such luck) is what surfaced the
+      # gap, so it's now explicit rather than accidental. Screen sharing's
+      # `scap` dependency additionally needs libpipewire + libdbus headers
+      # on Linux (its xdg-desktop-portal/PipeWire screencast backend) —
+      # macOS/Windows use native platform capture APIs instead and need
+      # nothing extra here.
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev libasound2-dev
 
       - name: Install sccache
         # `sccache` cuts the wall-clock cost of anything not already in

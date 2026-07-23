@@ -387,6 +387,23 @@ impl Group {
         member: &MlsMember<P>,
         message_bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, CryptoError> {
+        self.decrypt_with_sender(member, message_bytes)
+            .map(|decrypted| decrypted.plaintext)
+    }
+
+    /// Same as [`Group::decrypt`], but also reports the sender's opaque
+    /// identity bytes (the same `identity` an application passed to
+    /// [`MlsMember::new`]/[`MlsMember::new_persistent`] when that member
+    /// was created — see [`Group::members`]'s doc comment) — needed by a
+    /// real group-message receive path to know who sent an application
+    /// message, which [`Group::decrypt`] alone can't report. `sender_identity`
+    /// is still populated for a commit (`plaintext` is `None`), reporting
+    /// who committed the membership change.
+    pub fn decrypt_with_sender<P: OpenMlsProvider>(
+        &mut self,
+        member: &MlsMember<P>,
+        message_bytes: &[u8],
+    ) -> Result<DecryptedMessage, CryptoError> {
         let msg_in = MlsMessageIn::tls_deserialize(&mut &message_bytes[..]).map_err(map_err)?;
         let protocol_message: ProtocolMessage = match msg_in.extract() {
             MlsMessageBodyIn::PrivateMessage(m) => m.into(),
@@ -399,23 +416,100 @@ impl Group {
             .process_message(&member.provider, protocol_message)
             .map_err(map_err)?;
 
-        match processed.into_content() {
-            ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(Some(app_msg.into_bytes())),
+        // Captured before `into_content()` consumes `processed` — `Credential`
+        // borrows from `processed`, not from `content`.
+        let sender_identity = processed.credential().serialized_content().to_vec();
+
+        let plaintext = match processed.into_content() {
+            ProcessedMessageContent::ApplicationMessage(app_msg) => Some(app_msg.into_bytes()),
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                 self.inner
                     .merge_staged_commit(&member.provider, *staged_commit)
                     .map_err(map_err)?;
-                Ok(None)
+                None
             }
-            _ => Ok(None),
-        }
+            _ => None,
+        };
+
+        Ok(DecryptedMessage {
+            plaintext,
+            sender_identity,
+        })
     }
+}
+
+/// See [`Group::decrypt_with_sender`].
+pub struct DecryptedMessage {
+    pub plaintext: Option<Vec<u8>>,
+    pub sender_identity: Vec<u8>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mls_storage::PersistentMlsProvider;
+
+    /// Documents *why* a published key package must be replaced with a
+    /// fresh one immediately after this member joins a group with it, not
+    /// just periodically: `join_group` consumes the local HPKE private
+    /// material tied to that specific serialized key package (openmls's
+    /// own single-use-by-design behavior), so reusing the same bytes for a
+    /// second, unrelated group's `add_member`/`join_group` fails outright
+    /// — it isn't just "stale," it's actively broken the moment it's first
+    /// used. `bh-network::key_package_directory`'s own doc comment points
+    /// back at this test for the reasoning.
+    #[test]
+    fn a_consumed_key_package_cannot_be_reused_to_join_a_second_group() {
+        let carol = MlsMember::new(b"carol").unwrap();
+        let carol_kp = carol.generate_key_package().unwrap();
+
+        let alice = MlsMember::new(b"alice").unwrap();
+        let mut alice_group = alice.create_group().unwrap();
+        let added1 = alice_group.add_member(&alice, &carol_kp).unwrap();
+        assert!(
+            carol
+                .join_group(&added1.welcome, &added1.ratchet_tree)
+                .is_ok(),
+            "first join, consuming the key package, must succeed"
+        );
+
+        let bob = MlsMember::new(b"bob").unwrap();
+        let mut bob_group = bob.create_group().unwrap();
+        let added2 = bob_group.add_member(&bob, &carol_kp).unwrap();
+        assert!(
+            carol
+                .join_group(&added2.welcome, &added2.ratchet_tree)
+                .is_err(),
+            "a second join reusing the same already-consumed key package bytes must fail"
+        );
+    }
+
+    #[test]
+    fn decrypt_with_sender_reports_who_sent_an_application_message_and_who_committed() {
+        let alice = MlsMember::new(b"alice").unwrap();
+        let bob = MlsMember::new(b"bob").unwrap();
+
+        let mut alice_group = alice.create_group().unwrap();
+        let bob_kp = bob.generate_key_package().unwrap();
+        let added = alice_group.add_member(&alice, &bob_kp).unwrap();
+        let mut bob_group = bob.join_group(&added.welcome, &added.ratchet_tree).unwrap();
+
+        // An application message from Alice must report Alice's identity,
+        // not Bob's or an empty one.
+        let ciphertext = alice_group.encrypt(&alice, b"hello group").unwrap();
+        let decrypted = bob_group.decrypt_with_sender(&bob, &ciphertext).unwrap();
+        assert_eq!(decrypted.plaintext, Some(b"hello group".to_vec()));
+        assert_eq!(decrypted.sender_identity, b"alice");
+
+        // A commit is still attributed to whoever committed it, even though
+        // its own `plaintext` is `None`.
+        let carol = MlsMember::new(b"carol").unwrap();
+        let carol_kp = carol.generate_key_package().unwrap();
+        let added2 = alice_group.add_member(&alice, &carol_kp).unwrap();
+        let decrypted = bob_group.decrypt_with_sender(&bob, &added2.commit).unwrap();
+        assert_eq!(decrypted.plaintext, None);
+        assert_eq!(decrypted.sender_identity, b"alice");
+    }
 
     #[test]
     fn two_members_exchange_a_group_message() {

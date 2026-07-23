@@ -71,3 +71,4 @@ bh-storage = { path = "crates/bh-storage" }
 bh-files = { path = "crates/bh-files" }
 bh-api = { path = "crates/bh-api" }
 bh-calls = { path = "crates/bh-calls" }
+bh-push-relay = { path = "crates/bh-push-relay" }

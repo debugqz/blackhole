@@ -1,0 +1,16 @@
+# Keeps the Docker build context small and the layer cache useful — see
+# infra/README.md. Only `infra/*/Dockerfile` builds happen in this repo
+# today (the bootstrap-node `daemon` binary and `bh-push-relay`), both of
+# which need the Cargo workspace (workspace-relative paths in Cargo.toml
+# mean every crate under `crates/`, plus `daemon/` and
+# `client/desktop/src-tauri/` since they're workspace members, has to stay
+# in the build context even though the Tauri crate itself isn't built by
+# either infra image) but never the desktop client's own build output or
+# any local Rust build cache.
+target/
+client/desktop/node_modules/
+client/desktop/dist/
+client/desktop/src-tauri/target/
+.git/
+docs/
+*.md

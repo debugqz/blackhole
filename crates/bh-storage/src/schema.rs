@@ -7,7 +7,7 @@ use rusqlite::Connection;
 
 use crate::StorageError;
 
-pub const CURRENT_VERSION: i64 = 15;
+pub const CURRENT_VERSION: i64 = 20;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS own_identity (
@@ -450,6 +450,121 @@ CREATE TABLE IF NOT EXISTS own_prekey (
 );
 "#;
 
+// v16 adds this identity's currently-published MLS key package — see
+// `models::OwnMlsKeyPackage`'s doc comment for why it's a single-use record
+// (unlike `own_prekey`'s deliberately-reusable signed prekey) that must be
+// replaced every time it's consumed by a real `add_member`/`join_group`,
+// not just periodically. Single-row, same pattern as `own_prekey`.
+const SCHEMA_V16: &str = r#"
+CREATE TABLE IF NOT EXISTS own_mls_key_package (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    signer_public_key  BLOB NOT NULL,
+    key_package_bytes  BLOB NOT NULL,
+    created_at         INTEGER NOT NULL
+);
+"#;
+
+// v17 adds a local "dead man's switch" (see `bh-api::dead_mans_switch`'s
+// module doc for the full design): a single-row per-profile config
+// (armed/cadence/last-check-in/fired-once latch) plus a list of predefined
+// (contact, text) release entries. Text only — see
+// `bh-api::files::upload_attachment`'s doc comment for why attachments have
+// no real network delivery yet in this codebase, so this feature
+// deliberately never offers one. Delivery itself reuses the existing
+// Direct-conversation send path (`bh-api::conversations::send_message` /
+// `message_crypto::send_encrypted_over_network`) — nothing here is a new
+// crypto or transport primitive, just scheduling plus a release list.
+// `triggered_at` is the re-arm latch: once set, the sweeper
+// (`bh-api::dead_mans_switch::checkin_tick`) never fires again for this row
+// until the user disables and re-enables it (which clears it and resets
+// `last_check_in_at`, see `Database::activate_dead_mans_switch`).
+const SCHEMA_V17: &str = r#"
+CREATE TABLE IF NOT EXISTS dead_mans_switch (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled           INTEGER NOT NULL DEFAULT 0,
+    cadence_days      INTEGER NOT NULL,
+    last_check_in_at  INTEGER NOT NULL,
+    triggered_at      INTEGER,
+    updated_at        INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dead_mans_switch_release (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_id   TEXT NOT NULL REFERENCES contacts(contact_id) ON DELETE CASCADE,
+    body         TEXT NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dms_release_contact ON dead_mans_switch_release(contact_id);
+"#;
+
+// v18 widens a linked device's identity past just the Ed25519 signing key
+// `device_link.rs` originally recorded: `identity_agreement_key` is the
+// X25519 half of the same per-device `IdentityKeyPair` a linked device now
+// generates during linking (`bh_crypto::device_link::NewDevice::
+// device_identity`) — together with the existing `public_key` (signing)
+// column, `public_key || identity_agreement_key` is the same 64-byte
+// `signing || agreement` layout `Contact.identity_public_key` already
+// uses, letting a linked device be addressed via `recipient_key_hash`/
+// `prekey_directory` exactly like a contact (`bh-api::device_sync`'s
+// module doc). Nullable: existing rows linked before this column existed
+// have no agreement key on record yet (the same-daemon simulation never
+// needed one) and simply can't be addressed over the real network until
+// re-linked.
+const SCHEMA_V18: &str = r#"
+ALTER TABLE devices ADD COLUMN identity_agreement_key BLOB;
+"#;
+
+// v19 adds ephemeral identities (see `bh-api::ephemeral_identity`'s module
+// doc): a throwaway `IdentityKeyPair`, generated on demand and good for a
+// caller-chosen number of days, meant to be handed out via an invite
+// instead of the profile's real identity for a one-off interaction with a
+// stranger. `shadow_contact_id`/`conversation_id` point at a
+// locally-generated stand-in contact and its conversation (same spirit as
+// `groups.rs`'s shadow members) that make the identity demoable without a
+// real remote counterpart — v1 deliberately doesn't poll a second mailbox
+// for it, see that module doc for why. `conversation_id` is a plain,
+// unenforced pointer (no `REFERENCES` — the row is inserted before the
+// conversation exists, and `conversations.ephemeral_identity_id` already
+// points the other way, so a `REFERENCES` here would be a cycle); it's set
+// once at creation and only ever read.
+// `conversations.ephemeral_identity_id` is `ON DELETE CASCADE` so
+// deleting the `ephemeral_identity` row (on manual revoke or sweep-driven
+// expiry, `Database::wipe_ephemeral_identity`) cascades to delete its
+// conversation and, from there, every message in it via `messages`' own
+// existing cascade to `conversations` — a real, irreversible wipe, not a
+// soft-delete. The shadow `contacts` row isn't reachable through that
+// cascade chain (nothing references `ephemeral_identity` from `contacts`),
+// so `wipe_ephemeral_identity` deletes it with one explicit extra
+// statement.
+const SCHEMA_V19: &str = r#"
+CREATE TABLE IF NOT EXISTS ephemeral_identity (
+    id                     TEXT PRIMARY KEY,
+    label                  TEXT,
+    identity_public_key    BLOB NOT NULL,
+    identity_private_key   BLOB NOT NULL,
+    shadow_contact_id      TEXT,
+    conversation_id        TEXT NOT NULL,
+    created_at             INTEGER NOT NULL,
+    expires_at             INTEGER NOT NULL
+);
+
+ALTER TABLE conversations ADD COLUMN ephemeral_identity_id TEXT REFERENCES ephemeral_identity(id) ON DELETE CASCADE;
+"#;
+
+// v20 adds `relay_url` to the existing `push_registration` row (`SCHEMA_
+// V12`): the base URL of the `bh-push-relay` instance this profile
+// registered `token` with, so it can be published (signed, via
+// `bh_crypto::push_relay::PushRelayRecord`) to the DHT for contacts to
+// discover — see `bh-network::push_relay_directory` and
+// `bh-api::push`'s wiring of `POST {relay_url}/register`/`/wake/:token`.
+// `NULL` for a pre-existing row (or one that never supplied a relay URL)
+// means "local-only token, not actually reachable over the network" —
+// the same fallback every other network-touching feature in this
+// codebase already has for "no live network."
+const SCHEMA_V20: &str = r#"
+ALTER TABLE push_registration ADD COLUMN relay_url TEXT;
+"#;
+
 /// Each step's DDL runs together with `PRAGMA user_version = N` for that
 /// same step. `SCHEMA_V2`/`SCHEMA_V5` contain `ALTER TABLE ... ADD COLUMN`,
 /// which is *not* idempotent (SQLite errors on a column that already
@@ -479,6 +594,11 @@ const STEPS: &[(i64, &str, bool)] = &[
     (13, SCHEMA_V13, false),
     (14, SCHEMA_V14, false),
     (15, SCHEMA_V15, false),
+    (16, SCHEMA_V16, false),
+    (17, SCHEMA_V17, false),
+    (18, SCHEMA_V18, false),
+    (19, SCHEMA_V19, false),
+    (20, SCHEMA_V20, false),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StorageError> {

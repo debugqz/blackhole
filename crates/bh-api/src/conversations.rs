@@ -164,8 +164,19 @@ pub async fn send_message(
         // integration test suite) keeps today's local-storage-only
         // behavior, matching `network.rs`'s `GET /network/status`
         // reporting `enabled: false` rather than erroring in that case.
+        // A conversation tagged with `ephemeral_identity_id` (see
+        // `ephemeral_identity.rs`'s module doc) always stays local-storage-
+        // only regardless of `state.network`: sending it for real would
+        // sign/encrypt under this profile's *real* identity, not the
+        // ephemeral one the conversation is supposed to represent — wrong,
+        // not just incomplete, so it's skipped outright rather than
+        // falling back on a per-call basis.
         ConversationKind::Direct => {
-            if let Some(network) = &state.network {
+            let network = state
+                .network
+                .as_ref()
+                .filter(|_| conversation.ephemeral_identity_id.is_none());
+            if let Some(network) = network {
                 let contact_id = conversation
                     .contact_id
                     .as_deref()
@@ -206,12 +217,54 @@ pub async fn send_message(
                 tracing::trace!(%conversation_id, "storing message (no live network attached)");
             }
         }
-        // Real MLS ciphertext fan-out over the network is a separate
-        // follow-up from the Direct/X3DH wiring above — see
-        // `message_crypto`'s module doc for why this pass scoped to
-        // `Direct` only.
+        // Real MLS ciphertext fan-out (`Mailbox::fan_out`) — same
+        // network-optional posture as the `Direct` arm above: falls back to
+        // local-storage-only when no live network is attached.
         ConversationKind::Group => {
-            tracing::trace!(%conversation_id, "storing group message");
+            if let Some(network) = &state.network {
+                let group_id = conversation
+                    .group_id
+                    .as_deref()
+                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                let group_id_bytes =
+                    hex::decode(group_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                // Same envelope type Direct messages use — a group's
+                // mailbox operator (or anyone observing the shared
+                // `fan_out` key) sees ciphertext indistinguishable in shape
+                // from a 1:1 message, same metadata-resistance goal
+                // `message_crypto.rs`'s module doc describes for Direct.
+                let envelope_bytes = Envelope::Text {
+                    body: req.body.clone(),
+                    reply_to_message_id: None,
+                }
+                .encode()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let ciphertext =
+                    crate::groups::encrypt_group_message(&state, group_id, &envelope_bytes)?;
+
+                let sent_at = now();
+                let pow = bh_network::mailbox::Mailbox::solve_pow(
+                    &group_id_bytes,
+                    message_id.as_bytes(),
+                    &ciphertext,
+                    sent_at,
+                );
+                network
+                    .mailbox()
+                    .fan_out(
+                        &group_id_bytes,
+                        message_id.as_bytes(),
+                        ciphertext,
+                        crate::message_crypto::MAILBOX_TTL_SECONDS,
+                        sent_at,
+                        &pow,
+                    )
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            } else {
+                tracing::trace!(%conversation_id, "storing group message (no live network attached)");
+            }
         }
     }
 

@@ -48,6 +48,14 @@ pub struct CreateInviteRequest {
     /// Maximum number of times the issuer will accept a handshake using
     /// this token, if set (e.g. `Some(1)` for a single-use invite).
     pub max_uses: Option<i64>,
+    /// Issue this invite from an ephemeral identity
+    /// (`ephemeral_identity.rs`) instead of the profile's real one —
+    /// whoever scans it ends up with the ephemeral identity's public keys,
+    /// never the real ones. `404` if the id doesn't exist (already
+    /// expired/revoked, or never existed — both look identical, since a
+    /// wiped ephemeral identity is deleted outright, not soft-deleted).
+    #[serde(default)]
+    pub ephemeral_identity_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -62,7 +70,21 @@ pub async fn create_invite(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateInviteRequest>,
 ) -> Result<Json<CreateInviteResponse>, StatusCode> {
-    let identity = load_identity(&state)?;
+    let identity = match &req.ephemeral_identity_id {
+        Some(id) => {
+            let stored = state
+                .db()
+                .get_ephemeral_identity(id)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .ok_or(StatusCode::NOT_FOUND)?;
+            let bytes: [u8; 64] = stored
+                .identity_private_key
+                .try_into()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            IdentityKeyPair::import_bytes(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        }
+        None => load_identity(&state)?,
+    };
     let created_at = now();
 
     let mut payload = InvitePayload::for_identity(&identity, req.display_name)

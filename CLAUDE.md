@@ -58,9 +58,30 @@ and "what could go wrong here" questions are already answered there.
   by a real two-daemon integration test, not a same-process shadow
   session — see `bh-api/tests/api_smoke.rs`'s
   `direct_message_travels_a_real_network_between_two_daemons_and_decrypts`.
-  **`Group` conversations are not wired yet** — real MLS ciphertext
-  fan-out via `Mailbox::fan_out` is a separate follow-up, deliberately out
-  of scope for this pass (see `message_crypto.rs`'s module doc).
+  **`Group` conversations are now wired too**: `conversations::send_message`'s
+  `Group` arm encrypts with real MLS (`bh_crypto::mls::Group::encrypt`) and
+  fans the ciphertext out over `Mailbox::fan_out`, keyed by the group id
+  rather than a per-recipient mailbox; `message_receive.rs`'s loop grew a
+  second per-tick phase that polls every locally-known group's shared
+  mailbox, decrypts with `Group::decrypt_with_sender`, and delivers —
+  deliberately never deleting a processed entry (it's shared by every
+  member) and instead tracking already-attempted message ids in-process
+  (`GroupRegistry::already_attempted_group_message`) so a daemon doesn't
+  re-decrypt the same backlog every tick. Real membership travels the
+  network too, not just messages: `groups::add_member`/`create_group` now
+  fetch a real member's real, DHT-published MLS key package
+  (`bh_network::key_package_directory`, `bh-api::mls_key_package` owning
+  this identity's own single-use key package — republished after every
+  consumption, not just periodically, since an MLS key package's private
+  material is consumed by `join_group`, unlike an X3DH signed prekey)
+  before falling back to the previous locally-simulated "shadow member" (no
+  live network, no key package published yet, or no `Contact` row).
+  The resulting `Welcome` travels to the new member over the existing 1:1
+  mailbox as a new `Envelope::GroupInvite`, and the resulting commit fans
+  out over the group mailbox to already-joined real members. Proven
+  end-to-end by a genuine three-daemon integration test — see
+  `bh-api/tests/api_smoke.rs`'s
+  `group_membership_and_messages_travel_a_real_network_between_three_daemons`.
 - `crates/bh-crypto` — identity + seed phrase, passkeys/TOTP, X3DH + Double
   Ratchet, MLS, PQ hybrid, invite QR/links, device linking, encrypted
   backups (SPEC.md §2-4). All real, tested implementations. Also:
@@ -88,13 +109,39 @@ and "what could go wrong here" questions are already answered there.
   `bh-crypto::ratchet::PreKeyBundle`'s own doc comment already pointed at.
   `supervised.rs` wraps the event loop so a panic (e.g. the live `yamux`
   CVE, THREAT_MODEL.md §3.10) respawns a fresh node instead of permanently
-  killing that node's networking, and now also exposes `dial()` for
-  connecting to a known peer directly (real deployments still need a
-  bootstrap-node list, not implemented here).
+  killing that node's networking, and exposes `dial()` for connecting to a
+  known peer directly plus `spawn_with_bootstrap()` for dialing a
+  configured list on startup *and* after any respawn (a respawned node's
+  routing table is always empty — see that method's own doc comment — and,
+  by default, so is its libp2p identity: `Node::spawn`/`spawn_with_bootstrap`
+  generate a fresh random keypair every call). `daemon/src/main.rs` reads
+  the bootstrap list from `BLACKHOLE_BOOTSTRAP_PEERS` (comma-separated
+  multiaddrs), empty/unset by default since no public bootstrap nodes are
+  deployed for this project yet. **A stable-identity variant now exists**
+  for the deployment that actually needs one — a bootstrap node, whose
+  whole job is being an address other nodes' `BLACKHOLE_BOOTSTRAP_PEERS`
+  can keep pointing at: `Node::spawn_with_keypair`/`SupervisedNetwork::
+  spawn_with_bootstrap_and_keypair` accept a caller-supplied `Keypair` that
+  survives both a process restart and a mid-life supervisor respawn alike,
+  gated behind `daemon/src/main.rs`'s `BLACKHOLE_PERSISTENT_NETWORK_IDENTITY`
+  opt-in (off by default — an ordinary end-user daemon has no reason to
+  want a network-layer identity that outlives one run, THREAT_MODEL.md
+  §3.5). `key_package_directory.rs` publishes/fetches MLS key packages via
+  the DHT, the group-membership counterpart to `prekey_directory.rs` (see
+  the `Group` conversations entry above) — deliberately single-use, unlike
+  `prekey_directory`'s reusable bundle, since `openmls` invalidates a key
+  package's local private material the moment it's consumed by a real
+  `join_group`.
 - `crates/bh-storage` — SQLCipher-backed data model (contacts,
   conversations, messages, groups, devices, sessions, files, settings),
   platform keystore (Keychain/Credential Manager/Secret Service via
   `keyring`), panic wipe, self-destruct message sweeper (SPEC.md §7).
+  `keystore.rs` also has an opt-in headless fallback now:
+  `BLACKHOLE_KEYSTORE_BACKEND=file` switches to key material stored as
+  `chmod 600` files under `<data_dir>/keystore-file-backend/` instead of
+  the OS keychain, for deployments (a DHT bootstrap node in a container)
+  with no D-Bus Secret Service to talk to — off by default, and a genuine,
+  labeled downgrade, not a free fix, see THREAT_MODEL.md §3.7.
   Also: `db_key_lock.rs` (optional PIN layer sealing the SQLCipher key,
   Argon2id + ChaCha20-Poly1305, opt-in per profile — now also reachable
   via a WebAuthn passkey's PRF-derived secret instead of a typed PIN, see
@@ -141,18 +188,45 @@ and "what could go wrong here" questions are already answered there.
   `bh-storage`/`bh-crypto`/`bh-calls`/`bh-files`, verified end-to-end via
   live HTTP smoke tests during development plus an in-process
   `tower::ServiceExt` integration test suite
-  (`crates/bh-api/tests/api_smoke.rs`). Device linking, device sync,
-  groups, and file attachments are deliberately scoped to what works
-  without a live `bh-network`: device linking is a single-daemon
-  simulation of the real 4-step protocol (not a second physical device);
-  device sync exercises a genuine X3DH + Double Ratchet handshake between
-  the primary device's real identity and a locally-generated shadow
-  identity for the linked device's endpoint (same trick groups uses for
-  contacts) so the sync round-trip is real crypto, not a same-process
-  echo; groups (including broadcast channels and group calls) use
-  per-contact/per-participant "shadow" MLS members generated locally to
-  exercise the real crypto path (not real remote peers); and live MLS
-  group state does survive a daemon restart
+  (`crates/bh-api/tests/api_smoke.rs`). **Device linking and device sync
+  now travel the real network too**, each proven by a genuine two-daemon
+  integration test with zero shared process state: device linking's
+  4-step ceremony (`begin`/`scan`/`accept`/`finish`) routes its two
+  bootstrap ciphertexts through a new one-shot DHT relay
+  (`bh_network::device_link_relay`) when a network is attached — a
+  genuinely separate "new device" daemon (no `own_identity` of its own
+  yet) recovers the primary's real account identity this way
+  (`device_linking_completes_a_real_ceremony_between_two_daemons_over_the_network`);
+  the linked device's own per-device identity was widened from a bare
+  Ed25519 signing key to a full signing+X25519-agreement pair
+  (`bh_crypto::device_link::NewDevice::device_identity`) specifically so
+  it can be addressed the same way a `Contact` is. Device sync then
+  pushes real pending `Direct`-conversation messages to that device's real
+  mailbox (`device_sync::sync_device_over_network`, reusing
+  `message_crypto::send_encrypted_over_network` against a pseudo-`Contact`
+  built from the `Device` row) rather than encrypting-and-immediately-
+  decrypting in the same process
+  (`device_sync_pushes_a_real_message_to_a_linked_device_over_the_network`).
+  **Deliberately still out of scope** (see `device_link.rs`'s own module
+  doc): a real linked device does not install the transferred account
+  identity as its own `own_identity` — doing so would collide its
+  `recipient_key_hash` with the primary's, and this codebase's `Direct`
+  mailbox is delete-on-read/single-consumer (unlike `Group`'s
+  `Mailbox::fan_out`), so two daemons racing to pull the same account's
+  incoming mail would silently drop messages for whichever loses. Falls
+  back to the pre-existing same-daemon simulation whenever there's no live
+  network (or, for sync, no `identity_agreement_key` on record for that
+  device yet) — same-daemon device linking exercises the real 4-step
+  protocol without a second physical device; same-daemon device sync
+  exercises a genuine X3DH + Double Ratchet handshake between the primary
+  device's real identity and a locally-generated shadow identity for the
+  linked device's endpoint (same trick groups uses for contacts). Groups
+  (including broadcast channels and group calls) similarly fall back to
+  per-contact/per-participant "shadow" MLS members generated locally
+  whenever there's no live network or no real key package published yet
+  for the target contact (see the `bh-network`/`bh-crypto` entries above
+  for the real-network group-membership path) — and live MLS group state
+  does survive a daemon restart
   (`bh_crypto::mls_storage::PersistentMlsProvider` backs the own member in
   every group, and `bh-api::groups.rs` reconstructs a `GroupRegistry`
   cache miss from storage — `add_member`/`remove_member`/`mls-self-test`
@@ -193,9 +267,17 @@ and "what could go wrong here" questions are already answered there.
   Linux): frames flow through the *exact same* VP8 encode + SFrame
   encrypt path camera video already uses, just on a second, parallel
   track (`"screen"` vs `"video"` track id) — not a separate codec or
-  encryption scheme. No STUN/TURN yet, same current limitation as
-  `bh-network`, so today's WebRTC connections (1:1, group-mesh, and
-  screen-share alike) only work when peers can reach each other directly.
+  encryption scheme. STUN is wired in (`transport::default_ice_servers`
+  — a public server by default, `BLACKHOLE_STUN_SERVERS`-configurable, used
+  by every `new_peer_connection` call site including group-mesh edges), so
+  ordinary-NAT peers no longer both need to be directly reachable. **TURN
+  is now configurable too** — `BLACKHOLE_TURN_SERVERS` (comma-separated
+  `turn:`/`turns:` URLs) plus `BLACKHOLE_TURN_USERNAME`/
+  `BLACKHOLE_TURN_CREDENTIAL`, all three required together or none is added
+  (`default_ice_servers` fails soft with a `tracing::warn!` rather than
+  building a config `webrtc-rs` would reject at connection time) — but no
+  TURN server is deployed for this project, so unless an operator sets all
+  three, a symmetric NAT on either side still won't connect.
   Needs `opus`, `libvpx`, and `pkg-config` installed at build time (see
   `crates/bh-calls/Cargo.toml`); the Linux screen-capture backend
   additionally needs `libpipewire`/`libdbus` headers (see
@@ -204,15 +286,49 @@ and "what could go wrong here" questions are already answered there.
   part of the `bh-api` loopback-only daemon) whose *only* job is relaying
   an opaque "wake up" token — never message content, sender identity, or
   conversation id. `POST /register` accepts a client's opaque token;
-  `POST /wake/:token` (called by the daemon's mailbox code once wired —
-  currently a marked `// TODO(real-push)` integration point, not built)
-  triggers a content-free push to whatever real provider (APNs/FCM/
-  UnifiedPush) is plugged in later, itself still a stub
-  (`forward_to_push_provider`). In-memory only, no database, no logging
-  beyond what's operationally necessary — see the crate's own module doc
-  for the full design rationale (SPEC.md §5.6). The daemon-side
-  registration state (opaque, rotating token + on/off) lives in
-  `bh-storage::push`/`bh-api::push`, opt-in and off by default.
+  `POST /wake/:token` triggers a content-free push to whatever real
+  provider (APNs/FCM/UnifiedPush) is plugged in later, itself still a stub
+  (`forward_to_push_provider`, `// TODO(real-push)`, needs platform
+  credentials this repo can't provision). In-memory only, no database, no
+  logging beyond what's operationally necessary — see the crate's own
+  module doc for the full design rationale (SPEC.md §5.6).
+  **The daemon side is now genuinely wired to a relay, not just a local
+  token store.** `bh-api::push`'s registration state (opaque, rotating
+  token + on/off, `bh-storage::push`, opt-in and off by default) grew a
+  `relay_url` field (`SCHEMA_V20`); when set with a live network attached,
+  enabling push actually calls the relay's real `POST /register` and
+  signs-and-publishes a `bh_crypto::push_relay::PushRelayRecord` to the
+  DHT (`bh-network::push_relay_directory`, the push-relay counterpart to
+  `prekey_directory` — republished periodically alongside the Key
+  Transparency tree head, same daemon-loop pattern,
+  `push::republish_own_registration_best_effort`) *before* writing
+  anything locally — both must succeed, so "push is enabled" can't drift
+  from "a contact could actually reach it." The record is signed (not a
+  bare DHT value) because an unsigned one would let any DHT node inject an
+  attacker-chosen `relay_url`, turning the *fetching* peer's own daemon
+  into an SSRF client against a URL it never agreed to; verification uses
+  the same already-locally-trusted `Contact::identity_public_key` X3DH
+  itself relies on, so no new trust bootstrap was needed. On the send
+  side, `bh-api::message_crypto::wake_recipient_best_effort` — the actual
+  landing site the old `// TODO(real-push)` marker pointed at — runs
+  right after a real mailbox push succeeds: fetches the recipient's
+  record, verifies it, and calls `POST {relay_url}/wake/{token}`,
+  best-effort (logged, never propagated, since the message itself has
+  already genuinely been delivered either way). Proven end-to-end by a
+  real two-daemon test plus a genuine third, separately-listening
+  `RelayServer` instance (real TCP, not `oneshot` — the daemon reaches it
+  over real HTTP via `reqwest`) —
+  `bh-api/tests/api_smoke.rs`'s
+  `sending_a_message_wakes_the_recipients_real_push_relay`.
+  **Still not deployed**: this is all code-level wiring — no actual
+  `bh-push-relay` instance runs anywhere for real users yet, same as
+  `bh-network`'s own bootstrap nodes and TURN above; an operator still has
+  to run one and point `relay_url` at it. The desktop client's push-toggle
+  UI also doesn't yet have a `relay_url` input field (still sends
+  `{"enabled": true}` with no `relay_url`, which keeps working — the field
+  is optional and falls back to the pre-existing local-only behavior) —
+  wiring that up is a separate, explicit follow-up, same "backend wired,
+  client catches up later" precedent 1:1 calls set.
 - `client/desktop` — Tauri desktop client. Real product UI (monochrome
   "Event Horizon" visual direction), wired end-to-end against every
   same-profile `bh-api` route that doesn't need a live network: identity
@@ -278,14 +394,25 @@ and "what could go wrong here" questions are already answered there.
   webview via Tauri's event system (`call-event`/`call-frame`, binary
   frames base64-encoded in the JSON payload — the same lesson
   `message_crypto.rs`'s sealed-sender fix learned about not JSON-encoding
-  raw `Vec<u8>` on the daemon side). **Scope note, matching the existing
+  raw `Vec<u8>` on the daemon side). **1:1 calls now place a real call to a
+  real contact**: the "Call"/"Video" buttons (`main.ts`'s `startCall`) read
+  the open conversation's real `contact_id` and pass it to `POST /calls`,
+  which — per `bh-api::calls`'s own module doc — routes the offer through
+  that contact's real mailbox instead of the same-daemon demo path; falls
+  back to the old same-daemon demo automatically for conversations with no
+  resolved `contact_id` (e.g. "Notes to self"). There's still no unprompted
+  "incoming call" ringing UI — the daemon auto-answers a real incoming
+  offer server-side — but the client now polls `GET /calls/network`
+  (`bh-api::calls::list_network_calls`) and shows a minimal banner
+  ("Call with X" + Join/Dismiss) once a call it didn't place itself goes
+  live. **Group calls remain the same-daemon demo** (matching the existing
   "device linking (local simulation, labeled as such in the UI)"
-  precedent**: since call-signal delivery between two separate devices
-  still isn't wired into the P2P network (`bh-api::calls`'s own module
-  doc), every call this UI starts plays both the caller and callee role
-  against this same daemon — the WebRTC connection, media capture/encode,
-  and SFrame end-to-end encryption are all genuine, only the signaling
-  hop is local instead of over the network, and the UI says so. The
+  precedent): `bh-api::calls`'s own module doc explains `GroupOffer`/
+  `GroupAnswer` are deliberately not routed over the network yet, so every
+  group call this UI starts still plays every participant role against
+  this same daemon — the WebRTC connections, media capture/encode, and
+  SFrame end-to-end encryption are all genuine, only the signaling hop is
+  local instead of over the network, and the UI says so. The
   passkey enroll/unlock/PRF WebAuthn glue
   (`navigator.credentials.create()/get()` in `main.ts`) can't be
   exercised headlessly — verify manually on real hardware (Touch ID/

@@ -65,6 +65,7 @@ async fn wake(State(state): State<Arc<RelayState>>, Path(token): Path<String>) -
     if !state.is_registered(&token) {
         return StatusCode::NOT_FOUND;
     }
+    state.record_wake(&token);
     forward_to_push_provider(&token);
     StatusCode::ACCEPTED
 }

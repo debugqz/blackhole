@@ -13,13 +13,14 @@ use crate::{models::PushRegistration, Database, StorageError};
 impl Database {
     pub fn set_push_registration(&self, reg: &PushRegistration) -> Result<(), StorageError> {
         self.conn()?.execute(
-            "INSERT INTO push_registration (id, token, enabled, updated_at)
-             VALUES (1, ?1, ?2, ?3)
+            "INSERT INTO push_registration (id, token, enabled, updated_at, relay_url)
+             VALUES (1, ?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
                 token = excluded.token,
                 enabled = excluded.enabled,
-                updated_at = excluded.updated_at",
-            params![reg.token, reg.enabled as i64, reg.updated_at],
+                updated_at = excluded.updated_at,
+                relay_url = excluded.relay_url",
+            params![reg.token, reg.enabled as i64, reg.updated_at, reg.relay_url],
         )?;
         Ok(())
     }
@@ -27,13 +28,14 @@ impl Database {
     pub fn get_push_registration(&self) -> Result<Option<PushRegistration>, StorageError> {
         self.conn()?
             .query_row(
-                "SELECT token, enabled, updated_at FROM push_registration WHERE id = 1",
+                "SELECT token, enabled, updated_at, relay_url FROM push_registration WHERE id = 1",
                 [],
                 |row| {
                     Ok(PushRegistration {
                         token: row.get(0)?,
                         enabled: row.get::<_, i64>(1)? != 0,
                         updated_at: row.get(2)?,
+                        relay_url: row.get(3)?,
                     })
                 },
             )
@@ -71,6 +73,7 @@ mod tests {
             token: "abc123".into(),
             enabled: true,
             updated_at: 100,
+            relay_url: Some("https://relay.example".into()),
         })
         .unwrap();
 
@@ -78,6 +81,22 @@ mod tests {
         assert_eq!(reg.token, "abc123");
         assert!(reg.enabled);
         assert_eq!(reg.updated_at, 100);
+        assert_eq!(reg.relay_url.as_deref(), Some("https://relay.example"));
+    }
+
+    #[test]
+    fn relay_url_defaults_to_none_when_omitted() {
+        let db = Database::open_in_memory(&[1u8; 32]).unwrap();
+        db.set_push_registration(&PushRegistration {
+            token: "abc123".into(),
+            enabled: true,
+            updated_at: 100,
+            relay_url: None,
+        })
+        .unwrap();
+
+        let reg = db.get_push_registration().unwrap().unwrap();
+        assert_eq!(reg.relay_url, None);
     }
 
     #[test]
@@ -87,17 +106,20 @@ mod tests {
             token: "first".into(),
             enabled: true,
             updated_at: 1,
+            relay_url: None,
         })
         .unwrap();
         db.set_push_registration(&PushRegistration {
             token: "second".into(),
             enabled: true,
             updated_at: 2,
+            relay_url: Some("https://relay.example".into()),
         })
         .unwrap();
 
         let reg = db.get_push_registration().unwrap().unwrap();
         assert_eq!(reg.token, "second");
+        assert_eq!(reg.relay_url.as_deref(), Some("https://relay.example"));
     }
 
     #[test]
@@ -107,6 +129,7 @@ mod tests {
             token: "abc123".into(),
             enabled: true,
             updated_at: 100,
+            relay_url: None,
         })
         .unwrap();
         assert!(db.get_push_registration().unwrap().is_some());

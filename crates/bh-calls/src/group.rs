@@ -147,7 +147,7 @@ impl GroupCallSession {
     }
 
     async fn new_edge_pc(&self) -> Result<Arc<RTCPeerConnection>, CallError> {
-        let pc = transport::new_peer_connection(vec![]).await?;
+        let pc = transport::new_peer_connection(transport::default_ice_servers()).await?;
         pc.add_track(self.audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .map_err(to_call_error)?;

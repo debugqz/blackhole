@@ -26,6 +26,55 @@ pub struct OwnPrekey {
     pub created_at: i64,
 }
 
+/// This identity's currently-published MLS key package (SPEC.md §5.4),
+/// keyed by the `MlsMember` signer used to generate it — persisted so a
+/// `GroupInvite` that arrives after a daemon restart can still be joined:
+/// `bh_crypto::mls::MlsMember::from_stored_signer` reconstructs the exact
+/// same member that key package was built from, the same restart-survival
+/// trick `groups.mls_state` already uses per-group. **Single-use**: unlike
+/// `OwnPrekey`'s deliberately-reusable signed prekey, an MLS key package's
+/// private material is consumed the moment it's used to join a group (see
+/// `bh-network::key_package_directory`'s module doc) — this row must be
+/// replaced with a fresh signer/key-package pair immediately after every
+/// successful join, not just periodically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnMlsKeyPackage {
+    pub signer_public_key: Vec<u8>,
+    /// The exact serialized key package last published — stored alongside
+    /// `signer_public_key` (rather than re-serializing on every periodic
+    /// republish) so a republish is a pure re-publish of bytes already
+    /// known-good, with no risk of a second `generate_key_package()` call
+    /// on the same member producing bytes inconsistent with whatever a
+    /// remote peer may have already fetched.
+    pub key_package_bytes: Vec<u8>,
+    pub created_at: i64,
+}
+
+/// A throwaway `IdentityKeyPair`, distinct from the profile's real
+/// `OwnIdentity`, generated on demand and good for a caller-chosen number
+/// of days — meant to be handed out via an invite instead of the real
+/// identity for a one-off interaction with a stranger (see
+/// `bh-api::ephemeral_identity`'s module doc for the full design and its
+/// deliberate v1 scoping). `identity_public_key`/`identity_private_key`
+/// use the same 64-byte `signing || agreement` layout as `OwnIdentity`.
+/// `shadow_contact_id`/`conversation_id`, when set, point at a
+/// locally-generated stand-in contact and its Direct conversation (tagged
+/// via `Conversation::ephemeral_identity_id`) representing "whoever
+/// redeems this" — deleting this row cascades to delete that conversation
+/// and its messages; `Database::wipe_ephemeral_identity` additionally
+/// deletes the contact row itself, which the cascade chain doesn't reach.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EphemeralIdentity {
+    pub id: String,
+    pub label: Option<String>,
+    pub identity_public_key: Vec<u8>,
+    pub identity_private_key: Vec<u8>,
+    pub shadow_contact_id: Option<String>,
+    pub conversation_id: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
 /// Local record of this profile's opt-in "wake push" registration (SPEC.md
 /// §5.6, `crates/bh-push-relay`) — an opaque, locally-generated token and
 /// whether the feature is currently on. Never message content, never a
@@ -36,6 +85,53 @@ pub struct PushRegistration {
     pub token: String,
     pub enabled: bool,
     pub updated_at: i64,
+    /// Base URL of the `bh-push-relay` instance `token` was registered
+    /// with, if any (SCHEMA_V20). `None` means a local-only registration —
+    /// no live network at enable-time, or no relay configured — never
+    /// published to the DHT, never actually reachable by a contact's
+    /// daemon.
+    pub relay_url: Option<String>,
+}
+
+/// Single-row-per-profile "dead man's switch" config (see
+/// `bh-api::dead_mans_switch`'s module doc): if the user doesn't check in
+/// for `cadence_days`, a predefined set of text messages goes out to
+/// predefined contacts. See `schema.rs`'s `SCHEMA_V17` doc comment for the
+/// `triggered_at` re-arm latch semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadMansSwitchConfig {
+    pub enabled: bool,
+    pub cadence_days: i64,
+    pub last_check_in_at: i64,
+    /// `Some` once the switch has fired — stays `Some` (even while
+    /// `enabled` flips around) until the user disables then re-enables,
+    /// which is the only thing that clears it. `None` means "armed and has
+    /// not yet fired since it was last (re-)enabled."
+    pub triggered_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+/// One predefined (contact, text body) release entry — sent verbatim over
+/// the real Direct-conversation send path when the switch fires. Text
+/// only: see `bh-api::dead_mans_switch`'s module doc for why attachments
+/// are out of scope for v1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadMansSwitchRelease {
+    pub id: i64,
+    pub contact_id: String,
+    pub body: String,
+    pub created_at: i64,
+}
+
+/// A release entry joined with enough contact display info to render in
+/// the UI without a second round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadMansSwitchReleaseView {
+    pub id: i64,
+    pub contact_id: String,
+    pub contact_display_name: Option<String>,
+    pub body: String,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +165,15 @@ pub struct Device {
     pub contact_id: Option<String>,
     pub name: Option<String>,
     pub public_key: Vec<u8>,
+    /// The X25519 half of this device's own per-device
+    /// `bh_crypto::identity::IdentityKeyPair` (`public_key` above is the
+    /// Ed25519 signing half) — `None` for a device linked before this
+    /// column existed, or one whose linking daemon hasn't published it
+    /// yet. See `schema.rs`'s `SCHEMA_V18` doc comment for why
+    /// `public_key || identity_agreement_key` matters: it's the same
+    /// 64-byte layout `Contact.identity_public_key` uses, letting a linked
+    /// device be addressed via `recipient_key_hash`/`prekey_directory`.
+    pub identity_agreement_key: Option<Vec<u8>>,
     pub linked_at: i64,
     pub last_seen_at: Option<i64>,
     pub revoked_at: Option<i64>,
@@ -170,6 +275,12 @@ pub struct Conversation {
     /// (`sent_at + timer` becomes `expires_at`); see `expiry.rs` for the
     /// sweeper that actually purges them.
     pub disappearing_timer_secs: Option<i64>,
+    /// `Some` when this conversation belongs to an ephemeral identity's
+    /// locally-generated shadow contact (see `EphemeralIdentity`'s doc
+    /// comment) rather than the profile's real identity — `send_message`
+    /// uses this to never attempt a real network send under the wrong
+    /// identity.
+    pub ephemeral_identity_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

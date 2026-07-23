@@ -22,6 +22,16 @@ pub const MAX_REGISTRATIONS: usize = 100_000;
 /// no conversation identifiers — see the `bh_push_relay` crate docs.
 pub struct RelayState {
     tokens: Mutex<HashSet<String>>,
+    /// Which registered tokens have received a `POST /wake/:token` call.
+    /// Reveals nothing `tokens` doesn't already — `server.rs`'s `wake`
+    /// handler only records here *after* confirming the token is
+    /// registered, so this set is always a subset of `tokens` — but lets a
+    /// caller (namely `bh-api`'s own real-network integration test, which
+    /// drives a genuine `RelayServer` to prove its send path actually
+    /// reaches this relay) confirm a wake really happened, without this
+    /// crate logging anything beyond what it already tracks (see the
+    /// crate-level "Logging" doc section).
+    woken: Mutex<HashSet<String>>,
     max_registrations: usize,
 }
 
@@ -35,6 +45,7 @@ impl RelayState {
     pub fn new() -> Self {
         Self {
             tokens: Mutex::new(HashSet::new()),
+            woken: Mutex::new(HashSet::new()),
             max_registrations: MAX_REGISTRATIONS,
         }
     }
@@ -46,6 +57,7 @@ impl RelayState {
     pub fn with_max_registrations(max_registrations: usize) -> Self {
         Self {
             tokens: Mutex::new(HashSet::new()),
+            woken: Mutex::new(HashSet::new()),
             max_registrations,
         }
     }
@@ -74,6 +86,22 @@ impl RelayState {
             .contains(token)
     }
 
+    /// Records that `token` received a wake call. See the `woken` field's
+    /// own doc comment for why this exists.
+    pub fn record_wake(&self, token: &str) {
+        self.woken
+            .lock()
+            .expect("relay state lock poisoned")
+            .insert(token.to_string());
+    }
+
+    pub fn was_woken(&self, token: &str) -> bool {
+        self.woken
+            .lock()
+            .expect("relay state lock poisoned")
+            .contains(token)
+    }
+
     #[cfg(test)]
     pub fn registered_count(&self) -> usize {
         self.tokens.lock().expect("relay state lock poisoned").len()
@@ -83,6 +111,15 @@ impl RelayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_is_not_woken_until_record_wake_is_called() {
+        let state = RelayState::new();
+        state.register("tok".to_string());
+        assert!(!state.was_woken("tok"));
+        state.record_wake("tok");
+        assert!(state.was_woken("tok"));
+    }
 
     #[test]
     fn register_is_idempotent_and_queryable() {
