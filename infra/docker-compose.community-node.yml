@@ -1,0 +1,41 @@
+# Standalone profile for running your OWN Blackhole DHT bootstrap node to
+# help the community's network find peers — distinct from
+# docker-compose.yml (the platform operator's own three-piece stack:
+# bootstrap-node + push-relay + coturn). A community node only ever needs
+# to be a bootstrap node — push-relay/coturn are per-operator concerns, not
+# something a community member needs to run to help the DHT.
+#
+# See COMMUNITY_NODE_GUIDE.md for the full walkthrough. Quick start:
+#
+#   cp infra/community-node.env.example infra/community-node.env
+#   # fill in BLACKHOLE_BOOTSTRAP_PEERS with peers you were given
+#   docker compose -f infra/docker-compose.community-node.yml \
+#     --env-file infra/community-node.env up -d --build
+#
+# Same image as the platform's own bootstrap-node (bootstrap-node/Dockerfile
+# — there's no separate "community" binary or build), run from the repo
+# root so the whole Cargo workspace is in build context.
+services:
+  community-bootstrap-node:
+    build:
+      context: ..
+      dockerfile: infra/bootstrap-node/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${COMMUNITY_NODE_PUBLIC_PORT:-4001}:4001/tcp"
+    environment:
+      # Joins the shared DHT instead of founding an isolated island of one.
+      # Required — there's no sensible default, since "which network to
+      # join" is exactly the one thing only you know. Comma-separate more
+      # than one multiaddr if you were given several.
+      BLACKHOLE_BOOTSTRAP_PEERS: "${BLACKHOLE_BOOTSTRAP_PEERS:?set BLACKHOLE_BOOTSTRAP_PEERS in infra/community-node.env — see COMMUNITY_NODE_GUIDE.md}"
+    volumes:
+      - community-bootstrap-data:/var/lib/blackhole/data
+    # BLACKHOLE_PERSISTENT_NETWORK_IDENTITY / BLACKHOLE_KEYSTORE_BACKEND /
+    # BLACKHOLE_NETWORK_LISTEN_ADDR are already baked into the Dockerfile —
+    # nothing to override here for the common case (see its own comments,
+    # and docs/THREAT_MODEL.md §3.5/§3.7, for why each is on by default for
+    # a bootstrap node specifically and off for an ordinary end-user one).
+
+volumes:
+  community-bootstrap-data:

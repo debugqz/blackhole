@@ -18,6 +18,12 @@ Everything below assumes you're running these from the repo root (`docker
 build`/`docker compose` need the whole Cargo workspace in context — see
 `../.dockerignore` for what's excluded).
 
+**Not the platform operator, just want to help the DHT?** You don't need
+any of the three pieces below — see `COMMUNITY_NODE_GUIDE.md` instead for
+a standalone bootstrap-node-only profile. If you *are* the operator and a
+community member just handed you their multiaddr, see
+`ACCEPTING_COMMUNITY_NODES.md` before adding it to anything you publish.
+
 ## What this does *not* do
 
 - Doesn't touch any real cloud account, DNS provider, or domain registrar.
