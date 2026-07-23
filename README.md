@@ -18,11 +18,17 @@ structural property of the protocol.
 
 ## Status
 
-**Core protocol logic is implemented and tested (329 tests across
+**Core protocol logic is implemented and tested (409 tests across
 `bh-crypto`/`bh-network`/`bh-storage`/`bh-files`/`bh-api`/`bh-calls`/
-`bh-push-relay`), and the desktop client is a real, end-to-end wired
-product UI with calls (1:1/group/screen-share) fully usable — but there
-is still no deployed public P2P network.**
+`bh-push-relay`/`bh-desktop`), and the desktop client is a real,
+end-to-end wired product UI with calls (1:1/group/screen-share) fully
+usable. `infra/` deploy tooling (bootstrap node, TURN relay, push relay —
+see [Infrastructure & deployment](#infrastructure--deployment)) has been
+exercised against a real, temporarily-stood-up deployment — two
+independent daemons found each other purely over the public DHT, and a
+real coturn allocation was obtained — but there is still no permanent,
+publicly-operated network for end users; running one is on whoever
+chooses to operate `infra/`, not this repo itself.**
 Concretely:
 
 | Piece | State |
@@ -38,17 +44,19 @@ Concretely:
 | `bh-network` spawned by the daemon | ✅ Listening and supervised (auto-respawns on the live `yamux` CVE panic), now with an optional `BLACKHOLE_BOOTSTRAP_PEERS` dial list (re-dialed after any respawn) — **wired into both Direct and Group message send/receive**: `bh-api::message_crypto::send_encrypted_over_network` does real X3DH/Double Ratchet + mailbox push for `Direct`; `groups.rs` does real MLS + `Mailbox::fan_out` for `Group`, including fetching a real member's real DHT-published MLS key package (`bh_network::key_package_directory`) before falling back to a locally-simulated one; `message_receive::spawn_receive_loop` polls/decrypts/delivers both. Proven by genuine multi-daemon integration tests (`bh-api/tests/api_smoke.rs::direct_message_travels_a_real_network_between_two_daemons_and_decrypts` and `::group_membership_and_messages_travel_a_real_network_between_three_daemons`). Real call signaling (`bh-api::calls`) shares the Direct wiring — see the calls row below. |
 | Local encrypted storage (SQLCipher), OS keystore, panic wipe | ✅ Implemented, tested — optional PIN layer in front of the DB key, **now also reachable via a WebAuthn passkey's PRF-derived secret** (hardware-backed, not TOTP — THREAT_MODEL.md §3.7) |
 | File chunking, per-chunk E2EE, resumable download | ✅ Implemented, tested — **attachments now swept by the disappearing-message timer** (expiry sweeper deletes orphaned chunk directories from disk, not just DB rows) |
-| Daemon localhost API (`bh-api`) | ✅ ~90 real endpoints across 28 modules, verified via live HTTP smoke tests + an in-process integration suite — **now with bearer-token auth** (`Authorization: Bearer <token>`, token in 0600 file, THREAT_MODEL.md §3.9) |
+| Daemon localhost API (`bh-api`) | ✅ ~93 real endpoints across 28 modules, verified via live HTTP smoke tests + an in-process integration suite — **now with bearer-token auth** (`Authorization: Bearer <token>`, token in 0600 file, THREAT_MODEL.md §3.9) |
 | Desktop client (Tauri) | ✅ Real product UI ("Event Horizon") — see [Feature set](#feature-set) below for the full list — **now with full calls UI** (1:1 audio/video/screen-share, group audio, VP8 decode via WebCodecs, `Vp8CanvasRenderer` in `calls.ts`) |
-| Voice/video calls, 1:1 (`bh-calls`) | ✅ Real WebRTC + SFrame media encryption, tested — STUN now wired in (`default_ice_servers`, public server by default, `BLACKHOLE_STUN_SERVERS`-configurable; TURN still absent), **client UI now exists** (Tauri event bridge for `/calls/:call_id/ws`, `call_stream_bridge.rs`); **1:1 call signaling travels the real network, end to end including the client**: `POST /calls`'s optional `contact_id` pushes the offer through the same X3DH/Double-Ratchet mailbox `Direct` messages use (`Envelope::Call`, `bh-api::calls::send_call_signal`/`handle_incoming_call_signal`), the receiving daemon auto-answers, and hangup propagates back the same way — proven by a real two-daemon integration test; the desktop client's "Call"/"Video" buttons now pass the open conversation's real `contact_id`, with a minimal incoming-call banner (`GET /calls/network`) for calls it didn't place itself |
-| Group calls (full-mesh, MLS-exporter-keyed) | ✅ Implemented, tested — STUN now applies here too (same `default_ice_servers` every mesh edge uses), TURN still absent; **client UI now exists** (audio-only participant grid, `MAX_GROUP_CALL_PARTICIPANTS = 6`) — signaling itself is still same-daemon only, `bh-api::calls` doesn't route `GroupOffer`/`GroupAnswer` over the network yet |
-| Screen sharing (same VP8/SFrame pipeline as camera) | ✅ Implemented, tested — same STUN-yes/TURN-no state as calls above, **client UI now exists** (parallel "screen" track, same VP8 decode path) |
+| Voice/video calls, 1:1 (`bh-calls`) | ✅ Real WebRTC + SFrame media encryption, tested — STUN now wired in (`default_ice_servers`, public server by default, `BLACKHOLE_STUN_SERVERS`-configurable; TURN is configurable too and was validated against a real, temporarily-deployed coturn instance — see [Infrastructure & deployment](#infrastructure--deployment) — but no TURN server is permanently operated for end users), **client UI now exists** (Tauri event bridge for `/calls/:call_id/ws`, `call_stream_bridge.rs`); **1:1 call signaling travels the real network, end to end including the client**: `POST /calls`'s optional `contact_id` pushes the offer through the same X3DH/Double-Ratchet mailbox `Direct` messages use (`Envelope::Call`, `bh-api::calls::send_call_signal`/`handle_incoming_call_signal`), the receiving daemon auto-answers, and hangup propagates back the same way — proven by a real two-daemon integration test; the desktop client's "Call"/"Video" buttons now pass the open conversation's real `contact_id`, with a minimal incoming-call banner (`GET /calls/network`) for calls it didn't place itself |
+| Group calls (full-mesh, MLS-exporter-keyed) | ✅ Implemented, tested — STUN now applies here too (same `default_ice_servers` every mesh edge uses), same configurable-but-not-permanently-deployed TURN state as 1:1 calls above; **client UI now exists** (audio-only participant grid, `MAX_GROUP_CALL_PARTICIPANTS = 6`) — signaling itself is still same-daemon only, `bh-api::calls` doesn't route `GroupOffer`/`GroupAnswer` over the network yet |
+| Screen sharing (same VP8/SFrame pipeline as camera) | ✅ Implemented, tested — same STUN/TURN state as calls above, **client UI now exists** (parallel "screen" track, same VP8 decode path) |
 | Device sync (keep a linked device's history current) | ✅ Real X3DH/Double Ratchet round-trip — **now pushes real `Direct` messages to a real second daemon's real mailbox** when the linked device has a real network identity on record, falling back to the same-daemon shadow simulation otherwise |
 | Cosmetics store, sticker packs | ✅ Implemented, tested — payment *confirmation* deliberately requires a real BTCPay webhook, not reachable from the client |
-| Opaque wake-push relay (`bh-push-relay`) | ✅ New, separate, internet-facing binary — real register/wake contract, tested; not yet wired to a real APNs/FCM/UnifiedPush backend or to the daemon's mailbox code |
+| Opaque wake-push relay (`bh-push-relay`) | ✅ New, separate, internet-facing binary — real register/wake contract, tested, **now genuinely called by the daemon** (SSRF-guarded, DNS-rebinding-pinned) right after a real mailbox push succeeds; still not wired to a real APNs/FCM/UnifiedPush backend (`forward_to_push_provider` stub), and no instance is permanently deployed for end users |
 | Client-side link previews | ✅ Implemented — opt-in (off by default), deliberately bypasses the daemon entirely |
 | Local full-text message search (FTS5) | ✅ Implemented, tested — pure local query, nothing leaves the daemon |
-| Deployed infrastructure (relay/mailbox nodes, TURN, KT log) | ❌ Not deployed |
+| **Shareable blocklists** (export/import a copyable block-list link) | ✅ Implemented, tested — voluntary courtesy export, never applied automatically |
+| **Contact trust level** (Blocked/Verified/Established/New badge) | ✅ Implemented, tested — local UI heuristic only, never a security boundary |
+| Deployed infrastructure (bootstrap node, TURN relay, push relay) | 🟡 Deploy tooling (`infra/`) is real and was validated against a real, temporarily-stood-up deployment (see [Infrastructure & deployment](#infrastructure--deployment)); nothing permanently operated for end users — mailbox nodes and a gossiped KT log both live inside the daemon/DHT already (no separate service needed) |
 | Payments (Monero/BTC/ETH via BTCPay) | 🟡 BTCPay-ready local contract implemented — daemon owns invoice IDs, payment DB has provider/checkout/expiry fields, client no longer fabricates invoices; real BTCPay infrastructure/client/webhook still pending |
 | Mobile / web clients | ❌ Not started — desktop-only for now |
 
@@ -68,7 +76,7 @@ the `bh-network` integration (now live for `Direct` messages, not yet for
 - [Architecture](#architecture)
 - [Feature set](#feature-set)
 - [Repo layout](#repo-layout)
-- [How a message travels](#how-a-message-travels-1-1-target-design)
+- [How a message travels](#how-a-message-travels-11-and-group-both-now-live)
 - [Group calls & screen sharing](#group-calls--screen-sharing)
 - [Cryptography](#cryptography)
 - [Network & anonymity](#network--anonymity)
@@ -79,6 +87,7 @@ the `bh-network` integration (now live for `Direct` messages, not yet for
 - [Threat model summary](#threat-model-summary)
 - [Building & running](#building--running)
 - [Daemon API surface](#daemon-api-surface-localhost-only)
+- [Infrastructure & deployment](#infrastructure--deployment)
 - [Distribution plans](#distribution-plans)
 - [Governance](#governance)
 - [License](#license)
@@ -113,13 +122,13 @@ would be a false guarantee (`docs/SPEC.md` §1).
 
 The client never talks to the P2P network directly — everything goes
 through a local daemon that owns key material, the encrypted database, and
-(once wired up) the network connection.
+the network connection.
 
 ```mermaid
 graph TB
     subgraph device["User's device"]
         UI["Desktop client (Tauri + TypeScript)<br/>client/desktop — 'Event Horizon' UI"]
-        API["bh-api — localhost RPC surface<br/>127.0.0.1 only, JSON over HTTP<br/>~90 routes across 28 modules"]
+        API["bh-api — localhost RPC surface<br/>127.0.0.1 only, JSON over HTTP<br/>~93 routes across 28 modules,<br/>bearer-token auth required"]
         Daemon["bh-daemon binary<br/>daemon/"]
 
         UI <-->|"HTTP, loopback only<br/>never reaches the network directly"| API
@@ -141,11 +150,11 @@ graph TB
         UI -.->|"direct HTTP fetch,<br/>never through the daemon"| LinkPreview
     end
 
-    subgraph net["bh-network — real & tested, not yet wired into the daemon"]
+    subgraph net["bh-network — real, tested, and wired into send/receive"]
         Transport["libp2p transport<br/>STUN + TURN fallback"]
-        DHT["Kademlia DHT<br/>+ Sybil/Eclipse-resistant<br/>node selection"]
+        DHT["Kademlia DHT<br/>+ Sybil/Eclipse-resistant<br/>node selection, per-subnet admission"]
         Onion["Onion routing<br/>3+ hop circuits"]
-        Mailbox["Encrypted mailboxes<br/>store-and-forward, TTL"]
+        Mailbox["Encrypted mailboxes<br/>store-and-forward, TTL,<br/>manifest size-capped"]
         Sealed["Sealed sender"]
         Cover["Cover traffic"]
         PoW["Anti-spam PoW, enforced"]
@@ -156,25 +165,31 @@ graph TB
         Mailbox --- Sealed
     end
 
-    Daemon -->|"spawned + supervised,<br/>listening — not yet on the<br/>send/receive path"| Transport
+    Daemon <-->|"send_encrypted_over_network / spawn_receive_loop —<br/>real X3DH+Double Ratchet (Direct) and<br/>MLS fan-out (Group), proven by genuine<br/>multi-daemon integration tests"| Transport
 
     subgraph relay["Separate internet-facing service"]
         PushRelay["bh-push-relay<br/>opaque wake-token relay only —<br/>no content, no identity, opt-in"]
     end
 
-    Daemon -.->|"planned: mailbox arrival →<br/>opaque wake — not wired yet"| PushRelay
+    Daemon -.->|"wake_recipient_best_effort —<br/>SSRF-guarded, DNS-rebinding-pinned,<br/>fires after a real mailbox push"| PushRelay
 
     style net fill:#1a1a2e,stroke:#666,stroke-dasharray: 4 4
     style relay fill:#1a1a2e,stroke:#666,stroke-dasharray: 4 4
 ```
 
-Everything inside `bh-network` is real, tested, working code — it is just
-not yet the thing the daemon calls when you hit "send." That integration
-(daemon ⇄ network) is the biggest remaining piece of plumbing before
-Blackhole is a live network rather than a well-tested protocol stack.
-`bh-push-relay` is a new, separate, deliberately minimal service (not part
-of the loopback-only daemon) — its wake-only contract is real and tested,
-but nothing calls it yet either.
+`bh-network` is not just real and tested in isolation anymore — it's the
+thing the daemon actually calls when you hit "send" for both `Direct` and
+`Group` conversations, proven by genuine multi-daemon integration tests
+with zero shared process state (see [How a message
+travels](#how-a-message-travels-1-1-target-design)). `bh-push-relay` is a
+separate, deliberately minimal service (not part of the loopback-only
+daemon); its wake-only contract is real, tested, and now actually called
+by the daemon after a real mailbox push succeeds — but no instance of it
+runs anywhere for real users yet (see [Infrastructure &
+deployment](#infrastructure--deployment)). The single remaining gap in
+this picture: no *permanent, publicly-operated* `bh-network`/TURN/push-relay
+deployment exists — the wiring has been validated against a real temporary
+one (`infra/`), not stood up for end users.
 
 ---
 
@@ -219,6 +234,9 @@ before group calls/screen sharing were added — see
 | **Screen sharing** | ✅ | `bh-calls::screen`, `bh-api::calls` |
 | Crypto payment requests in chat | ✅ | `bh-api::payment_requests` |
 | Moderation (block, message requests, reports) | ✅ | `bh-api::moderation` |
+| **Shareable blocklists** (export/decode/apply a block-list link) | ✅ | `bh-api::moderation` |
+| **Contact trust level** (local Blocked/Verified/Established/New badge) | ✅ | `bh-api::contacts` |
+| **UI density & font-size preferences** | ✅ | `client/desktop/src/ui_prefs.ts` |
 
 ---
 
@@ -286,7 +304,7 @@ crates/
                          and the network separately. (SPEC.md §5.5)
 
   bh-api/               Localhost RPC surface between daemon and UI
-                         clients. Binds 127.0.0.1 only. ~90 real endpoints
+                         clients. Binds 127.0.0.1 only. ~93 real endpoints
                          across 28 modules (identity, contacts, moderation,
                          conversations/messages incl. editing, reactions,
                          receipts, safety numbers, invites, export/import,
@@ -328,17 +346,29 @@ client/
                          spawn), groups incl. broadcast channels, notes to
                          self, file/voice attachments, local search,
                          cosmetics store + stickers, typing presence, link
-                         previews, wake-push toggle, panic wipe. **Calls
+                         previews, wake-push toggle, panic wipe,
+                         **shareable blocklists**, **contact trust-level
+                         badges**, **density/font-size UI prefs**. **Calls
                          (1:1/group/screen-share) now have full UI**:
                          in-call overlay, VP8 decode via WebCodecs,
                          camera/screen-share toggle, audio-only group grid.
       src/api.ts             typed request/response surface for daemon_call
       src/link_preview.ts      client-side-only link preview fetch/parse/render
+      src/ui_prefs.ts           client-only localStorage prefs (density, font size)
       src-tauri/src/link_preview.rs  the Tauri command backing it (bypasses the daemon)
+      src-tauri/src/network_config.rs  persists bootstrap/TURN/relay_url settings across restarts
 
 docs/
   SPEC.md               Full technical specification (source of truth)
   THREAT_MODEL.md        Per-subsystem STRIDE analysis + ranked open risks
+
+infra/                  Deploy artifacts (not app code) for the DHT
+                         bootstrap node, TURN relay (coturn), and push
+                         relay — Dockerfiles, docker-compose.yml, systemd
+                         units. Real and validated against a temporary
+                         real deployment; nothing permanently operated for
+                         end users. See infra/README.md and
+                         [Infrastructure & deployment](#infrastructure--deployment).
 
 .github/workflows/ci.yml  fmt + clippy -D warnings + build + test (Rust,
                            incl. libpipewire/libdbus for screen-capture),
@@ -347,18 +377,27 @@ docs/
 
 ---
 
-## How a message travels (1:1, **now live**)
+## How a message travels (1:1 and group, **both now live**)
 
-This is the intended end-to-end flow once `bh-network` is wired into the
-daemon. **For `Direct` conversations, this is no longer aspirational**:
-`bh-api::conversations::send_message` runs a real X3DH + Double Ratchet
-handshake (PQ-hybrid, X25519 + ML-KEM-768), wraps the ciphertext in a
-sealed-sender envelope, pushes it to the recipient's Kademlia mailbox via
-`bh-network`, and a background loop (`message_receive::spawn_receive_loop`)
-polls/decrypts/delivers. Proven by a genuine two-daemon integration test
+This is the real end-to-end flow, not an aspirational one. For `Direct`
+conversations, `bh-api::conversations::send_message` runs a real X3DH +
+Double Ratchet handshake (PQ-hybrid, X25519 + ML-KEM-768), wraps the
+ciphertext in a sealed-sender envelope, pushes it to the recipient's
+Kademlia mailbox via `bh-network`, and a background loop
+(`message_receive::spawn_receive_loop`) polls/decrypts/delivers. Proven by
+a genuine two-daemon integration test
 (`bh-api/tests/api_smoke.rs::direct_message_travels_a_real_network_between_two_daemons_and_decrypts`)
-— not a same-process shadow session. **`Group` conversations still aren't
-wired** — MLS fan-out via `Mailbox::fan_out` is a separate follow-up.
+— not a same-process shadow session. **`Group` conversations are wired the
+same way**: the `Group` arm of `send_message` encrypts with real MLS and
+fans the ciphertext out over `Mailbox::fan_out` (one shared mailbox per
+group, not one push per member), and real membership — not just
+messages — travels the network too (a real, DHT-published MLS key package
+per new member, a real `Envelope::GroupInvite` delivery) — proven by a
+genuine three-daemon integration test
+(`bh-api/tests/api_smoke.rs::group_membership_and_messages_travel_a_real_network_between_three_daemons`).
+Both fall back to the pre-existing local-storage-only behavior whenever no
+network is attached (no live daemon network, or a test that never attaches
+one).
 
 ```mermaid
 sequenceDiagram
@@ -634,6 +673,36 @@ opt-in:
   verified server-side**, mailbox nodes reject a `push`/`fan_out` whose
   solution doesn't check out before doing any storage work, not just
   defined-and-tested in isolation.
+- **Shareable blocklists** — export the contacts you've already blocked as
+  a copyable link, so a friend group can share a blocklist against a
+  shared bad actor. Always a voluntary, explicit courtesy between users,
+  never a centralized or automatically-applied list — decoding only
+  *previews* matches against the importer's own contacts, and applying
+  only ever blocks a contact the importer already has and explicitly
+  selected.
+- **Contact trust level** — a local-only badge (`Blocked` / `Verified` /
+  `Established` / `New`) computed from a contact's own `blocked`/
+  `verified` flags plus local message history. A UI convenience, never a
+  security boundary: only `Verified` reflects a real cryptographic
+  guarantee (a confirmed safety number).
+
+```mermaid
+sequenceDiagram
+    participant Alice as Alice's daemon
+    participant AliceUI as Alice's client
+    participant BobUI as Bob's client (friend)
+    participant Bob as Bob's daemon
+
+    Note over Alice: Alice has already blocked<br/>two abusive contacts locally
+    AliceUI->>Alice: GET /moderation/blocklist/export
+    Alice-->>AliceUI: blackhole://blocklist?d=... <br/>(identity pubkeys + labels, plain base64 JSON)
+    AliceUI-->>BobUI: pastes the link<br/>(any channel — chat, email; not sent by Blackhole itself)
+    BobUI->>Bob: POST /moderation/blocklist/decode
+    Bob-->>BobUI: preview: which entries match<br/>Bob's own contacts (nothing blocked yet)
+    Note over BobUI: Bob reviews and<br/>explicitly selects entries
+    BobUI->>Bob: POST /moderation/blocklist/apply<br/>{contact_ids: [...]}
+    Bob->>Bob: set_contact_blocked(true)<br/>— same call the Block button uses
+```
 
 ---
 
@@ -729,7 +798,7 @@ Full STRIDE-style breakdown per subsystem lives in
 | Compromised device (post-unlock) | Full access to an already-unlocked device | Everything on it — explicitly **out of scope** |
 | The Blackhole operator/maintainers | Publishes the code, open source & (aspirationally) reproducibly built | Nothing, by design |
 
-**Open risks, ranked** (from `docs/THREAT_MODEL.md` §4 — 20 tracked items
+**Open risks, ranked** (from `docs/THREAT_MODEL.md` §4 — 28 tracked items
 total; most of the earliest-identified ones are now FIXED/MITIGATED, kept
 in the numbered list with that status rather than renumbered, so
 cross-references stay stable). The genuinely still-**open** ones today:
@@ -796,8 +865,20 @@ now follows profile switches and deletes orphaned file chunks (was #12),
 broadcast-channel enforcement now lives at two independent layers (was
 #13), **calls have a full client UI** with VP8 decode via WebCodecs (was
 #14), and link previews now have an SSRF guard + explicit toggle copy (was
-#15) — see `docs/THREAT_MODEL.md` §4 for the full list with what
-specifically closed each one.
+#15). A more recent hardening pass closed several more: the push-relay
+wake path is now SSRF-guarded against a malicious contact's own
+self-published relay URL, including a DNS-rebinding-resistant pinned
+fetch (§3.12/§3.13 item 22); a mailbox manifest can no longer be grown
+past the DHT's record-size cap as a cheap denial-of-service (item 23); the
+daemon's bearer-token comparison is constant-time (item 24); both
+SQLCipher databases (profile + MLS group state) now zero deleted rows via
+`secure_delete` instead of merely unlinking them (item 25); a
+freshly-created keystore file/directory is never briefly world-readable
+(item 26); a malformed `PushRelayRecord`'s declared length can no longer
+panic the parsing daemon (item 27); and the TURN long-term credential no
+longer appears in a host process listing (item 28) — see
+`docs/THREAT_MODEL.md` §4 for the full list with what specifically closed
+each one.
 
 None of these are hidden — each is called out in the relevant module's own
 doc comments. This section (and the doc it summarizes) exists to make the
@@ -839,7 +920,7 @@ missing system packages, adds the `rustfmt`/`clippy` components, resolves
 # daemon + all library crates + the push relay + the Tauri client's Rust side
 cargo build --workspace
 
-# run the full test suite (285 tests — a handful of bh-calls tests need
+# run the full test suite (409 tests — a handful of bh-calls tests need
 # real UDP loopback and can be flaky under sandboxing/CI resource
 # contention; see that crate's test comments)
 cargo test --workspace
@@ -875,7 +956,7 @@ CI (`.github/workflows/ci.yml`) runs, on every push/PR:
 ## Daemon API surface (localhost only)
 
 `bh-api` binds `127.0.0.1` exclusively — it is never reachable from the
-network by construction, not just by configuration. ~90 routes across 28
+network by construction, not just by configuration. ~93 routes across 28
 handler modules; representative examples per area below rather than an
 exhaustive list (see `crates/bh-api/src/server.rs` for the full route
 table, or `crates/bh-api/src/*.rs` — one file per area, named to match).
@@ -884,7 +965,7 @@ table, or `crates/bh-api/src/*.rs` — one file per area, named to match).
 |---|---|---|
 | Identity & lifecycle | `GET/POST /identity`, `POST /panic-wipe` | `identity.rs`, `panic_wipe.rs` |
 | Security | `GET/POST /security/db-pin`, `POST /security/db-pin/clear` | `security.rs` |
-| Contacts & moderation | `GET/POST /contacts`, `POST /contacts/:id/block`, `POST /reports` | `contacts.rs`, `moderation.rs` |
+| Contacts & moderation | `GET/POST /contacts` (incl. `trust_level`), `POST /contacts/:id/block`, `POST /reports`, `GET/POST /moderation/blocklist/{export,decode,apply}` | `contacts.rs`, `moderation.rs` |
 | Conversations & messages | `GET/POST /conversations/:id/messages`, `PATCH /conversations/:id/messages/:mid` (edit), `GET .../edits` (history) | `conversations.rs` |
 | Reactions & receipts | `POST /messages/:id/reactions`, `POST /conversations/:id/receipts` | `reactions.rs`, `receipts.rs` |
 | Safety numbers | `GET /contacts/:id/safety-number`, `POST /contacts/:id/verify` | `safety_number.rs` |
@@ -902,6 +983,82 @@ table, or `crates/bh-api/src/*.rs` — one file per area, named to match).
 | Calls: 1:1, group, screen-share | `POST /calls`, `POST /calls/group/start`, `POST /calls/:id/screen-share/start` | `calls.rs` |
 | Payment requests | `POST /conversations/:id/payment-requests`, `POST /messages/:id/payment-request/paid` | `payment_requests.rs` |
 | Network status | `GET /network/status` | `network.rs` |
+
+---
+
+## Infrastructure & deployment
+
+Blackhole is deliberately infra-minimal — P2P by design, no server ever
+holds message content (`CLAUDE.md`, `docs/SPEC.md`). Exactly three pieces
+still need a real server, and the code for all three is done, tested, and
+now genuinely validated against a real (temporary) deployment — but
+**nothing here is permanently operated for end users**; standing one up is
+on whoever chooses to run `infra/`, not on this repo.
+
+```mermaid
+graph TB
+    subgraph userA["User A's device"]
+        DA["bh-daemon"]
+    end
+    subgraph userB["User B's device"]
+        DB["bh-daemon"]
+    end
+
+    subgraph deploy["infra/ — real, tested, not permanently operated"]
+        Boot[("DHT bootstrap node<br/>infra/bootstrap-node<br/>plain bh-daemon +<br/>BLACKHOLE_PERSISTENT_NETWORK_IDENTITY")]
+        Turn[("TURN relay (coturn)<br/>infra/docker-compose.yml<br/>static long-term credential")]
+        Caddy["Caddy — automatic TLS"]
+        Relay["bh-push-relay<br/>infra/push-relay<br/>opaque wake token only"]
+        Caddy --> Relay
+    end
+
+    DA -.->|"BLACKHOLE_BOOTSTRAP_PEERS<br/>dial on startup"| Boot
+    DB -.->|"BLACKHOLE_BOOTSTRAP_PEERS<br/>dial on startup"| Boot
+    DA <-->|"real Kademlia DHT traffic<br/>once bootstrapped"| DB
+    DA -.->|"BLACKHOLE_TURN_SERVERS<br/>only if both peers are<br/>behind a symmetric NAT"| Turn
+    DB -.->|"BLACKHOLE_TURN_SERVERS"| Turn
+    DA -.->|"POST /wake/:token<br/>opt-in, content-free"| Caddy
+    DB -.->|"POST /wake/:token"| Caddy
+
+    style deploy fill:#1a1a2e,stroke:#666,stroke-dasharray: 4 4
+```
+
+| Piece | What it's for | Code | Deploy artifact |
+|---|---|---|---|
+| DHT bootstrap node | lets daemons find each other at all | `daemon` (`bh-daemon`) | `infra/bootstrap-node/Dockerfile`, `infra/systemd/blackhole-bootstrap-node.service` |
+| TURN relay | calls across a symmetric NAT | not this repo's code (coturn) | `infra/docker-compose.yml`'s `coturn` service |
+| Push relay | wakes a suspended daemon | `bh-push-relay` | `infra/push-relay/Dockerfile`, `infra/systemd/blackhole-push-relay.service`, Caddy for automatic TLS |
+
+**Validated, not just written**: two independent daemons — this repo's
+desktop client, and a separately-run standalone one — found each other
+and exchanged a real X3DH/Double-Ratchet-decrypted message purely through
+a real, independently-hosted DHT bootstrap node reachable over the public
+internet, with no direct dial and no shared process state. A real `POST
+/calls` offer against that same deployment's TURN relay produced a
+genuine `typ relay` ICE candidate — an actual coturn allocation, not just
+a configured-but-unverified environment variable.
+
+**Known, labeled limitations** (full detail in `infra/README.md` and
+`docs/THREAT_MODEL.md` §3.7/§3.14):
+
+- The bootstrap node's `BLACKHOLE_KEYSTORE_BACKEND=file` fallback (no
+  D-Bus Secret Service in a headless container) is a genuine downgrade
+  from the OS keychain — acceptable there specifically because a
+  bootstrap node holds no real contacts/messages, only its own routing
+  identity.
+- TURN credentials are static, not coturn's time-limited
+  `use-auth-secret` scheme — a leaked credential is leaked until manually
+  rotated. The credential no longer appears in a host process listing
+  (`docker inspect`/`ps aux`) as of the latest hardening pass, but it's
+  still a long-lived secret, not an ephemeral one.
+- Push-relay registration is unauthenticated by design (an authenticated
+  token would itself be a stronger identity-linkage risk) — anyone who
+  obtains someone's opaque token can trigger repeated content-free wakes
+  for them.
+- Distributing a bootstrap node's multiaddr to real users has no
+  discovery mechanism today beyond "tell people the address" — run at
+  least two bootstrap nodes in any real deployment so one node's downtime
+  doesn't strand new peers.
 
 ---
 

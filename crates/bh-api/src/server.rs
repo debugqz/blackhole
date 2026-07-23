@@ -8,6 +8,7 @@ use axum::response::Response;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
 use crate::{
     call_stream, calls, contacts, conversations, cosmetics, dead_mans_switch, device_link,
@@ -50,9 +51,22 @@ async fn require_bearer_token(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(token) if token == state.api_token => Ok(next.run(req).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+    // Plain `==` on `&str`/`String` short-circuits on the first mismatched
+    // byte — exactly the kind of timing side channel `bh_crypto::webhook`'s
+    // `Mac::verify_slice` already avoids for a similar secret comparison
+    // (see that module's own doc comment). `ct_eq` compares every byte
+    // regardless of where the first mismatch falls; the differing-length
+    // case (this doesn't leak anything a remote caller doesn't already
+    // know — the token's fixed length isn't itself a secret) still
+    // resolves to "not equal" without ever running the token through a
+    // variable-time path.
+    let matches = presented
+        .map(|token| bool::from(token.as_bytes().ct_eq(state.api_token.as_bytes())))
+        .unwrap_or(false);
+    if matches {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
     }
 }
 
@@ -123,6 +137,18 @@ impl ApiServer {
             )
             .route("/contacts/:id/block", post(contacts::block_contact))
             .route("/contacts/:id/unblock", post(moderation::unblock_contact))
+            .route(
+                "/moderation/blocklist/export",
+                get(moderation::export_blocklist),
+            )
+            .route(
+                "/moderation/blocklist/decode",
+                post(moderation::decode_blocklist),
+            )
+            .route(
+                "/moderation/blocklist/apply",
+                post(moderation::apply_blocklist),
+            )
             .route(
                 "/conversations",
                 get(conversations::list_conversations)

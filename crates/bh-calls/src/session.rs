@@ -233,6 +233,14 @@ impl CallSession {
                   _receiver: Arc<RTCRtpReceiver>,
                   _transceiver: Arc<RTCRtpTransceiver>| {
                 let decryptor = decryptor.clone();
+                eprintln!(
+                    "[DEBUG on_track] id={:?} stream_id={:?} kind={:?} ssrc={:?} payload_type={:?}",
+                    track.id(),
+                    track.stream_id(),
+                    track.kind(),
+                    track.ssrc(),
+                    track.payload_type(),
+                );
                 match track.id().as_str() {
                     "audio" => Box::pin(run_depacketize_loop(
                         track,
@@ -491,12 +499,28 @@ async fn run_depacketize_loop<D>(
         depacketizer,
         clock_rate,
     )));
+    let track_id = track.id();
+    eprintln!("[DEBUG depacketize_loop] starting for track id={track_id:?}");
     let mut buf = vec![0u8; 1500];
     while let Ok((packet, _attrs)) = track.read(&mut buf).await {
+        eprintln!(
+            "[DEBUG depacketize_loop] id={track_id:?} read packet seq={} ts={} payload_len={}",
+            packet.header.sequence_number,
+            packet.header.timestamp,
+            packet.payload.len()
+        );
         let mut builder = sample_builder.lock().await;
         builder.push(packet);
         while let Some(sample) = builder.pop() {
+            eprintln!(
+                "[DEBUG depacketize_loop] id={track_id:?} sample_builder popped {} bytes",
+                sample.data.len()
+            );
             if let Ok((_, tag, _, plaintext)) = decryptor.decrypt(&sample.data) {
+                eprintln!(
+                    "[DEBUG depacketize_loop] id={track_id:?} decrypt ok tag={tag} \
+                     remote_sender_tag={remote_sender_tag}"
+                );
                 if tag == remote_sender_tag {
                     // Note: `on_frame` runs inline in this task, not
                     // spawned — callers doing real decode/playback should
@@ -507,6 +531,7 @@ async fn run_depacketize_loop<D>(
             }
         }
     }
+    eprintln!("[DEBUG depacketize_loop] id={track_id:?} track.read loop ended (EOF/error)");
 }
 
 /// An outgoing call whose offer has been sent but not yet answered.

@@ -38,12 +38,19 @@ export interface CreateIdentityResponse {
   seed_phrase: string;
 }
 
+/// A purely local, client-side heuristic ("how well do I actually know
+/// this contact") — see `bh-api::contacts::compute_trust_level`. Never a
+/// substitute for actually verifying a safety number: only "verified"
+/// reflects a real cryptographic guarantee.
+export type TrustLevel = "blocked" | "verified" | "established" | "new";
+
 export interface Contact {
   contact_id: string;
   display_name: string | null;
   verified: boolean;
   blocked: boolean;
   added_at: number;
+  trust_level: TrustLevel;
 }
 
 export type ConversationKind = "direct" | "group" | "self";
@@ -128,6 +135,25 @@ export interface ReportBundle {
   reason: string;
   created_at: number;
   messages: Message[];
+}
+
+// ---------------- shareable blocklists ----------------
+
+export interface ExportBlocklistResponse {
+  link: string;
+  count: number;
+}
+
+export interface DecodedBlocklistEntry {
+  identity_public_key: string;
+  label: string | null;
+  matched_contact_id: string | null;
+  matched_display_name: string | null;
+  already_blocked: boolean;
+}
+
+export interface ApplyBlocklistResponse {
+  blocked_count: number;
 }
 
 export interface ProfileMeta {
@@ -500,6 +526,12 @@ export const api = {
   blockContact: (contactId: string) => call<void>("POST", `/contacts/${encodeURIComponent(contactId)}/block`),
   unblockContact: (contactId: string) => call<void>("POST", `/contacts/${encodeURIComponent(contactId)}/unblock`),
 
+  exportBlocklist: () => call<ExportBlocklistResponse>("GET", "/moderation/blocklist/export"),
+  decodeBlocklist: (link: string) =>
+    call<DecodedBlocklistEntry[]>("POST", "/moderation/blocklist/decode", { link }),
+  applyBlocklist: (contactIds: string[]) =>
+    call<ApplyBlocklistResponse>("POST", "/moderation/blocklist/apply", { contact_ids: contactIds }),
+
   listMessageRequests: () => call<MessageRequest[]>("GET", "/message-requests"),
   acceptMessageRequest: (contactId: string) =>
     call<void>("POST", `/message-requests/${encodeURIComponent(contactId)}/accept`),
@@ -649,9 +681,12 @@ export const api = {
 
   // ---------------- push wake notifications (opt-in) ----------------
   getPushRegistration: () =>
-    call<{ enabled: boolean; token?: string }>("GET", "/push/register"),
-  setPushRegistration: (enabled: boolean) =>
-    call<{ enabled: boolean; token?: string }>("POST", "/push/register", { enabled }),
+    call<{ enabled: boolean; token?: string; relay_url?: string }>("GET", "/push/register"),
+  setPushRegistration: (enabled: boolean, relayUrl?: string) =>
+    call<{ enabled: boolean; token?: string; relay_url?: string }>("POST", "/push/register", {
+      enabled,
+      relay_url: relayUrl || undefined,
+    }),
 
   // ---------------- dead man's switch ----------------
   getDeadMansSwitch: () => call<DeadMansSwitchStatus>("GET", "/dead-mans-switch"),

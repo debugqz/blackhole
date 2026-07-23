@@ -89,11 +89,20 @@ and "what could go wrong here" questions are already answered there.
   proofs — a tested client-side primitive, not yet a deployed gossiped
   log, THREAT_MODEL.md §3.1), `mls_storage.rs`
   (`PersistentMlsProvider` — SQLCipher-backed `openmls` storage so group
-  state survives a daemon restart), `payment_address.rs` (address-format
+  state survives a daemon restart; its connection now also sets `PRAGMA
+  secure_delete = ON`, same as `bh-storage::db`'s main profile database,
+  so a removed member's now-inaccessible epoch secrets are actually
+  zeroed on disk rather than merely unlinked — THREAT_MODEL.md §3.7),
+  `payment_address.rs` (address-format
   validation for XMR/BTC/ETH payment requests), `qr.rs` (shared QR
   rendering for invites/device-linking/safety-numbers), `webhook.rs`
   (HMAC-SHA256 signing/verification gating the cosmetics-store
-  payment-confirmed webhook).
+  payment-confirmed webhook), `push_relay.rs` (`read_u32`/`read_string`
+  now use `checked_add` instead of raw `+` when parsing a
+  `PushRelayRecord`'s declared length — this parses DHT-sourced bytes
+  from an untrusted peer *before* signature verification, so an
+  attacker-chosen length near `u32::MAX` must fail cleanly rather than
+  panic/wrap — THREAT_MODEL.md §3.12).
 - `crates/bh-network` — libp2p transport + Kademlia DHT, onion routing,
   Eclipse/Sybil-resistant node selection, cover traffic, mailboxes, sealed
   sender, anti-spam PoW (SPEC.md §5). Real and tested against local
@@ -104,7 +113,15 @@ and "what could go wrong here" questions are already answered there.
   packet-size leak — a finer, further-extended `SIZE_BUCKETS` ladder plus
   a smaller oversized-payload fallback stride — and mailbox manifest race
   — jittered retry backoff (`manifest_retry_backoff`) on top of the
-  existing read-merge-write-verify loop. `prekey_directory.rs` publishes/
+  existing read-merge-write-verify loop. `mailbox.rs` also now caps a
+  manifest's serialized size (`MAX_MANIFEST_BYTES`, 96 KiB, conservative
+  headroom under the DHT's 128 KiB record cap) and rejects a `push` once a
+  recipient's/group's manifest is already at that cap — closes a cheap
+  denial-of-service where an attacker who knows a target's
+  `recipient_key_hash` could solve trivially-difficult PoW in bulk and
+  grow their manifest past the DHT's own size limit, silently breaking
+  every future legitimate push to that recipient until the next lazy
+  prune (THREAT_MODEL.md §3.6). `prekey_directory.rs` publishes/
   fetches X3DH prekey bundles via the DHT, the mechanism
   `bh-crypto::ratchet::PreKeyBundle`'s own doc comment already pointed at.
   `supervised.rs` wraps the event loop so a panic (e.g. the live `yamux`
@@ -157,7 +174,16 @@ and "what could go wrong here" questions are already answered there.
   `search.rs` (local FTS5 full-text search over this profile's own
   already-decrypted `messages.body` — a pure local query, never
   "content scanning" in the CLAUDE.md-forbidden sense since nothing
-  leaves the daemon).
+  leaves the daemon), `contacts.rs::message_counts_by_contact` (one
+  aggregate query — non-deleted `Direct`-conversation message count per
+  contact — feeding `bh-api::contacts`'s local trust-level heuristic
+  below; never persisted, computed fresh per request). `keystore.rs`'s
+  `Backend::File` now creates its directory/file with owner-only
+  permissions (`0o700`/`0o600`) at creation time via
+  `DirBuilder`/`OpenOptions`'s own `mode` argument rather than a
+  follow-up `chmod`, closing a brief window where a freshly-created path
+  was readable by other local users under a permissive umask —
+  THREAT_MODEL.md §3.7.
 - `crates/bh-files` — content-addressed file chunking, per-chunk E2EE,
   resumable download tracking (SPEC.md §5.5). Storage/transport-agnostic by
   design — the daemon wires it to disk and the network separately.
@@ -245,7 +271,34 @@ and "what could go wrong here" questions are already answered there.
   spawning the daemon until the PRF assertion succeeds — TOTP is
   deliberately excluded from this path (a TOTP secret has to be readable
   by the client without the database open, so it can't provide a real
-  second factor here) — see THREAT_MODEL.md §3.7.
+  second factor here) — see THREAT_MODEL.md §3.7. **Shareable blocklists**
+  (`moderation.rs`'s `export_blocklist`/`decode_blocklist`/
+  `apply_blocklist`, three new routes under `/moderation/blocklist/*`): a
+  courtesy export, not a moderation system — a copyable
+  `blackhole://blocklist?d=...` link (plain base64 JSON, same convention
+  as `bh_crypto::invite::InvitePayload::to_link`, no encryption since
+  nothing in it is secret) listing the identity public keys + local
+  labels of this profile's own blocked contacts. Decoding only ever
+  *previews* which entries match the importer's own contact book;
+  applying only ever blocks a contact the importer already has and
+  explicitly selected by id — nothing here creates a contact or blocks
+  anyone automatically, keeping the "no content moderation, ever"
+  non-negotiable intact (every real effect is the same local
+  `set_contact_blocked` call the existing block button already used).
+  **Contact trust level** (`contacts.rs`'s `TrustLevel`/
+  `compute_trust_level`, folded into `GET /contacts`'s response as
+  `ContactView`): a purely local, never-persisted UI heuristic
+  (`Blocked`/`Verified`/`Established`/`New`) computed fresh from
+  `Contact.blocked`/`Contact.verified` plus
+  `bh-storage::contacts::message_counts_by_contact` — `Established` means
+  "≥10 non-deleted messages over ≥3 days," a much weaker signal than
+  `Verified`'s real safety-number confirmation, shown only so a longtime
+  unverified contact doesn't look identical to one added five minutes
+  ago. `require_bearer_token` (`server.rs`) now compares the presented
+  token to `state.api_token` with `subtle::ConstantTimeEq` instead of
+  plain `==`, closing a timing side channel a co-located local process
+  could otherwise use to narrow down the token byte-by-byte —
+  THREAT_MODEL.md §3.9.
 - `crates/bh-calls` — voice/video calls: real WebRTC transport (ICE/DTLS/
   SRTP via `webrtc-rs`) plus an independent SFrame-style end-to-end media
   encryption layer keyed from `bh-crypto::call_keys` (so even a coerced
@@ -352,7 +405,15 @@ and "what could go wrong here" questions are already answered there.
   payment, by design, since that's gated behind an HMAC secret only a
   real BTCPay webhook should have), a sticker picker in the composer
   (only shows owned packs), opt-in "typing…" indicators (debounced
-  send-while-typing + polled status line), opt-in link previews (resolved
+  send-while-typing + polled status line), a contact's derived **trust
+  level** shown as a badge (`bh-api::contacts`'s `Blocked`/`Verified`/
+  `Established`/`New`), **shareable blocklists** (export/import panel
+  wired to `moderation.rs`'s three new routes — a preview step shows
+  which decoded entries match the importer's own contacts before any
+  block is applied), client-only **UI preferences**
+  (`src/ui_prefs.ts` — density and font-size, pure `localStorage`,
+  deliberately not profile-scoped since these describe the device's
+  screen, not any identity), opt-in link previews (resolved
   **client-side only**, via a dedicated Tauri command
   (`fetch_link_preview`, `src-tauri/src/link_preview.rs`) that never goes
   through `daemon_call`/the daemon at all — enabling it reveals the
@@ -371,10 +432,35 @@ and "what could go wrong here" questions are already answered there.
   `derivePrfSecret`) lets a profile require a WebAuthn passkey (via the
   PRF extension, hardware-derived, not TOTP — see THREAT_MODEL.md §3.7 for
   why) before the daemon even spawns, genuinely gating SQLCipher
-  decryption rather than just the client's own UI. Daemon binary
-  resolution is dev-mode only for now (`BLACKHOLE_DAEMON_BIN` or a
-  monorepo-relative `cargo tauri dev` fallback) — packaging it as a signed
-  Tauri sidecar for real distribution is a separate follow-up. Calls
+  decryption rather than just the client's own UI. A "Network" settings
+  section (`src-tauri/src/network_config.rs`) closes a real gap this
+  repo's own real-network deployment work surfaced: `BLACKHOLE_
+  BOOTSTRAP_PEERS`/`BLACKHOLE_TURN_*` are plain env vars `daemon/src/
+  main.rs`/`bh-calls::transport` read at process start, and the Tauri
+  shell used to only pick them up if whatever launched the app happened
+  to have them exported — a real bootstrap/TURN connection didn't
+  survive the app being closed and reopened normally. `network_config.rs`
+  persists them to a local JSON file (`app_config_dir()/
+  network_config.json`, `chmod 600`) that `daemon_lifecycle.rs::
+  ensure_daemon_running` reads and applies as env vars on the spawned
+  daemon `Command` — but only for a var not already present in this
+  process's own environment, so the original ad hoc "export it yourself
+  before launching" override still works unchanged for anyone who wants
+  it. The same settings section also finally gives the opt-in push
+  toggle a `relay_url` field (`bh-api::push::PushRegistrationResponse`
+  now round-trips it) — previously only reachable via a raw API call.
+  **Validated against a real deployment, not just locally**: two
+  independent daemons (this client's own, and a separate standalone one)
+  found each other and exchanged a real X3DH/Double-Ratchet-decrypted
+  message purely through a real, independently-hosted DHT bootstrap node
+  reachable over the public internet — no direct dial, no shared process
+  state — and a real `POST /calls` offer against that same deployment's
+  TURN relay produced a genuine `typ relay` ICE candidate (an actual
+  coturn allocation, not just a configured-but-unverified env var).
+  Daemon binary resolution is dev-mode only for now
+  (`BLACKHOLE_DAEMON_BIN` or a monorepo-relative `cargo tauri dev`
+  fallback) — packaging it as a signed Tauri sidecar for real
+  distribution is a separate follow-up. Calls
   (1:1 audio/video/screen-share, group audio) now have a client UI: a
   "Call"/"Video" pair in the conversation header for direct conversations
   and a "Group call" button for groups, an in-call overlay with local
@@ -435,10 +521,31 @@ and "what could go wrong here" questions are already answered there.
   the real network/UI (real `Direct`-message delivery over `bh-network`,
   the three pragmatic hardening fixes, DHT routing admission control,
   full call-streaming UI, and the daemon/client bearer-token auth layer).
+  §18 covers a fourth round: shareable blocklists, the contact trust-level
+  heuristic, client-only UI preferences, and a further hardening pass
+  (mailbox manifest-size DoS cap, constant-time bearer-token comparison,
+  `secure_delete` parity for MLS storage, a `PushRelayRecord` parser
+  overflow guard, a keystore file/directory creation race, and the TURN
+  credential no longer appearing in a host process listing).
 - `docs/THREAT_MODEL.md` — per-subsystem STRIDE analysis grounded in the
   actual implementation, plus a ranked list of known open risks.
+- `infra/` — deploy artifacts (not application code) for the three real
+  pieces of infrastructure Blackhole needs but doesn't bundle: a DHT
+  bootstrap node (Dockerfile + systemd unit wrapping the ordinary
+  `bh-daemon` binary with `BLACKHOLE_PERSISTENT_NETWORK_IDENTITY=1` and
+  `BLACKHOLE_KEYSTORE_BACKEND=file`), the opaque wake-push relay
+  (Dockerfile + systemd unit around `bh-push-relay`, fronted by Caddy for
+  automatic TLS), and a TURN relay (`docker-compose.yml`'s `coturn`
+  service — coturn itself, not this repo's code; static credentials only,
+  see `infra/README.md`'s own limitation note). Nothing here is deployed
+  to a real domain by this repo itself — `infra/README.md` is the
+  step-by-step guide for an operator who wants to. **Genuinely exercised
+  against a real deployment, not just written**: a real bootstrap node and
+  TURN relay were stood up and used to validate two independent daemons
+  finding each other over the public DHT and a real `typ relay` ICE
+  candidate — see the `client/desktop` entry above.
 
-Workspace-wide: 328 tests across `bh-crypto`/`bh-network`/`bh-storage`/
+Workspace-wide: 409 tests across `bh-crypto`/`bh-network`/`bh-storage`/
 `bh-files`/`bh-api`/`bh-calls`/`bh-push-relay`/`bh-desktop` (including real
 local WebRTC connection tests in `bh-calls` — 1:1, three-way group mesh, and
 a screen-share track — all of which need real UDP loopback and can be flaky

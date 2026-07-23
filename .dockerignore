@@ -14,3 +14,10 @@ client/desktop/src-tauri/target/
 .git/
 docs/
 *.md
+
+# Real secrets an operator fills in from infra/*.env.example — must never
+# be baked into a build-stage image layer, even one the final multi-stage
+# image discards (a cached/pushed builder layer or `docker history` would
+# still leak them). Keep the *.example templates copyable.
+**/*.env
+!**/*.env.example

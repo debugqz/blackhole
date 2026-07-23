@@ -42,6 +42,13 @@ fn use_mock_keychain() {
         // vars concurrently (`Once` guarantees this runs before any test
         // body executes), and never removed/changed afterward.
         unsafe { std::env::set_var("BLACKHOLE_API_TOKEN", TEST_API_TOKEN) };
+        // `bh_api::push`'s SSRF guard (`ALLOW_PRIVATE_RELAY_ENV`) would
+        // otherwise reject `sending_a_message_wakes_the_recipients_real_push_relay`'s
+        // test relay, which necessarily binds to 127.0.0.1 — there's no
+        // real public host to point it at in CI. See that constant's own
+        // doc comment for why this can't be used to reopen the SSRF gap
+        // for anyone who hasn't set it on their own daemon.
+        unsafe { std::env::set_var("BLACKHOLE_ALLOW_PRIVATE_RELAY_URL", "1") };
     });
 }
 
@@ -698,6 +705,263 @@ async fn messaging_features_round_trip_end_to_end() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// `GET /contacts` exposes a purely local, computed-fresh-every-call trust
+/// heuristic (`bh-api::contacts::compute_trust_level`) covering all four
+/// levels: a blocked contact reads `blocked` even if it's also verified
+/// (blocked takes priority); a verified contact reads `verified` even with
+/// a long message history (verified takes priority over "established");
+/// a contact added long enough ago with enough exchanged messages reads
+/// `established`; a freshly-added contact with no history reads `new`.
+#[tokio::test]
+async fn contacts_expose_a_local_trust_level() {
+    use_mock_keychain();
+    let dir = test_dir("contacts-trust");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-contacts-trust");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let db = session.db.clone();
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    let long_ago = -10 * 86_400; // 10 days before the unix epoch is fine for a test fixture
+
+    // Blocked, and also verified — blocked must still win.
+    db.upsert_contact(&Contact {
+        contact_id: "blocked-and-verified".into(),
+        identity_public_key: vec![1; 64],
+        display_name: None,
+        verified: true,
+        blocked: true,
+        added_at: long_ago,
+    })
+    .unwrap();
+
+    // Verified, with plenty of message history — verified must still win
+    // over "established".
+    db.upsert_contact(&Contact {
+        contact_id: "verified".into(),
+        identity_public_key: vec![2; 64],
+        display_name: None,
+        verified: true,
+        blocked: false,
+        added_at: long_ago,
+    })
+    .unwrap();
+    db.create_direct_conversation("conv-verified", "verified", long_ago)
+        .unwrap();
+    for i in 0..10 {
+        db.insert_message(&Message {
+            message_id: format!("m-verified-{i}"),
+            conversation_id: "conv-verified".into(),
+            sender_contact_id: None,
+            body: Some("hi".into()),
+            sent_at: long_ago,
+            received_at: None,
+            expires_at: None,
+            deleted_at: None,
+            reply_to_message_id: None,
+            edited_at: None,
+        })
+        .unwrap();
+    }
+
+    // Unverified, added long ago, with plenty of message history —
+    // "established".
+    db.upsert_contact(&Contact {
+        contact_id: "established".into(),
+        identity_public_key: vec![3; 64],
+        display_name: None,
+        verified: false,
+        blocked: false,
+        added_at: long_ago,
+    })
+    .unwrap();
+    db.create_direct_conversation("conv-established", "established", long_ago)
+        .unwrap();
+    for i in 0..10 {
+        db.insert_message(&Message {
+            message_id: format!("m-established-{i}"),
+            conversation_id: "conv-established".into(),
+            sender_contact_id: None,
+            body: Some("hi".into()),
+            sent_at: long_ago,
+            received_at: None,
+            expires_at: None,
+            deleted_at: None,
+            reply_to_message_id: None,
+            edited_at: None,
+        })
+        .unwrap();
+    }
+
+    // Unverified, just added, no history — "new".
+    db.upsert_contact(&Contact {
+        contact_id: "brand-new".into(),
+        identity_public_key: vec![4; 64],
+        display_name: None,
+        verified: false,
+        blocked: false,
+        added_at: 0,
+    })
+    .unwrap();
+
+    let response = app.oneshot(get_request("/contacts")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let contacts = body_json(response).await;
+    let trust_level_of = |contact_id: &str| -> String {
+        contacts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["contact_id"] == json!(contact_id))
+            .unwrap()["trust_level"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(trust_level_of("blocked-and-verified"), "blocked");
+    assert_eq!(trust_level_of("verified"), "verified");
+    assert_eq!(trust_level_of("established"), "established");
+    assert_eq!(trust_level_of("brand-new"), "new");
+}
+
+/// A shareable blocklist export/decode/apply round trip: exporting only
+/// includes already-blocked contacts, decoding is a pure preview that
+/// matches against this profile's own contacts without changing anything,
+/// an unknown identity key decodes with no match, and applying only ever
+/// blocks contacts the caller explicitly named (and that genuinely exist).
+#[tokio::test]
+async fn blocklist_export_decode_and_apply_round_trip() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    use_mock_keychain();
+    let dir = test_dir("blocklist");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-blocklist");
+    let default = manager.create_profile("Default", 0).unwrap();
+    let session = open_profile_session(&manager, &default.id, true);
+    let db = session.db.clone();
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state);
+
+    db.upsert_contact(&Contact {
+        contact_id: "blocked-one".into(),
+        identity_public_key: vec![1; 64],
+        display_name: Some("Spammer".into()),
+        verified: false,
+        blocked: true,
+        added_at: 0,
+    })
+    .unwrap();
+    db.upsert_contact(&Contact {
+        contact_id: "not-blocked".into(),
+        identity_public_key: vec![2; 64],
+        display_name: Some("Friend".into()),
+        verified: false,
+        blocked: false,
+        added_at: 0,
+    })
+    .unwrap();
+
+    // Export only includes the already-blocked contact.
+    let response = app
+        .clone()
+        .oneshot(get_request("/moderation/blocklist/export"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let exported = body_json(response).await;
+    assert_eq!(exported["count"], json!(1));
+    let link = exported["link"].as_str().unwrap().to_string();
+    assert!(link.starts_with("blackhole://blocklist?d="));
+
+    // Decoding is a pure preview: the already-blocked contact matches and
+    // reports `already_blocked: true`; nothing changes as a side effect.
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/moderation/blocklist/decode",
+            json!({"link": link}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let decoded = body_json(response).await;
+    let decoded = decoded.as_array().unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0]["matched_contact_id"], json!("blocked-one"));
+    assert_eq!(decoded[0]["already_blocked"], json!(true));
+
+    // A hand-built blob naming the not-yet-blocked contact's identity key,
+    // plus one nobody has — the not-yet-blocked one previews as
+    // `already_blocked: false`, the unknown one has no match at all.
+    let hand_built = json!({
+        "version": 1,
+        "entries": [
+            {"identity_public_key": hex::encode([2u8; 64]), "label": "Friend"},
+            {"identity_public_key": hex::encode([9u8; 64]), "label": "Stranger"},
+        ]
+    });
+    let link2 = format!(
+        "blackhole://blocklist?d={}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&hand_built).unwrap())
+    );
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/moderation/blocklist/decode",
+            json!({"link": link2}),
+        ))
+        .await
+        .unwrap();
+    let decoded = body_json(response).await;
+    let decoded = decoded.as_array().unwrap();
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(decoded[0]["matched_contact_id"], json!("not-blocked"));
+    assert_eq!(decoded[0]["already_blocked"], json!(false));
+    assert_eq!(decoded[1]["matched_contact_id"], Value::Null);
+
+    // Apply: block "not-blocked" (a real, matched contact) and a
+    // nonexistent id (should be silently skipped, not an error).
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/moderation/blocklist/apply",
+            json!({"contact_ids": ["not-blocked", "does-not-exist"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let applied = body_json(response).await;
+    assert_eq!(applied["blocked_count"], json!(1));
+
+    let response = app.clone().oneshot(get_request("/contacts")).await.unwrap();
+    let contacts = body_json(response).await;
+    let blocked = contacts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["contact_id"] == json!("not-blocked"))
+        .unwrap()["blocked"]
+        .as_bool()
+        .unwrap();
+    assert!(blocked);
+
+    // A malformed link is rejected, not silently accepted as empty.
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/moderation/blocklist/decode",
+            json!({"link": "not-a-blocklist-link"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 /// Safety-number verification and expiring invites, also end to end.

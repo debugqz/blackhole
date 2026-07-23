@@ -93,8 +93,8 @@
                 id="open-security"
                 class="icon-btn"
                 type="button"
-                title="Security"
-                aria-label="Security"
+                title="Settings"
+                aria-label="Settings"
               >
                 ◐
               </button>
@@ -249,9 +249,9 @@
       </section>
 
       <div id="screen-security" class="overlay" hidden>
-        <div class="panel-window">
+        <div class="panel-window settings-window">
           <div class="panel-bar">
-            <span>Security</span>
+            <span>Settings</span>
             <button
               id="close-security"
               class="icon-btn"
@@ -261,168 +261,451 @@
               ×
             </button>
           </div>
+          <div class="settings-panel">
+            <nav class="settings-nav" id="settings-nav">
+              <button type="button" class="active" data-category="seguridad">Security</button>
+              <button type="button" data-category="privacidad">Privacy</button>
+              <button type="button" data-category="notificaciones">Notifications</button>
+              <button type="button" data-category="personalizacion">Personalization</button>
+              <button type="button" data-category="accesibilidad">Accessibility</button>
+              <button type="button" data-category="dispositivos">Devices</button>
+              <button type="button" data-category="red">Network &amp; advanced</button>
+            </nav>
+            <div class="settings-categories">
+              <div class="settings-category active" data-category="seguridad">
+                <section>
+                  <h3>Identity</h3>
+                  <div class="kv">
+                    <span>Signing key</span><code id="id-signing" class="mono"></code>
+                  </div>
+                  <div class="kv">
+                    <span>Agreement key</span
+                    ><code id="id-agreement" class="mono"></code>
+                  </div>
+                  <p class="trust-note">
+                    Your recovery phrase was shown once, at creation. Blackhole
+                    never stores it, so it can't be shown again.
+                  </p>
+                </section>
+                <section>
+                  <h3>Local unlock</h3>
+                  <p id="local-auth-status" class="trust-note">Loading…</p>
+                  <div class="actions">
+                    <button id="enroll-totp" class="chip-btn" type="button">
+                      Enroll TOTP
+                    </button>
+                    <button id="remove-totp" class="chip-btn" type="button" hidden>
+                      Remove TOTP
+                    </button>
+                    <button id="enroll-passkey" class="chip-btn" type="button">
+                      Enroll passkey
+                    </button>
+                  </div>
+                  <div id="totp-enroll-panel" class="invite-preview" hidden></div>
+                  <div id="passkey-list"></div>
+                  <p class="trust-note">
+                    Gates this app's unlock screen only — it does not change how
+                    the local database itself is encrypted.
+                  </p>
+                </section>
+                <section>
+                  <h3>Database lock</h3>
+                  <p id="db-lock-status" class="trust-note">Loading…</p>
+                  <div class="actions">
+                    <button id="enable-db-lock" class="chip-btn" type="button">
+                      Enable with passkey
+                    </button>
+                    <button id="disable-db-lock" class="chip-btn" type="button" hidden>
+                      Disable
+                    </button>
+                  </div>
+                  <p class="trust-note">
+                    Unlike the local unlock screen above, this genuinely gates
+                    the database's encryption key using your passkey's
+                    hardware-derived secret (WebAuthn's PRF extension) — the
+                    daemon does not open the database at all until you unlock
+                    with the passkey at startup. Needs an authenticator that
+                    supports PRF (most modern platform authenticators — Touch
+                    ID, Windows Hello, recent security keys).
+                  </p>
+                </section>
+                <section>
+                  <h3>Dead man's switch</h3>
+                  <label class="toggle-row">
+                    <input id="dms-toggle" type="checkbox" />
+                    Release messages if I don't check in
+                  </label>
+                  <div class="row">
+                    <span>Check in every</span>
+                    <input
+                      id="dms-cadence"
+                      type="number"
+                      min="1"
+                      class="field mono"
+                      style="width: 5em"
+                    />
+                    <span>days</span>
+                  </div>
+                  <p class="trust-note">
+                    Last check-in: <span id="dms-last-checkin" class="mono">—</span><br />
+                    Deadline: <span id="dms-deadline" class="mono">—</span>
+                  </p>
+                  <p id="dms-triggered-note" class="trust-note" hidden>
+                    This switch has already fired. Disable and re-enable it to
+                    re-arm.
+                  </p>
+                  <button id="dms-checkin-now" class="btn-outline wide" type="button">
+                    Check in now
+                  </button>
+                  <p id="dms-status" class="trust-note"></p>
+
+                  <h4>Release messages</h4>
+                  <div id="dms-release-list" class="device-list"></div>
+                  <div class="row">
+                    <select id="dms-add-contact" class="field"></select>
+                  </div>
+                  <textarea
+                    id="dms-add-body"
+                    class="field mono"
+                    rows="3"
+                    placeholder="Message body"
+                  ></textarea>
+                  <button id="dms-add-release" class="btn-outline wide" type="button">
+                    Add release message
+                  </button>
+                  <p id="dms-release-error" class="error-text" hidden></p>
+                  <p class="trust-note">
+                    Text only — one message per contact. Delivered exactly like
+                    a normal encrypted message the moment this switch fires.
+                  </p>
+                </section>
+                <section>
+                  <h3>Shareable blocklist</h3>
+                  <p class="trust-note">
+                    A courtesy, not moderation: export who you've blocked as
+                    a text blob to share with a friend however you like.
+                    Importing only ever previews matches against your own
+                    contacts — nothing is blocked until you pick which ones
+                    yourself.
+                  </p>
+                  <button id="blocklist-export" class="btn-outline wide" type="button">
+                    Export my blocklist
+                  </button>
+                  <div id="blocklist-export-result" class="invite-preview" hidden></div>
+                  <textarea
+                    id="blocklist-import-input"
+                    class="field mono"
+                    rows="3"
+                    placeholder="Paste a blocklist link…"
+                  ></textarea>
+                  <button id="blocklist-decode" class="btn-outline wide" type="button">
+                    Decode
+                  </button>
+                  <div id="blocklist-preview" class="device-list"></div>
+                  <button id="blocklist-apply" class="btn-outline wide" type="button" hidden>
+                    Block selected
+                  </button>
+                  <p id="blocklist-status" class="trust-note"></p>
+                </section>
+                <section>
+                  <h3>Panic wipe</h3>
+                  <button id="panic-wipe" class="wipe-btn" type="button">
+                    Wipe this device
+                  </button>
+                  <p id="wipe-status" class="trust-note"></p>
+                  <p class="trust-note">
+                    Blackhole cannot read your messages. There is no moderation —
+                    ever.
+                  </p>
+                </section>
+              </div>
+
+              <div class="settings-category" data-category="privacidad">
+                <section>
+                  <h3>Link previews</h3>
+                  <label class="toggle-row">
+                    <input id="link-preview-toggle" type="checkbox" />
+                    <span id="link-preview-label">Show link previews</span>
+                  </label>
+                  <p id="link-preview-warning" class="trust-note"></p>
+                </section>
+                <section>
+                  <h3>Typing indicators</h3>
+                  <label class="toggle-row">
+                    <input id="typing-indicator-toggle" type="checkbox" />
+                    Show/send "is typing…" (off by default)
+                  </label>
+                  <p class="trust-note">
+                    Sealed the same way as a real message — indistinguishable
+                    ciphertext to anything but the recipient. Still, it's a
+                    small extra signal, so it stays opt-in.
+                  </p>
+                </section>
+                <section>
+                  <h3>Photo metadata</h3>
+                  <label class="toggle-row">
+                    <input id="strip-exif-toggle" type="checkbox" />
+                    Strip EXIF data before sending photos
+                  </label>
+                  <p class="trust-note">
+                    Location, camera model, and capture time never leave this
+                    device — the photo is re-encoded through a canvas before
+                    upload, which drops the original file's metadata
+                    entirely. On by default.
+                  </p>
+                </section>
+                <section>
+                  <h3>Last seen</h3>
+                  <label class="toggle-row">
+                    <input id="last-seen-toggle" type="checkbox" disabled />
+                    Share and show "last seen"
+                  </label>
+                  <p class="setting-disabled-note">
+                    Not available yet — the daemon doesn't expose a
+                    presence field for any contact today, so there's
+                    nothing for this to share or display.
+                  </p>
+                </section>
+              </div>
+
+              <div class="settings-category" data-category="notificaciones">
+                <section>
+                  <h3>Push wake notifications</h3>
+                  <label class="toggle-row">
+                    <input id="push-toggle" type="checkbox" />
+                    Wake this device for new messages (opt-in)
+                  </label>
+                  <input
+                    id="push-relay-url"
+                    class="field mono"
+                    type="text"
+                    placeholder="https://your-relay.example"
+                  />
+                  <p class="trust-note">
+                    Registers an opaque, identity-independent token with the
+                    relay above, whose only job is telling this device
+                    "something arrived" — never message content, never who
+                    it's from. Leave blank to keep push local-only (no real
+                    wake, same as before a relay existed).
+                  </p>
+                </section>
+                <section>
+                  <h3>Do not disturb</h3>
+                  <label class="toggle-row">
+                    <input id="dnd-toggle" type="checkbox" />
+                    Quiet hours
+                  </label>
+                  <div class="row">
+                    <input id="dnd-start" class="field mono" type="time" />
+                    <span>to</span>
+                    <input id="dnd-end" class="field mono" type="time" />
+                  </div>
+                  <p class="setting-disabled-note">
+                    Saved, but not wired to anything yet — this app doesn't
+                    play sounds or raise system notifications for new
+                    messages today, so there's nothing here to silence.
+                  </p>
+                </section>
+              </div>
+
+              <div class="settings-category" data-category="personalizacion">
+                <section>
+                  <h3>Interface density</h3>
+                  <select id="density-select" class="field wide">
+                    <option value="compact">Compact</option>
+                    <option value="comfortable">Comfortable</option>
+                    <option value="spacious">Spacious</option>
+                  </select>
+                </section>
+                <section>
+                  <h3>Quick reactions</h3>
+                  <input
+                    id="quick-reactions-input"
+                    class="field wide"
+                    type="text"
+                    maxlength="16"
+                  />
+                  <p class="trust-note">
+                    Up to 8 emoji, shown when you long-press a message to
+                    react.
+                  </p>
+                </section>
+                <section>
+                  <h3>Link preview cache</h3>
+                  <button id="clear-link-preview-cache" class="btn-outline wide" type="button">
+                    Clear cache
+                  </button>
+                  <p id="link-preview-cache-status" class="trust-note"></p>
+                </section>
+                <section>
+                  <h3>Language</h3>
+                  <select id="language-select" class="field wide" disabled>
+                    <option>Español</option>
+                  </select>
+                  <p class="setting-disabled-note">
+                    Only Spanish exists today — the interface isn't
+                    translated into other languages yet.
+                  </p>
+                </section>
+              </div>
+
+              <div class="settings-category" data-category="accesibilidad">
+                <section>
+                  <h3>Text size</h3>
+                  <select id="font-size-select" class="field wide">
+                    <option value="small">Small</option>
+                    <option value="medium">Medium</option>
+                    <option value="large">Large</option>
+                  </select>
+                </section>
+                <section>
+                  <h3>Motion</h3>
+                  <label class="toggle-row">
+                    <input id="reduce-motion-toggle" type="checkbox" />
+                    Reduce motion
+                  </label>
+                  <p class="trust-note">
+                    Turns off the unlock screen's ambient animation, on top
+                    of whatever your OS already prefers.
+                  </p>
+                </section>
+                <section>
+                  <h3>Contrast</h3>
+                  <label class="toggle-row">
+                    <input id="high-contrast-toggle" type="checkbox" />
+                    High contrast
+                  </label>
+                </section>
+                <section>
+                  <h3>Links</h3>
+                  <label class="toggle-row">
+                    <input id="underline-links-toggle" type="checkbox" />
+                    Always underline links
+                  </label>
+                </section>
+                <section>
+                  <h3>Keyboard shortcuts</h3>
+                  <div class="kv"><span>New contact</span><code class="mono">⌘/Ctrl N</code></div>
+                  <div class="kv"><span>Search messages</span><code class="mono">⌘/Ctrl K</code></div>
+                  <div class="kv"><span>Open settings</span><code class="mono">⌘/Ctrl ,</code></div>
+                  <p class="trust-note">
+                    Active anywhere in the app except while typing in a
+                    text field.
+                  </p>
+                </section>
+              </div>
+
+              <div class="settings-category" data-category="dispositivos">
+                <section>
+                  <h3>Linked devices</h3>
+                  <div id="devices-list" class="device-list"></div>
+                  <div class="link-steps" id="link-steps" hidden>
+                    <span class="link-step-dot" data-step="1">1</span>
+                    <span class="link-step-line"></span>
+                    <span class="link-step-dot" data-step="2">2</span>
+                    <span class="link-step-line"></span>
+                    <span class="link-step-dot" data-step="3">3</span>
+                    <span class="link-step-line"></span>
+                    <span class="link-step-dot" data-step="4">4</span>
+                  </div>
+                  <div id="link-qr" class="link-qr" hidden></div>
+                  <button id="link-device" class="btn-outline wide" type="button">
+                    Link a new device (local simulation)
+                  </button>
+                  <p id="link-status" class="trust-note"></p>
+                  <p class="trust-note">
+                    This daemon plays both roles of the linking protocol locally
+                    — there's no second physical device here, but the
+                    cryptographic handoff is real.
+                  </p>
+                </section>
+              </div>
+
+              <div class="settings-category" data-category="red">
+                <section>
+                  <h3>Network</h3>
+                  <div class="row">
+                    <span>Bootstrap peers</span>
+                  </div>
+                  <input
+                    id="network-bootstrap-peers"
+                    class="field mono"
+                    type="text"
+                    placeholder="/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo..."
+                  />
+                  <div class="row">
+                    <span>TURN servers</span>
+                  </div>
+                  <input
+                    id="network-turn-servers"
+                    class="field mono"
+                    type="text"
+                    placeholder="turn:1.2.3.4:3478"
+                  />
+                  <div class="row">
+                    <span>TURN username</span>
+                  </div>
+                  <input id="network-turn-username" class="field mono" type="text" />
+                  <div class="row">
+                    <span>TURN credential</span>
+                  </div>
+                  <input id="network-turn-credential" class="field mono" type="password" />
+                  <button id="network-save" class="btn-outline wide" type="button">
+                    Save
+                  </button>
+                  <p id="network-status" class="trust-note"></p>
+                  <p class="trust-note">
+                    Blank fields fall back to this build's defaults. Changes
+                    only take effect the next time the daemon (re)starts — an
+                    already-running daemon keeps using whatever it started
+                    with, restart the app to apply. An environment variable
+                    set before launching the app (`BLACKHOLE_BOOTSTRAP_PEERS`,
+                    `BLACKHOLE_TURN_*`) always overrides whatever is saved
+                    here.
+                  </p>
+                </section>
+                <section>
+                  <h3>Bandwidth</h3>
+                  <select id="bandwidth-select" class="field wide" disabled>
+                    <option>Unlimited</option>
+                  </select>
+                  <p class="setting-disabled-note">
+                    Not available yet — bh-network has no throttling knob
+                    for cover traffic or mailbox relay to plug this into
+                    today.
+                  </p>
+                </section>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="screen-verify" class="overlay" hidden>
+        <div class="panel-window">
+          <div class="panel-bar">
+            <span>Verify</span>
+            <button id="close-verify" class="icon-btn" type="button" aria-label="Close">
+              ×
+            </button>
+          </div>
           <div class="panel">
             <section>
-              <h3>Identity</h3>
-              <div class="kv">
-                <span>Signing key</span><code id="id-signing" class="mono"></code>
-              </div>
-              <div class="kv">
-                <span>Agreement key</span
-                ><code id="id-agreement" class="mono"></code>
-              </div>
+              <h3 id="verify-contact-name"></h3>
               <p class="trust-note">
-                Your recovery phrase was shown once, at creation. Blackhole
-                never stores it, so it can't be shown again.
+                Compare this number with your contact over a separate
+                channel — in person, by phone, whatever you already trust.
+                Mark it verified only if every group matches exactly.
               </p>
-            </section>
-            <section>
-              <h3>Linked devices</h3>
-              <div id="devices-list" class="device-list"></div>
-              <button id="link-device" class="btn-outline wide" type="button">
-                Link a new device (local simulation)
+              <div id="verify-safety-grid" class="safety-grid"></div>
+              <div id="verify-qr" class="invite-preview" hidden></div>
+              <button id="verify-confirm" class="btn-primary wide" type="button">
+                Mark as verified
               </button>
-              <p id="link-status" class="trust-note"></p>
-              <p class="trust-note">
-                This daemon plays both roles of the linking protocol locally
-                — there's no second physical device here, but the
-                cryptographic handoff is real.
-              </p>
-            </section>
-            <section>
-              <h3>Link previews</h3>
-              <label class="toggle-row">
-                <input id="link-preview-toggle" type="checkbox" />
-                <span id="link-preview-label">Show link previews</span>
-              </label>
-              <p id="link-preview-warning" class="trust-note"></p>
-            </section>
-            <section>
-              <h3>Push wake notifications</h3>
-              <label class="toggle-row">
-                <input id="push-toggle" type="checkbox" />
-                Wake this device for new messages (opt-in)
-              </label>
-              <p class="trust-note">
-                Registers an opaque, identity-independent token with a
-                relay whose only job is telling this device "something
-                arrived" — never message content, never who it's from.
-              </p>
-            </section>
-            <section>
-              <h3>Typing indicators</h3>
-              <label class="toggle-row">
-                <input id="typing-indicator-toggle" type="checkbox" />
-                Show/send "is typing…" (off by default)
-              </label>
-              <p class="trust-note">
-                Sealed the same way as a real message — indistinguishable
-                ciphertext to anything but the recipient. Still, it's a
-                small extra signal, so it stays opt-in.
-              </p>
-            </section>
-            <section>
-              <h3>Local unlock</h3>
-              <p id="local-auth-status" class="trust-note">Loading…</p>
-              <div class="actions">
-                <button id="enroll-totp" class="chip-btn" type="button">
-                  Enroll TOTP
-                </button>
-                <button id="remove-totp" class="chip-btn" type="button" hidden>
-                  Remove TOTP
-                </button>
-                <button id="enroll-passkey" class="chip-btn" type="button">
-                  Enroll passkey
-                </button>
-              </div>
-              <div id="totp-enroll-panel" class="invite-preview" hidden></div>
-              <div id="passkey-list"></div>
-              <p class="trust-note">
-                Gates this app's unlock screen only — it does not change how
-                the local database itself is encrypted.
-              </p>
-            </section>
-            <section>
-              <h3>Database lock</h3>
-              <p id="db-lock-status" class="trust-note">Loading…</p>
-              <div class="actions">
-                <button id="enable-db-lock" class="chip-btn" type="button">
-                  Enable with passkey
-                </button>
-                <button id="disable-db-lock" class="chip-btn" type="button" hidden>
-                  Disable
-                </button>
-              </div>
-              <p class="trust-note">
-                Unlike the local unlock screen above, this genuinely gates
-                the database's encryption key using your passkey's
-                hardware-derived secret (WebAuthn's PRF extension) — the
-                daemon does not open the database at all until you unlock
-                with the passkey at startup. Needs an authenticator that
-                supports PRF (most modern platform authenticators — Touch
-                ID, Windows Hello, recent security keys).
-              </p>
-            </section>
-            <section>
-              <h3>Dead man's switch</h3>
-              <label class="toggle-row">
-                <input id="dms-toggle" type="checkbox" />
-                Release messages if I don't check in
-              </label>
-              <div class="row">
-                <span>Check in every</span>
-                <input
-                  id="dms-cadence"
-                  type="number"
-                  min="1"
-                  class="field mono"
-                  style="width: 5em"
-                />
-                <span>days</span>
-              </div>
-              <p class="trust-note">
-                Last check-in: <span id="dms-last-checkin" class="mono">—</span><br />
-                Deadline: <span id="dms-deadline" class="mono">—</span>
-              </p>
-              <p id="dms-triggered-note" class="trust-note" hidden>
-                This switch has already fired. Disable and re-enable it to
-                re-arm.
-              </p>
-              <button id="dms-checkin-now" class="btn-outline wide" type="button">
-                Check in now
+              <button id="verify-cancel" class="btn-secondary wide" type="button">
+                Not now
               </button>
-              <p id="dms-status" class="trust-note"></p>
-
-              <h4>Release messages</h4>
-              <div id="dms-release-list" class="device-list"></div>
-              <div class="row">
-                <select id="dms-add-contact" class="field"></select>
-              </div>
-              <textarea
-                id="dms-add-body"
-                class="field mono"
-                rows="3"
-                placeholder="Message body"
-              ></textarea>
-              <button id="dms-add-release" class="btn-outline wide" type="button">
-                Add release message
-              </button>
-              <p id="dms-release-error" class="error-text" hidden></p>
-              <p class="trust-note">
-                Text only — one message per contact. Delivered exactly like
-                a normal encrypted message the moment this switch fires.
-              </p>
-            </section>
-            <section>
-              <h3>Panic wipe</h3>
-              <button id="panic-wipe" class="wipe-btn" type="button">
-                Wipe this device
-              </button>
-              <p id="wipe-status" class="trust-note"></p>
-              <p class="trust-note">
-                Blackhole cannot read your messages. There is no moderation —
-                ever.
-              </p>
+              <p id="verify-error" class="error-text" hidden></p>
             </section>
           </div>
         </div>
@@ -444,7 +727,7 @@
                 crypto, never a privacy upsell. Buying records a pending
                 purchase; it's granted once payment is confirmed.
               </p>
-              <div id="store-catalog-list" class="device-list"></div>
+              <div id="store-catalog-list" class="store-grid"></div>
             </section>
             <section>
               <h3>Owned</h3>
@@ -720,7 +1003,10 @@
             </button>
           </div>
           <div class="panel call-panel">
-            <p id="call-status" class="trust-note"></p>
+            <div class="call-status-row">
+              <p id="call-status" class="trust-note"></p>
+              <span id="call-duration" class="mono"></span>
+            </div>
             <div id="call-videos" class="call-videos">
               <canvas id="call-remote-video" class="call-video-canvas"></canvas>
               <canvas id="call-local-video" class="call-video-canvas call-video-local"></canvas>

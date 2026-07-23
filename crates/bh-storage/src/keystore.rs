@@ -161,6 +161,57 @@ impl Keystore {
         Ok(())
     }
 
+    /// Creates `dir` (and any missing parents) with owner-only permissions
+    /// applied at creation time, not after — closing the brief window
+    /// `create_dir_all` followed by a separate `restrict_permissions` call
+    /// would otherwise leave a fresh directory world/group-readable (per
+    /// the process umask) until the second call lands. The caller still
+    /// follows up with [`restrict_permissions`] anyway, purely to heal a
+    /// directory that already existed with looser permissions from before
+    /// this function existed — that second call is a no-op for a directory
+    /// this function just created.
+    #[cfg(unix)]
+    fn create_dir_with_owner_only_permissions(dir: &std::path::Path) -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+
+    #[cfg(not(unix))]
+    fn create_dir_with_owner_only_permissions(dir: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
+
+    /// Writes `contents` to `path` with owner-only permissions applied at
+    /// creation time (via the `open(2)` call's own `mode` argument), not
+    /// after a separate `std::fs::write` + `set_permissions` pair — the
+    /// key-material equivalent of the directory fix above, same race
+    /// (secret bytes briefly readable per the process umask before a
+    /// follow-up chmod lands). Only takes effect for a file this call
+    /// actually creates — the kernel ignores `mode` when `O_CREAT` finds
+    /// the file already present — so the caller still runs
+    /// [`restrict_permissions`] afterward to heal a pre-existing file left
+    /// over from before this function existed.
+    #[cfg(unix)]
+    fn write_owner_only_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())
+    }
+
+    #[cfg(not(unix))]
+    fn write_owner_only_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+        std::fs::write(path, contents)
+    }
+
     /// Stores a key in the platform's secure credential store, never in
     /// plaintext on disk — unless [`Backend::File`] is active, see the
     /// module doc for why that exists and what it trades away.
@@ -170,10 +221,10 @@ impl Keystore {
                 e.set_password(&hex::encode(key))
             }),
             Backend::File { dir } => {
-                std::fs::create_dir_all(dir)?;
+                Self::create_dir_with_owner_only_permissions(dir)?;
                 Self::restrict_permissions(dir, 0o700)?;
                 let path = Self::file_backend_path(dir, label);
-                std::fs::write(&path, hex::encode(key))?;
+                Self::write_owner_only_file(&path, &hex::encode(key))?;
                 Self::restrict_permissions(&path, 0o600)?;
                 Ok(())
             }

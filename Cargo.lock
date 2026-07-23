@@ -598,6 +598,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "subtle 2.6.1",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",

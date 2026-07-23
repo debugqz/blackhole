@@ -80,6 +80,13 @@ fn open_sqlcipher_connection(path: &Path, key: &[u8; 32]) -> Result<Connection, 
     // a wrong key fails loudly here instead of on the first real query.
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
         .map_err(|_| CryptoError::KeyDerivation)?;
+    // Same reasoning as `bh_storage::db::SetSqlCipherKey` — without this,
+    // a removed member's now-inaccessible epoch secrets (and any other
+    // deleted MLS storage row) only get unlinked, not overwritten, leaving
+    // recoverable plaintext-after-decryption bytes in this database file
+    // for anyone who later obtains its key.
+    conn.pragma_update(None, "secure_delete", "ON")
+        .map_err(|_| CryptoError::KeyDerivation)?;
     Ok(conn)
 }
 

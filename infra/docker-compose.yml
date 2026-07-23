@@ -63,20 +63,44 @@ services:
     image: coturn/coturn:latest
     restart: unless-stopped
     network_mode: host
-    command:
-      - "-n"
-      - "--listening-port=3478"
-      - "--tls-listening-port=5349"
-      - "--min-port=49152"
-      - "--max-port=65535"
-      - "--realm=${TURN_REALM:?set TURN_REALM in infra/.env}"
-      - "--server-name=${TURN_REALM}"
-      - "--external-ip=${TURN_PUBLIC_IP:?set TURN_PUBLIC_IP in infra/.env}"
-      - "--lt-cred-mech"
-      - "--user=${TURN_USERNAME:?set TURN_USERNAME in infra/.env}:${TURN_CREDENTIAL:?set TURN_CREDENTIAL in infra/.env}"
-      - "--no-cli"
-      - "--fingerprint"
-      - "--stale-nonce=600"
+    environment:
+      TURN_REALM: "${TURN_REALM:?set TURN_REALM in infra/.env}"
+      TURN_PUBLIC_IP: "${TURN_PUBLIC_IP:?set TURN_PUBLIC_IP in infra/.env}"
+      TURN_USERNAME: "${TURN_USERNAME:?set TURN_USERNAME in infra/.env}"
+      TURN_CREDENTIAL: "${TURN_CREDENTIAL:?set TURN_CREDENTIAL in infra/.env}"
+    # The long-term credential used to be passed as a `--user=...`
+    # command-line flag — visible in plaintext to anyone on the host who
+    # can run `ps aux`/read `/proc/<pid>/cmdline`, or `docker inspect`/
+    # `docker top` against the container, a lower-friction local exposure
+    # on top of the already-accepted "this credential is leaked forever if
+    # it leaks" risk the README calls out. `environment:` values aren't
+    # immune to a sufficiently privileged local reader either, but they're
+    # not in the default `ps`/`docker top` output, and writing the
+    # credential into a generated config file coturn reads via `-c` (rather
+    # than a CLI flag) means the actually-running `turnserver` process's
+    # own argv never contains it either way.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        conf=/tmp/turnserver.generated.conf
+        umask 077
+        cat > "$$conf" <<EOF
+        listening-port=3478
+        tls-listening-port=5349
+        min-port=49152
+        max-port=65535
+        realm=$$TURN_REALM
+        server-name=$$TURN_REALM
+        external-ip=$$TURN_PUBLIC_IP
+        lt-cred-mech
+        user=$$TURN_USERNAME:$$TURN_CREDENTIAL
+        no-cli
+        fingerprint
+        stale-nonce=600
+        EOF
+        exec turnserver -n -c "$$conf"
     # `network_mode: host` because coturn negotiates real UDP relay ports
     # from min-port/max-port dynamically — Docker's normal per-port
     # publishing can't cover a 16k-port range sanely. Linux hosts only;

@@ -323,6 +323,32 @@ guarantee.
   `pow.rs`'s primitive (§3.8) is no longer just defined-and-tested in
   isolation, it's the actual gate. TTL-bounded storage still keeps
   abandoned mailboxes from growing forever on top of that.
+- **MITIGATED — a second, cheaper denial of service closed: manifest
+  size exhaustion**. `POW_DIFFICULTY_BITS` is deliberately low (see its
+  own doc comment), so nothing stopped an attacker who knows a target's
+  `recipient_key_hash` (unavoidably public — required to message anyone
+  at all) from solving thousands of trivial proofs and pushing that many
+  tiny messages, growing the recipient's (or a group's) manifest past the
+  DHT's own `MAX_DHT_RECORD_BYTES` record-size cap — after which *every*
+  future legitimate push/fan-out to that recipient/group started failing,
+  silently and unpredictably, until the manifest was next pruned (which
+  only happens lazily, on `pull`; an offline or rarely-polling victim
+  stayed effectively unreachable indefinitely). `MAX_MANIFEST_BYTES` (96
+  KiB, conservative headroom under the 128 KiB DHT cap) now bounds a
+  manifest's actual *serialized* byte size — not a guessed entry count,
+  since `serde_json`'s array-of-decimal-numbers encoding of each
+  `message_id`'s bytes means entry count alone doesn't predict record
+  size (same inflation `StoredMessage::to_bytes`'s own doc comment
+  already flags for message content) — and `push` now rejects with a
+  clear error once a manifest is already at the cap, confirmed by
+  `push_is_rejected_once_the_manifests_size_cap_is_reached`. This
+  converts an unbounded, silent failure mode into a bounded, immediately-
+  reported one; it does not by itself make the underlying PoW cost less
+  cheap to pay repeatedly — a determined attacker can still fill a
+  target's manifest back up to this cap after every prune. Raising
+  `POW_DIFFICULTY_BITS` or adding real per-sender rate limiting at the
+  mailbox-node RPC layer remains the deeper fix (this section's own
+  "dedicated mailbox-node protocol" long-term direction).
 
 ### 3.7 Local storage (`bh-storage`)
 
@@ -358,6 +384,38 @@ guarantee.
   entry) with the operational mitigations `infra/README.md` documents
   (dedicated volume, host-level disk encryption, restrictive
   permissions); not recommended for a real end-user profile.
+- **MITIGATED — a brief window where a freshly-created keystore
+  directory/file was readable by other local users is now closed**.
+  `Backend::File`'s old sequence was `create_dir_all` (or `fs::write`)
+  followed by a *separate* `restrict_permissions` call — between those two
+  calls, a fresh directory or file existed with whatever the process
+  umask allowed (commonly group/world-readable), briefly exposing key
+  material this backend already labels as a downgrade from the OS
+  keychain. `Keystore::create_dir_with_owner_only_permissions`/
+  `write_owner_only_file` now apply `0o700`/`0o600` at creation time — via
+  `DirBuilder::mode`/`OpenOptions::mode` (the `mkdir(2)`/`open(2)` call's
+  own `mode` argument) rather than a follow-up `chmod` — so there is no
+  window where the path exists with looser permissions. The subsequent
+  `restrict_permissions` call is kept, now purely to heal a directory/file
+  left over from before this fix existed (`mode` is a no-op for a path
+  `mkdir`/`O_CREAT` finds already present). A narrow, local-attacker-only
+  window (same trust boundary as §2's "another local process" adversary),
+  not a network-facing one.
+- **MITIGATED — deleted rows leave no recoverable plaintext on disk**.
+  Both SQLCipher connections this codebase opens (`bh_storage::db`'s main
+  profile database, and `bh_crypto::mls_storage`'s separate MLS group-state
+  database) set `PRAGMA secure_delete = ON` right after opening — SQLite's
+  normal behavior only *unlinks* a deleted row from its B-tree page,
+  leaving the actual bytes readable in the file's free space until
+  something else happens to overwrite them; `secure_delete` makes SQLite
+  zero a freed page immediately instead (`ON`, not the weaker `FAST`
+  variant, specifically so pages are actually zeroed rather than left in
+  the free-page list for later reuse). Matters most for `mls_storage`:
+  removing a group member invalidates that epoch's secrets, but without
+  this pragma the *bytes* of those now-inaccessible secrets stayed
+  recoverable in the database file for anyone who later obtained its key
+  — the same class of gap a removed member's forward secrecy is supposed
+  to close.
 - **Elevation of privilege / DoS mitigation**: `panic_wipe` gives a tested,
   irreversible emergency destruction path
   (`panic_wipe_removes_keys_and_data_dir`), confirmed end-to-end through
@@ -454,6 +512,21 @@ guarantee.
   `reject_browser_origin` (rejects any request carrying a browser-set
   `Origin` header, defending against a malicious web page rather than
   another local process) — a request needs to pass both middlewares.
+- **MITIGATED — the bearer-token comparison itself is now constant-time**.
+  `require_bearer_token` used to compare the presented token to
+  `state.api_token` with plain `==` on `&str`, which short-circuits at the
+  first mismatched byte — the kind of timing side channel
+  `bh_crypto::webhook`'s `Mac::verify_slice` already avoids for a
+  similarly secret comparison. It now uses `subtle::ConstantTimeEq`
+  (`token.as_bytes().ct_eq(state.api_token.as_bytes())`), which compares
+  every byte regardless of where the first mismatch falls, so a co-located
+  process attempting to brute-force the token file's contents can no
+  longer use response-time differences to narrow the search byte-by-byte.
+  Low severity in isolation — the attacker in this scenario already needs
+  local code execution as this user, at which point reading the `0600`
+  token file directly is easier than a timing attack — but a real,
+  correct hardening in the direction §2's "another local process" threat
+  already takes seriously.
 - **Repudiation**: `POST /identity` refuses to overwrite an existing
   identity (`409 Conflict`, verified live in the smoke test) — an
   accidental or malicious re-init can't silently replace a user's identity
@@ -774,6 +847,26 @@ Reviewed 2026-07-21, covering everything added in SPEC.md §16.
   device repeatedly. Low severity (a wake is content-free and rate-limited
   only by whatever the real push provider enforces) but worth noting as
   unmitigated.
+- **MITIGATED — a malicious declared length in a `PushRelayRecord` could
+  panic the parsing daemon**: `bh_crypto::push_relay::read_u32`/
+  `read_string` parse bytes fetched from the DHT — i.e. from an untrusted
+  peer — *before* `verify()` ever runs (`message_crypto.rs::
+  wake_recipient_best_effort` calls `from_bytes` first, checks the
+  signature second), so a record's declared string length was fully
+  attacker-controlled input reaching `*offset + len` with plain (not
+  checked) addition. On a build with overflow checks enabled — every
+  debug/test build, and increasingly common in release profiles too — a
+  length near `u32::MAX` panics that arithmetic outright; on a 32-bit
+  release target without overflow checks it would instead silently wrap,
+  potentially passing a bogus small `end` value on to the following slice
+  index. Both `read_u32` and `read_string` now use `checked_add`,
+  confirmed by `a_huge_declared_length_is_rejected_not_a_panic`, which
+  feeds a `u32::MAX`-length record through `PushRelayRecord::from_bytes`
+  and asserts a clean `Err` rather than a crash. A panic here would only
+  ever take down the *fetching* peer's own request-handling task, not
+  compromise it, but "any DHT-reachable peer can crash part of your
+  daemon by publishing one malformed record" is worth closing regardless
+  of severity.
 - **Denial of service (local search has no query-cost bound beyond FTS5's
   own)**: `search_messages` caps result count (`MAX_LIMIT = 200`) but not
   match-set size before that cap applies — a pathological query against a
@@ -911,6 +1004,84 @@ storage or synthetic tests.
   caller rather than silently degrading to "looks sent, isn't" — the
   same "surface it now, not just in logs" precedent already used for
   camera/screen-capture failures (§3.11, §3.12).
+
+### 3.14 Shareable blocklists, contact trust level, client UI prefs, and a fourth hardening pass (`bh-api::{moderation,contacts}`, `bh-storage::contacts`, `client/desktop/src/ui_prefs.ts`, plus the mailbox/keystore/token/parser fixes folded into §3.6/§3.7/§3.9/§3.12 above)
+
+- **Information disclosure (a blocklist export is a voluntary, explicit
+  metadata share, not a leak)**: `moderation::export_blocklist` produces a
+  plain base64-JSON blob (`blackhole://blocklist?d=...`, same convention
+  as `bh_crypto::invite::InvitePayload::to_link` — no passphrase or
+  encryption, since none of the contents are secret) listing the
+  identity public keys and local labels of contacts *this* user has
+  already blocked. Sharing it is an explicit, user-initiated copy/paste —
+  nothing about it travels automatically — but once shared, the recipient
+  of that link learns exactly who the exporter has blocked and whatever
+  display-name label the exporter attached to each. That is the intended
+  function (letting a friend group share a blocklist against a shared bad
+  actor), not a bug, but it is a real, if narrow, information disclosure
+  the exporter should understand before sharing widely — worth stating
+  here rather than leaving implicit. `decode_blocklist` is a pure,
+  storage-free preview (mirrors `invites::decode_invite`'s pattern) that
+  only ever reports which entries match the *importer's own* existing
+  contacts; `apply_blocklist` only ever blocks a contact the importer
+  already has and explicitly selected by id — decoding a link never
+  creates a contact, and no entry is applied automatically. Keeps
+  CLAUDE.md's "no content moderation, ever" intact: every real effect
+  bottoms out in the same local, explicit `set_contact_blocked` call the
+  existing `POST /contacts/:id/block` button already used, and
+  `apply_blocklist` re-checks that a given `contact_id` actually exists
+  before touching it — defense in depth against a hand-crafted request
+  naming an id the earlier `decode` step never matched.
+- **Not a security boundary, by design — the contact trust-level
+  heuristic (`bh-api::contacts::compute_trust_level`)**: `Blocked`/
+  `Verified`/`Established`/`New` is a purely local UI signal ("how well do
+  I actually know this contact"), never persisted (recomputed fresh from
+  `Contact.blocked`/`Contact.verified` plus a local message-count/age
+  heuristic on every `GET /contacts`) and never a substitute for actually
+  comparing a safety number. Only `Blocked` and `Verified` reflect a real
+  explicit user action or cryptographic guarantee; `Established` is
+  inferred purely from local activity (≥10 non-deleted `Direct` messages
+  exchanged over ≥3 days) and carries no security meaning at all — it
+  exists only so a longtime unverified contact doesn't render visually
+  identical to one added five minutes ago. Nothing about this heuristic
+  is network-visible or attacker-influenceable in a way that matters: an
+  attacker who wants to look "Established" just has to actually exchange
+  ten real, decrypted messages with the victim over three real days,
+  which grants them nothing they didn't already have (an authenticated,
+  ongoing conversation) — the heuristic doesn't unlock any additional
+  trust or capability, only a badge in the contact list UI.
+- **No new attack surface — client-only UI preferences
+  (`client/desktop/src/ui_prefs.ts`)**: density/font-size/etc. live in
+  `localStorage` only, deliberately not namespaced per-profile (unlike
+  `link_preview.ts`'s own setting, which *is* profile-scoped since it
+  gates a real network-facing behavior) since these are about how this
+  device's screen looks, not about any identity or content. Never reaches
+  the daemon, never affects encryption, session state, or moderation
+  decisions — noted here only for completeness, so a reader scanning this
+  document for "what changed" doesn't have to guess whether a new
+  client-side module was screened for security relevance.
+- **MITIGATED — the TURN long-term credential no longer appears in a
+  process listing**: `infra/docker-compose.yml`'s `coturn` service used to
+  pass `TURN_USERNAME`/`TURN_CREDENTIAL` as `--user=...` command-line
+  flags, visible in plaintext to anyone on the host who can run `ps aux`,
+  read `/proc/<pid>/cmdline`, or run `docker inspect`/`docker top` against
+  the container — a lower-friction *local* exposure on top of the
+  already-accepted "this credential is leaked forever if it leaks at all"
+  tradeoff §3.11's TURN entry and `infra/README.md` already call out
+  (coturn's `--user` mechanism is static-credential-only, not the
+  time-limited `use-auth-secret` scheme). The credential is now written
+  (via a generated shell entrypoint, `umask 077`) into a config file
+  coturn reads with `-c`, so the actually-running `turnserver` process's
+  own argv never contains it. `environment:` values aren't immune to a
+  sufficiently privileged local reader either, but they don't appear in
+  the default `ps`/`docker top` output the way argv does — a real
+  reduction in exposure, not a claim that the credential is now
+  unreadable to a determined host-level attacker (that attacker already
+  has the config file, which is the accepted tradeoff). Deployment-side
+  hardening, not code in this repo's own crates — worth tracking here
+  anyway since `infra/` is where "the code is done, the deployment is
+  real" work actually lands (see §3.7's file-keystore-backend entry for
+  the precedent of documenting `infra/`-level decisions in this file).
 
 
 
@@ -1073,6 +1244,66 @@ now describes what closed it, not that the number was removed.
     `libcrux-aead` hard-pin exact 0.0.x versions. Same shape as #2 used to
     be before correction: real, live, needs an upstream release, not
     fixable by editing this repo.
+22. **FIXED — a contact could point a sender's own daemon at an internal
+    address via the push-relay wake path (SSRF)** (§3.12/§3.13).
+    `message_crypto::wake_recipient_best_effort` fetches the *recipient's*
+    self-signed `PushRelayRecord` from the DHT and, on a real send, has
+    the *sender's* daemon issue an HTTP request to whatever `relay_url`
+    that record declares — a value chosen entirely by the remote contact,
+    not the local user. Without a check, a malicious contact could
+    publish a record pointing at a cloud metadata endpoint, `localhost`,
+    or another host on the sender's own LAN, and get the sender's own
+    daemon to make that request on every message sent to them.
+    `bh-api::push::validate_relay_url`/`is_blocked_host`/
+    `is_non_public_ip` now reject a loopback/private/link-local/
+    unspecified/multicast host before ever calling `register_with_relay`
+    or `wake_recipient_best_effort`'s HTTP client — same guard shape
+    `client/desktop/src-tauri/src/link_preview.rs`'s existing SSRF check
+    already established, applied here to the daemon-side `reqwest` call
+    instead of the client-side `ureq` fetch. Closes the DNS-rebinding gap
+    a string-only check would leave open too: `pinned_relay_client`
+    resolves the host once, re-validates the *resolved* address, and
+    pins `reqwest`'s connection to exactly that address, so the checked
+    address can't silently differ from the one actually connected to.
+    `BLACKHOLE_ALLOW_PRIVATE_RELAY_URL` opts back out for local
+    development and this crate's own loopback-bound integration test
+    (`sending_a_message_wakes_the_recipients_real_push_relay`) — off by
+    default, and only ever weakens a daemon's check on a URL *it* is
+    about to fetch, so it can't be used to reopen this gap on anyone
+    else's machine.
+23. **MITIGATED — mailbox manifest-size denial of service** (§3.6).
+    `MAX_MANIFEST_BYTES` bounds a manifest's serialized size and `push`
+    now rejects once a recipient's/group's manifest is already at the
+    cap, turning an unbounded silent-failure DoS (cheap PoW, unlimited
+    tiny pushes) into a bounded, immediately-reported one — the
+    underlying cheap-PoW cost itself is unchanged, see §3.6 for what
+    still isn't fixed.
+24. **MITIGATED — bearer-token comparison is now constant-time** (§3.9).
+    `require_bearer_token` uses `subtle::ConstantTimeEq` instead of `==`,
+    closing a timing side channel against a co-located local process —
+    low severity given that attacker already needs local code execution.
+25. **MITIGATED — deleted rows leave no recoverable plaintext on disk**
+    (§3.7). Both SQLCipher connections (`bh_storage::db` and
+    `bh_crypto::mls_storage`) now set `PRAGMA secure_delete = ON`; matters
+    most for MLS group state, where a removed member's now-inaccessible
+    epoch secrets previously stayed byte-recoverable in the file.
+26. **MITIGATED — a freshly-created keystore file/directory is never
+    briefly world-readable** (§3.7). `Backend::File` now applies
+    `0o700`/`0o600` at creation time (`DirBuilder`/`OpenOptions` `mode`)
+    instead of via a separate follow-up `chmod`, closing the race window
+    between the two.
+27. **MITIGATED — a malicious `PushRelayRecord` declared length could
+    panic the parsing daemon** (§3.12). `read_u32`/`read_string` now use
+    `checked_add` instead of raw `+`, rejecting a `u32::MAX`-scale length
+    cleanly instead of panicking (debug/test builds) or wrapping (32-bit
+    release builds) on DHT-sourced bytes parsed before signature
+    verification.
+28. **MITIGATED — the TURN long-term credential no longer appears in a
+    host process listing** (§3.14). `infra/docker-compose.yml`'s `coturn`
+    service now reads it from a generated config file instead of a
+    `--user=...` CLI flag, removing it from `ps`/`docker inspect`/`docker
+    top` output — deployment-side hardening, the underlying
+    static-credential-only tradeoff itself is unchanged.
 
 Two entries deliberately excluded from this list: the `hickory-proto`
 alerts (§3.10) are dormant with no path to becoming live short of

@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["time", "sync", "net"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -23,6 +23,11 @@ webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"]
 url = "2"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
+# Constant-time comparison for the daemon bearer token
+# (`server.rs::require_bearer_token`) — already in the dependency tree
+# transitively via ed25519-dalek/x25519-dalek, promoted to a direct
+# dependency here so its use is explicit rather than incidental.
+subtle = "2"
 base64 = "0.22"
 getrandom = "0.4"
 ed25519-dalek = "3"

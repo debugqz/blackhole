@@ -40,12 +40,13 @@ fn signed_message(relay_url: &str, token: &str) -> Vec<u8> {
 }
 
 fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, CryptoError> {
-    let slice = bytes
-        .get(*offset..*offset + 4)
-        .ok_or(CryptoError::Malformed(
-            "push-relay record: truncated length",
-        ))?;
-    *offset += 4;
+    let end = offset.checked_add(4).ok_or(CryptoError::Malformed(
+        "push-relay record: truncated length",
+    ))?;
+    let slice = bytes.get(*offset..end).ok_or(CryptoError::Malformed(
+        "push-relay record: truncated length",
+    ))?;
+    *offset = end;
     Ok(u32::from_be_bytes(
         slice.try_into().expect("checked length"),
     ))
@@ -53,12 +54,20 @@ fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, CryptoError> {
 
 fn read_string(bytes: &[u8], offset: &mut usize) -> Result<String, CryptoError> {
     let len = read_u32(bytes, offset)? as usize;
-    let slice = bytes
-        .get(*offset..*offset + len)
-        .ok_or(CryptoError::Malformed(
-            "push-relay record: truncated string",
-        ))?;
-    *offset += len;
+    // This module parses DHT-fetched bytes from an untrusted peer *before*
+    // `verify()` ever runs (see `message_crypto.rs::wake_recipient_best_effort`)
+    // — a declared `len` near `u32::MAX` must not be allowed to overflow
+    // `*offset + len` (`checked_add` rather than `+`, which panics on
+    // overflow on any target where overflow checks are enabled, e.g. every
+    // debug/test build, and would wrap on a 32-bit release target
+    // otherwise).
+    let end = offset.checked_add(len).ok_or(CryptoError::Malformed(
+        "push-relay record: truncated string",
+    ))?;
+    let slice = bytes.get(*offset..end).ok_or(CryptoError::Malformed(
+        "push-relay record: truncated string",
+    ))?;
+    *offset = end;
     String::from_utf8(slice.to_vec())
         .map_err(|_| CryptoError::Malformed("push-relay record: invalid utf-8"))
 }
@@ -161,6 +170,19 @@ mod tests {
         let mut tampered = PushRelayRecord::from_bytes(&record.to_bytes()).unwrap();
         tampered.token = "cafebabe".to_string();
         assert!(!tampered.verify(&identity.public_signing_key()));
+    }
+
+    /// Regression test for the overflow guard in `read_string`/`read_u32`:
+    /// a maliciously huge declared length must be rejected cleanly (not
+    /// panic via `offset + len` overflowing `usize`) — this parses
+    /// DHT-sourced bytes from an untrusted peer before any signature check
+    /// runs.
+    #[test]
+    fn a_huge_declared_length_is_rejected_not_a_panic() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.extend_from_slice(b"way too short to satisfy that length");
+        assert!(PushRelayRecord::from_bytes(&bytes).is_err());
     }
 
     #[test]

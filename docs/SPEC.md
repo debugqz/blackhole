@@ -132,6 +132,10 @@ Log público append-only y auditable de claves públicas (mismo concepto que Cer
   - **Reporte voluntario**: el usuario que reporta decide qué comparte de su propio historial; la plataforma nunca accede a mensajes que el usuario no eligió mostrar.
   - "Solicitudes de mensaje" por defecto para contacto de desconocidos (no llegan directo al chat principal hasta aceptar).
 - **Anti-spam de red** (no de contenido): proof-of-work liviano por mensaje enviado, invisible para el usuario normal, costoso para un emisor masivo automatizado.
+- **Bloqueos compartibles** (implementado, §18): exportar/importar la
+  propia lista de bloqueados como un link — siempre una cortesía
+  voluntaria entre usuarios, nunca una lista centralizada ni aplicada
+  automáticamente.
 
 ---
 
@@ -454,6 +458,93 @@ no-negociables (§2.2, CLAUDE.md).
    solo no puede detectarlo; un diseño tipo Certificate Transparency real
    necesitaría monitores independientes con chequeos cruzados,
    explícitamente fuera de scope para un log auto-publicado por identidad.
+
+---
+
+## 18. Bloqueos compartibles, señal de confianza de contacto, preferencias de UI y cuarta ronda de hardening (post-§17)
+
+Cuarta tanda: a diferencia de §17 (conectar capacidad ya existente a la red
+real), esta ronda agrega dos superficies nuevas pequeñas orientadas al
+usuario (bloqueos compartibles, señal de confianza) más una preferencia de
+cliente sin ningún componente criptográfico o de red (densidad/tamaño de
+fuente), y cierra media docena de gaps de seguridad ya identificados o
+recién encontrados durante esta pasada. Mismo criterio de siempre: nada
+toca los no-negociables (§2.2, CLAUDE.md); ver `docs/THREAT_MODEL.md` §3.14
+para el análisis STRIDE completo.
+
+- **Bloqueos compartibles** (`bh-api::moderation::{export_blocklist,
+  decode_blocklist,apply_blocklist}`, tres rutas nuevas bajo
+  `/moderation/blocklist/*`, con panel de export/import en el cliente): una
+  cortesía, no un sistema de moderación — un link copiable
+  (`blackhole://blocklist?d=...`, JSON base64 plano, misma convención que
+  `bh_crypto::invite::InvitePayload::to_link`, sin cifrar porque nada del
+  contenido es secreto) que lista las claves públicas de identidad + label
+  local de los contactos que este perfil ya bloqueó. Decodificar solo
+  *previsualiza* qué entradas coinciden con los contactos propios del que
+  importa; aplicar solo bloquea un contacto que el importador ya tiene y
+  seleccionó explícitamente por id — nada de esto crea un contacto nuevo ni
+  bloquea a nadie automáticamente, así que el principio "sin moderación de
+  contenido, nunca" (§8) queda intacto: el único efecto real siempre
+  termina en la misma llamada local `set_contact_blocked` que ya usaba el
+  botón de bloqueo existente. Compartir el link es una acción explícita del
+  usuario, no algo que viaje solo — pero, una vez compartido, el receptor sí
+  aprende exactamente a quién bloqueó el que lo exportó; una fuga de
+  metadata real, aunque acotada y voluntaria (`docs/THREAT_MODEL.md` §3.14
+  lo documenta con ese nombre).
+- **Señal de confianza de contacto** (`bh-api::contacts::{TrustLevel,
+  compute_trust_level}`, expuesta como `ContactView` en `GET /contacts`,
+  con badge en el cliente): una heurística puramente local y nunca
+  persistida — `Blocked`/`Verified`/`Established`/`New` — calculada de
+  nuevo en cada request a partir de `Contact.blocked`/`Contact.verified` y
+  un conteo de mensajes por contacto
+  (`bh-storage::contacts::message_counts_by_contact`, una sola query
+  agregada). Solo `Verified` refleja una garantía criptográfica real (una
+  comparación de número de seguridad confirmada); `Established` (≥10
+  mensajes no borrados en una conversación `Direct` a lo largo de ≥3 días)
+  es una señal mucho más débil, mostrada únicamente para que un contacto
+  no verificado de larga data no se vea idéntico a uno agregado hace cinco
+  minutos. Nunca sustituye la verificación manual del número de seguridad
+  (§2.4) — es un dato de UI, no un mecanismo de confianza nuevo.
+- **Preferencias de UI del cliente** (`client/desktop/src/ui_prefs.ts`):
+  densidad de la lista de conversaciones y tamaño de fuente, guardadas en
+  `localStorage` puro, deliberadamente *no* aisladas por perfil (a
+  diferencia de la preferencia de `link_preview.ts`, que sí lo está porque
+  gatea un comportamiento real de red) ya que describen cómo se ve la
+  pantalla de este dispositivo, no algo sobre una identidad o contenido.
+  Nunca llega al daemon.
+- **Cuarta ronda de hardening pragmático** (ver `docs/THREAT_MODEL.md`
+  §3.14 y las entradas correspondientes en §3.6/§3.7/§3.9/§3.12 para el
+  detalle completo de cada uno):
+  - **Buzones**: `mailbox.rs` ahora limita el tamaño serializado de un
+    manifiesto (`MAX_MANIFEST_BYTES`) y rechaza un `push` una vez que el
+    manifiesto de un destinatario/grupo ya está en ese límite — cierra una
+    denegación de servicio barata donde un atacante podía resolver miles
+    de pruebas de trabajo triviales y llenar el manifiesto de la víctima
+    hasta romper el límite de tamaño de registro de la DHT.
+  - **Token de portador**: la comparación en `require_bearer_token` ahora
+    es en tiempo constante (`subtle::ConstantTimeEq`), cerrando un canal
+    lateral de timing contra otro proceso local en la misma máquina.
+  - **Borrado seguro en SQLCipher**: tanto `bh-storage::db` como
+    `bh-crypto::mls_storage` activan `PRAGMA secure_delete = ON` — sin
+    esto, los secretos de época de un miembro removido de un grupo MLS
+    quedaban recuperables en el archivo de la base de datos, no
+    verdaderamente borrados.
+  - **Parser de `PushRelayRecord`**: `read_u32`/`read_string` ahora usan
+    suma con verificación de overflow en vez de suma directa — este
+    parser procesa bytes de la DHT, de un peer no confiable, *antes* de
+    verificar la firma, así que una longitud declarada maliciosa cerca de
+    `u32::MAX` ya no puede provocar un panic ni un wraparound.
+  - **Keystore**: `Backend::File` ahora crea su directorio/archivo con
+    permisos exclusivos del dueño (`0o700`/`0o600`) en el momento mismo de
+    la creación, en vez de con un `chmod` posterior — cierra una ventana
+    breve donde la ruta existía con permisos más laxos según el umask del
+    proceso.
+  - **Credencial TURN** (`infra/docker-compose.yml`): coturn ahora lee el
+    usuario/credencial de un archivo de configuración generado en vez de
+    un flag `--user=...` en la línea de comandos, así que la credencial ya
+    no aparece en `ps aux`/`docker inspect`/`docker top` del host —
+    hardening de despliegue, no cambia el hecho ya aceptado de que es una
+    credencial estática, no efímera (`infra/README.md`).
 
 ---
 

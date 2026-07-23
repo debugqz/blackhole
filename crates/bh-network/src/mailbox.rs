@@ -55,6 +55,32 @@ const POW_DIFFICULTY_BITS: u8 = 16;
 /// forward delivery.
 const MAX_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 
+/// Conservative headroom under `transport`'s `MAX_DHT_RECORD_BYTES` (128
+/// KiB) for a manifest's *serialized* size — closes a cheap, targeted
+/// denial-of-service: `POW_DIFFICULTY_BITS` is deliberately low (see its
+/// own doc comment), so nothing before this check stopped an attacker who
+/// knows a target's `recipient_key_hash` (unavoidably public — required to
+/// message anyone at all) from solving thousands of trivial proofs and
+/// pushing that many tiny messages, filling the recipient's (or a group's)
+/// manifest until it stopped fitting in the DHT's record size cap —  after
+/// which *every* future legitimate push/fan_out to that recipient/group
+/// started failing, silently and unpredictably, until the manifest was
+/// next pruned (which only happens lazily, on `pull`; an offline or
+/// rarely-polling victim stayed effectively unreachable indefinitely).
+/// Bounded on the manifest's actual *serialized* byte size rather than a
+/// guessed entry count, since `serde_json`'s array-of-decimal-numbers
+/// encoding of each `message_id`'s bytes means entry count alone doesn't
+/// predict how large the record gets (same inflation `StoredMessage::
+/// to_bytes`'s own doc comment already flags for message content). This
+/// converts an unbounded, silent failure mode into a bounded, immediately-
+/// reported one — it does not by itself make the underlying PoW cost less
+/// cheap to pay repeatedly; a determined attacker can still fill a target's
+/// manifest back up to this cap after every prune. Raising
+/// `POW_DIFFICULTY_BITS` or adding real per-sender rate limiting at the
+/// mailbox-node RPC layer remains the deeper fix (`docs/THREAT_MODEL.md`
+/// §3.6's own "dedicated mailbox-node protocol" long-term direction).
+const MAX_MANIFEST_BYTES: usize = 96 * 1024;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Manifest {
     message_ids: Vec<Vec<u8>>,
@@ -238,11 +264,15 @@ impl Mailbox {
                 return Ok(());
             }
             manifest.message_ids.push(message_id.to_vec());
+            let encoded = serde_json::to_vec(&manifest)?;
+            if encoded.len() > MAX_MANIFEST_BYTES {
+                return Err(NetworkError::Setup(format!(
+                    "mailbox: recipient's manifest is at its {MAX_MANIFEST_BYTES}-byte cap — \
+                     refusing to grow it further until older entries are pruned by a pull"
+                )));
+            }
             self.dht
-                .publish(
-                    &manifest_key(recipient_key_hash),
-                    serde_json::to_vec(&manifest)?,
-                )
+                .publish(&manifest_key(recipient_key_hash), encoded)
                 .await?;
 
             // Read-after-write: a concurrent writer may have clobbered the
@@ -688,6 +718,64 @@ mod tests {
         assert!(
             result.is_err(),
             "a PoW solved for msg-1 must not be replayable to push msg-2"
+        );
+    }
+
+    /// The DoS this size cap exists to bound: without it, an attacker who
+    /// knows a target's `recipient_key_hash` could keep pushing cheap-PoW
+    /// junk forever, growing the manifest past the DHT's own record-size
+    /// limit and silently breaking every future legitimate push to that
+    /// recipient. Seeds a manifest already at the cap directly via the DHT
+    /// (rather than performing thousands of real pushes) to isolate the
+    /// size check itself from the already-covered PoW/merge-retry paths.
+    #[tokio::test]
+    async fn push_is_rejected_once_the_manifests_size_cap_is_reached() {
+        let (sender_dht, recipient_dht) = connected_pair().await;
+        let sender_mailbox = Mailbox::new(sender_dht.clone());
+        let recipient_mailbox = Mailbox::new(recipient_dht);
+        let recipient_key = b"recipient-key-hash-manifest-cap";
+
+        let mut manifest = Manifest {
+            message_ids: Vec::new(),
+        };
+        loop {
+            manifest.message_ids.push(vec![0u8; 36]);
+            if serde_json::to_vec(&manifest).unwrap().len() > MAX_MANIFEST_BYTES {
+                manifest.message_ids.pop();
+                break;
+            }
+        }
+        sender_dht
+            .publish(
+                &manifest_key(recipient_key),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let ciphertext = b"one more message".to_vec();
+        let solution = Mailbox::solve_pow(recipient_key, b"overflow-msg", &ciphertext, 1_000);
+        let result = sender_mailbox
+            .push(
+                recipient_key,
+                b"overflow-msg",
+                ciphertext,
+                86_400,
+                1_000,
+                &solution,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "push must be rejected once the manifest is already at its size cap"
+        );
+
+        // The cap doesn't corrupt what was already there, and `pull` stays
+        // robust against a manifest sitting right at the size limit.
+        let messages = recipient_mailbox.pull(recipient_key, 1_000).await.unwrap();
+        assert!(
+            messages.iter().all(|(id, _)| id != b"overflow-msg"),
+            "the rejected push must not have been recorded"
         );
     }
 

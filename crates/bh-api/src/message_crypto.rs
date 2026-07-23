@@ -296,17 +296,36 @@ async fn wake_recipient_best_effort(
         return;
     }
 
+    // `record.relay_url` is attacker-controlled in the meaningful sense
+    // here: it's whatever the *recipient* (or anyone impersonating a
+    // trusted contact) chose to publish, signed only by their own key —
+    // signature verification above proves they published it, not that it's
+    // safe to fetch. Without this check, any contact could point their own
+    // registration at an internal/loopback/cloud-metadata address and have
+    // it fetched by *every other contact's* daemon the next time they're
+    // messaged (see `crate::push`'s SSRF guard doc comments for the full
+    // writeup) — this is the actual cross-user attack surface, so unlike
+    // `crate::push::set_push_registration`'s validation of a user's *own*
+    // relay_url, there is deliberately no scenario where skipping this
+    // check is safe.
+    let Ok(parsed_relay_url) = crate::push::validate_relay_url(&record.relay_url) else {
+        tracing::warn!("wake: recipient's relay_url failed the SSRF guard, refusing to fetch");
+        return;
+    };
+    let client = match crate::push::pinned_relay_client(&parsed_relay_url).await {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::debug!(%err, "wake: failed to resolve/pin recipient's relay host");
+            return;
+        }
+    };
+
     let url = format!(
         "{}/wake/{}",
         record.relay_url.trim_end_matches('/'),
         record.token
     );
-    if let Err(err) = crate::push::http_client()
-        .post(url)
-        .timeout(WAKE_RELAY_TIMEOUT)
-        .send()
-        .await
-    {
+    if let Err(err) = client.post(url).timeout(WAKE_RELAY_TIMEOUT).send().await {
         tracing::debug!(%err, "wake: failed to reach recipient's push relay");
     }
 }

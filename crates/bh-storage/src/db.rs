@@ -42,6 +42,21 @@ impl CustomizeConnection<Connection, rusqlite::Error> for SetSqlCipherKey {
         // `:memory:` connections, so it's safe to set unconditionally here
         // rather than only in `open_file_pool`.
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Without this, SQLite only marks a deleted row's page as free —
+        // it doesn't overwrite the plaintext-after-decryption bytes, so
+        // they can linger in the (still SQLCipher-encrypted, but readable
+        // by anyone who has the DB key) file until something else happens
+        // to reuse that page. That silently undermines every feature in
+        // this codebase that promises "this is actually gone" — disappearing
+        // messages, edited-message history, a revoked ephemeral identity's
+        // private key (`bh-api::ephemeral_identity::revoke`) — the exact
+        // scenario those features exist for (a device seized after the
+        // fact, its DB key already extracted) is precisely when this would
+        // matter. Same setting Signal's own SQLCipher-backed clients use by
+        // default, per SQLCipher's own documented recommendation for
+        // secure deletion. `ON` (not `FAST`) so freed pages are actually
+        // zeroed, not just left in the free-page list for later reuse.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         Ok(())
     }
 }

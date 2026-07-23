@@ -3,6 +3,7 @@ import {
   DaemonError,
   type Contact,
   type Conversation,
+  type DecodedBlocklistEntry,
   type Device,
   type FileMetaPublic,
   type GroupDTO,
@@ -11,6 +12,7 @@ import {
   type PaymentAsset,
   type PaymentRequestView,
   type ProfileMeta,
+  type TrustLevel,
 } from "./api";
 import {
   isLinkPreviewsEnabled,
@@ -19,6 +21,7 @@ import {
   renderLinkPreviewCard,
 } from "./link_preview";
 import { ensureDaemonRunning } from "./daemon_lifecycle";
+import { invoke } from "@tauri-apps/api/core";
 import { subscribeToCallStream, FrameKind, Vp8CanvasRenderer, type CallEvent } from "./calls";
 import {
   bytesToHex,
@@ -27,6 +30,41 @@ import {
   enrollDatabaseUnlockGate,
   getPrfUnlockConfig,
 } from "./prf_unlock";
+import {
+  applyUiPrefs,
+  getDensity,
+  getDndWindow,
+  getFontSize,
+  getQuickReactions,
+  isAlwaysUnderlineLinksEnabled,
+  isHighContrastEnabled,
+  isReduceMotionEnabled,
+  isStripExifEnabled,
+  setDensity,
+  setDndWindow,
+  setFontSize,
+  setAlwaysUnderlineLinksEnabled,
+  setHighContrastEnabled,
+  setQuickReactions,
+  setReduceMotionEnabled,
+  setStripExifEnabled,
+  type Density,
+  type FontSize,
+} from "./ui_prefs";
+import { clearLinkPreviewCache } from "./link_preview";
+
+// Mirrors `src-tauri/src/network_config.rs`'s `NetworkConfig` — the saved
+// override for which DHT bootstrap peers / TURN relay this daemon should
+// use, applied as env vars the next time `ensure_daemon_running` spawns
+// it. Read/written via the `get_network_config`/`save_network_config`
+// Tauri commands directly (no daemon HTTP round trip — this has to be
+// known *before* the daemon exists).
+interface NetworkConfig {
+  bootstrap_peers?: string;
+  turn_servers?: string;
+  turn_username?: string;
+  turn_credential?: string;
+}
 
 // Screenshot/shoulder-surfing mitigation (SPEC.md §7): blur the whole app
 // whenever the window loses focus. Real, cross-platform, but not equivalent
@@ -36,6 +74,37 @@ import {
 function installBlurOnUnfocus(root: HTMLElement) {
   window.addEventListener("blur", () => root.classList.add("bh-privacy-blur"));
   window.addEventListener("focus", () => root.classList.remove("bh-privacy-blur"));
+}
+
+// The 3 real global shortcuts advertised in Settings → Accessibility.
+// Only active once the main app screen is up, and never while the user
+// is typing somewhere (a text field, a select, contenteditable).
+function installGlobalShortcuts() {
+  window.addEventListener("keydown", (event) => {
+    if (!(event.metaKey || event.ctrlKey)) return;
+    if ($<HTMLElement>("screen-app").hidden) return;
+    const active = document.activeElement;
+    const isTyping =
+      active instanceof HTMLInputElement ||
+      active instanceof HTMLTextAreaElement ||
+      active instanceof HTMLSelectElement ||
+      (active instanceof HTMLElement && active.isContentEditable);
+    if (isTyping) return;
+    switch (event.key.toLowerCase()) {
+      case "n":
+        event.preventDefault();
+        $<HTMLButtonElement>("add-contact").click();
+        break;
+      case "k":
+        event.preventDefault();
+        $<HTMLButtonElement>("open-search").click();
+        break;
+      case ",":
+        event.preventDefault();
+        $<HTMLButtonElement>("open-security").click();
+        break;
+    }
+  });
 }
 
 function $<T extends HTMLElement>(id: string): T {
@@ -110,8 +179,6 @@ function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
 }
-
-const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢"];
 
 // ---------------- app state ----------------
 let contacts: Contact[] = [];
@@ -475,7 +542,15 @@ function renderConvList() {
     item.append(el("i", "ring-avatar"));
 
     const meta = el("div", "conv-meta");
-    meta.append(el("div", "conv-name", conversationLabel(conversation)));
+    const nameRow = el("div", "conv-name-row");
+    nameRow.append(el("span", "conv-name", conversationLabel(conversation)));
+    if (conversation.kind === "direct" && conversation.contact_id) {
+      const trustLevel = contactsById.get(conversation.contact_id)?.trust_level;
+      if (trustLevel) {
+        nameRow.append(el("span", `trust-dot trust-dot-${trustLevel}`));
+      }
+    }
+    meta.append(nameRow);
     const cached = lastMessageCache.get(conversation.conversation_id);
     meta.append(el("div", "conv-preview", cached?.body ?? "Tap to view messages"));
     item.append(meta);
@@ -597,6 +672,35 @@ function setCallStatus(text: string) {
   $<HTMLParagraphElement>("call-status").textContent = text;
 }
 
+let callDurationTimer: ReturnType<typeof setInterval> | null = null;
+let callConnectedAt: number | null = null;
+
+function stopCallDurationTimer() {
+  if (callDurationTimer !== null) {
+    clearInterval(callDurationTimer);
+    callDurationTimer = null;
+  }
+  callConnectedAt = null;
+  $<HTMLSpanElement>("call-duration").textContent = "";
+}
+
+function startCallDurationTimer() {
+  stopCallDurationTimer();
+  callConnectedAt = Date.now();
+  const durationEl = $<HTMLSpanElement>("call-duration");
+  const tick = () => {
+    if (callConnectedAt === null) return;
+    const elapsed = Math.max(0, Math.floor((Date.now() - callConnectedAt) / 1000));
+    const minutes = Math.floor(elapsed / 60)
+      .toString()
+      .padStart(2, "0");
+    const seconds = (elapsed % 60).toString().padStart(2, "0");
+    durationEl.textContent = `${minutes}:${seconds}`;
+  };
+  tick();
+  callDurationTimer = setInterval(tick, 1000);
+}
+
 function updateCallControls() {
   $<HTMLButtonElement>("call-toggle-camera").hidden = activeCallIsGroup;
   $<HTMLButtonElement>("call-toggle-screen").hidden = activeCallIsGroup;
@@ -618,6 +722,7 @@ function handleCallEvent(event: CallEvent) {
   switch (event.type) {
     case "connected":
       setCallStatus("Connected");
+      startCallDurationTimer();
       break;
     case "participant_joined":
       groupCallParticipants.add(event.tag);
@@ -641,6 +746,7 @@ function openCallOverlay(title: string, isGroup: boolean) {
   groupCallParticipants.clear();
   $<HTMLSpanElement>("call-title").textContent = title;
   setCallStatus("Connecting…");
+  stopCallDurationTimer();
   updateCallControls();
   renderGroupCallParticipants();
   $<HTMLDivElement>("screen-call").hidden = false;
@@ -660,6 +766,7 @@ async function endCallUi() {
   cameraOn = false;
   screenShareOn = false;
   groupCallParticipants.clear();
+  stopCallDurationTimer();
   $<HTMLDivElement>("screen-call").hidden = true;
 }
 
@@ -1136,7 +1243,7 @@ function renderReactionChips(
       return;
     }
     const picker = el("div", "react-picker");
-    for (const emoji of QUICK_REACTIONS) {
+    for (const emoji of getQuickReactions()) {
       const btn = el("button", undefined, emoji);
       btn.type = "button";
       btn.addEventListener("click", async () => {
@@ -1324,6 +1431,17 @@ function renderPaymentBlock(
   container.append(block);
 }
 
+// Both the CSS class and display label per trust level — "new" reuses the
+// pre-existing "unverified" class/label (no visual guarantee either way,
+// just no local activity behind it yet), the other three each get their
+// own distinct treatment.
+const TRUST_LEVEL_DISPLAY: Record<TrustLevel, { className: string; label: string }> = {
+  blocked: { className: "blocked", label: "blocked" },
+  verified: { className: "verified", label: "verified" },
+  established: { className: "established", label: "established" },
+  new: { className: "unverified", label: "unverified" },
+};
+
 function renderVerifyChip(contact: Contact | null) {
   const chip = $<HTMLSpanElement>("thread-verify");
   chip.replaceChildren();
@@ -1331,27 +1449,62 @@ function renderVerifyChip(contact: Contact | null) {
     chip.hidden = true;
     return;
   }
+  const display = TRUST_LEVEL_DISPLAY[contact.trust_level];
   chip.hidden = false;
-  chip.className = `verify-chip ${contact.verified ? "verified" : "unverified"}`;
-  chip.textContent = contact.verified ? "verified" : "unverified";
+  chip.className = `verify-chip ${display.className}`;
+  chip.textContent = display.label;
   chip.onclick = contact.verified ? null : () => verifyContact(contact);
 }
 
+let verifyingContact: Contact | null = null;
+
 async function verifyContact(contact: Contact) {
+  verifyingContact = contact;
+  const grid = $<HTMLDivElement>("verify-safety-grid");
+  const qr = $<HTMLDivElement>("verify-qr");
+  const error = $<HTMLParagraphElement>("verify-error");
+  $<HTMLElement>("verify-contact-name").textContent = `Verify ${contact.display_name ?? contact.contact_id}`;
+  grid.replaceChildren(el("div", "empty-note", "Loading…"));
+  qr.hidden = true;
+  qr.replaceChildren();
+  error.hidden = true;
+  $<HTMLDivElement>("screen-verify").hidden = false;
   try {
     const safetyNumber = await api.getSafetyNumber(contact.contact_id);
-    const confirmed = window.confirm(
-      `Safety number for ${contact.display_name ?? contact.contact_id}:\n\n${safetyNumber.grouped}\n\n` +
-        "Compare this with your contact over a separate channel. Mark as verified only if it matches exactly.",
-    );
-    if (!confirmed) return;
-    await api.setVerified(contact.contact_id, true);
-    contact.verified = true;
-    renderVerifyChip(contact);
+    grid.replaceChildren();
+    for (const group of safetyNumber.grouped.split(/\s+/).filter(Boolean)) {
+      grid.append(el("span", undefined, group));
+    }
+    qr.innerHTML = safetyNumber.qr_svg;
+    qr.hidden = false;
   } catch (err) {
-    window.alert(errorMessage(err));
+    grid.replaceChildren();
+    error.textContent = errorMessage(err);
+    error.hidden = false;
   }
 }
+
+$<HTMLButtonElement>("verify-confirm").addEventListener("click", async () => {
+  if (!verifyingContact) return;
+  const error = $<HTMLParagraphElement>("verify-error");
+  error.hidden = true;
+  try {
+    await api.setVerified(verifyingContact.contact_id, true);
+    verifyingContact.verified = true;
+    verifyingContact.trust_level = "verified";
+    renderVerifyChip(verifyingContact);
+    $<HTMLDivElement>("screen-verify").hidden = true;
+  } catch (err) {
+    error.textContent = errorMessage(err);
+    error.hidden = false;
+  }
+});
+$<HTMLButtonElement>("verify-cancel").addEventListener("click", () => {
+  $<HTMLDivElement>("screen-verify").hidden = true;
+});
+$<HTMLButtonElement>("close-verify").addEventListener("click", () => {
+  $<HTMLDivElement>("screen-verify").hidden = true;
+});
 
 function renderBlockToggle(contact: Contact | null) {
   const button = $<HTMLButtonElement>("toggle-block");
@@ -1429,16 +1582,45 @@ $<HTMLButtonElement>("attach-file").addEventListener("click", () => {
   $<HTMLInputElement>("attachment-input").click();
 });
 
+// Re-encodes an image through a <canvas> before upload, which genuinely
+// discards EXIF (GPS location, camera model, capture timestamp) since the
+// re-encoded output never carries the original file's metadata segments —
+// not a no-op toggle. Only touches actual raster images; SVG and non-image
+// files pass through untouched (SVG can embed its own metadata, but
+// re-encoding it through canvas would rasterize it, which is a worse
+// trade-off than leaving it alone).
+async function prepareAttachmentBytes(file: File): Promise<{ bytes: Uint8Array; mimeType: string }> {
+  const original = async () => ({ bytes: new Uint8Array(await file.arrayBuffer()), mimeType: file.type });
+  if (!isStripExifEnabled() || !file.type.startsWith("image/") || file.type === "image/svg+xml") {
+    return original();
+  }
+  try {
+    const bitmap = await createImageBitmap(file);
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return original();
+    ctx.drawImage(bitmap, 0, 0);
+    const outType = file.type === "image/png" ? "image/png" : "image/jpeg";
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, outType, 0.92));
+    if (!blob) return original();
+    return { bytes: new Uint8Array(await blob.arrayBuffer()), mimeType: outType };
+  } catch {
+    return original();
+  }
+}
+
 $<HTMLInputElement>("attachment-input").addEventListener("change", async () => {
   const input = $<HTMLInputElement>("attachment-input");
   const file = input.files?.[0];
   if (!file || !activeConversationId) return;
   const conversationId = activeConversationId;
   try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
+    const { bytes, mimeType } = await prepareAttachmentBytes(file);
     const { message, file: uploaded } = await api.uploadAttachment(conversationId, {
       file_name: file.name,
-      mime_type: file.type || null,
+      mime_type: mimeType || null,
       data_base64: bytesToBase64(bytes),
     });
     currentAttachments.set(message.message_id, uploaded);
@@ -1678,6 +1860,21 @@ function cosmeticLabel(kind: string): string {
   return kind === "sticker_pack" ? "sticker pack" : kind;
 }
 
+// The catalog has no image/preview field (CosmeticCatalogItem is just
+// name/kind/price) — this generates a deterministic monochrome swatch
+// from the item's own real fields instead of faking artwork.
+const STORE_KIND_GLYPH: Record<string, string> = {
+  banner: "▬",
+  theme: "◐",
+  badge: "◆",
+  sticker_pack: "✦",
+};
+function storeSwatchTone(name: string): number {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  return 0.04 + (hash % 10) / 100;
+}
+
 async function renderStore() {
   const catalogList = $<HTMLDivElement>("store-catalog-list");
   const inventoryList = $<HTMLDivElement>("store-inventory-list");
@@ -1697,11 +1894,16 @@ async function renderStore() {
     catalogList.replaceChildren();
     if (catalog.length === 0) catalogList.append(el("div", "empty-note", "Nothing in the catalog yet."));
     for (const item of catalog) {
-      const row = el("div", "device-row");
-      const info = el("div");
-      info.append(el("div", "name", `${item.name} (${cosmeticLabel(item.kind)})`));
-      info.append(el("div", "meta mono", `${item.price_amount} ${item.price_asset}`));
-      row.append(info);
+      const card = el("div", "store-card");
+      const swatch = el("div", "store-swatch", STORE_KIND_GLYPH[item.kind] ?? "◆");
+      swatch.style.background = `rgba(243, 241, 236, ${storeSwatchTone(item.name)})`;
+      card.append(swatch);
+
+      const body = el("div", "store-card-body");
+      body.append(el("span", "name", item.name));
+      body.append(
+        el("span", "meta", `${cosmeticLabel(item.kind)} · ${item.price_amount} ${item.price_asset}`),
+      );
       const actions = el("div", "actions");
       if (owned.has(`${item.kind}:${item.item_id}`)) {
         actions.append(el("span", "meta mono", "owned"));
@@ -1728,8 +1930,9 @@ async function renderStore() {
         });
         actions.append(buy);
       }
-      row.append(actions);
-      catalogList.append(row);
+      body.append(actions);
+      card.append(body);
+      catalogList.append(card);
     }
 
     if (inventory.length === 0) inventoryList.append(el("div", "empty-note", "Nothing owned yet."));
@@ -1908,11 +2111,34 @@ $<HTMLInputElement>("link-preview-toggle").addEventListener("change", (event) =>
 $<HTMLButtonElement>("open-security").addEventListener("click", async () => {
   $<HTMLDivElement>("screen-security").hidden = false;
   $<HTMLInputElement>("link-preview-toggle").checked = isLinkPreviewsEnabled();
+  $<HTMLInputElement>("strip-exif-toggle").checked = isStripExifEnabled();
+  $<HTMLSelectElement>("density-select").value = getDensity();
+  $<HTMLSelectElement>("font-size-select").value = getFontSize();
+  $<HTMLInputElement>("reduce-motion-toggle").checked = isReduceMotionEnabled();
+  $<HTMLInputElement>("high-contrast-toggle").checked = isHighContrastEnabled();
+  $<HTMLInputElement>("underline-links-toggle").checked = isAlwaysUnderlineLinksEnabled();
+  $<HTMLInputElement>("quick-reactions-input").value = getQuickReactions().join(" ");
+  $<HTMLParagraphElement>("link-preview-cache-status").textContent = "";
+  const dnd = getDndWindow();
+  $<HTMLInputElement>("dnd-toggle").checked = dnd.enabled;
+  $<HTMLInputElement>("dnd-start").value = dnd.start;
+  $<HTMLInputElement>("dnd-end").value = dnd.end;
   try {
     const push = await api.getPushRegistration();
     $<HTMLInputElement>("push-toggle").checked = push.enabled;
+    $<HTMLInputElement>("push-relay-url").value = push.relay_url ?? "";
   } catch {
-    // Leave the checkbox at its last known state.
+    // Leave the checkbox/field at their last known state.
+  }
+  try {
+    const network = await invoke<NetworkConfig>("get_network_config");
+    $<HTMLInputElement>("network-bootstrap-peers").value = network.bootstrap_peers ?? "";
+    $<HTMLInputElement>("network-turn-servers").value = network.turn_servers ?? "";
+    $<HTMLInputElement>("network-turn-username").value = network.turn_username ?? "";
+    $<HTMLInputElement>("network-turn-credential").value = network.turn_credential ?? "";
+    $<HTMLParagraphElement>("network-status").textContent = "";
+  } catch {
+    // Leave the fields at their last known state.
   }
   try {
     const identity = await api.getIdentity();
@@ -1935,6 +2161,11 @@ $<HTMLButtonElement>("open-security").addEventListener("click", async () => {
   } catch {
     // Leave the panel at its last known state.
   }
+  $<HTMLDivElement>("blocklist-export-result").hidden = true;
+  $<HTMLTextAreaElement>("blocklist-import-input").value = "";
+  $<HTMLDivElement>("blocklist-preview").replaceChildren();
+  $<HTMLButtonElement>("blocklist-apply").hidden = true;
+  $<HTMLParagraphElement>("blocklist-status").textContent = "";
   await Promise.all([renderDevicesList(), renderLocalAuthStatus()]);
 });
 $<HTMLInputElement>("typing-indicator-toggle").addEventListener("change", async (event) => {
@@ -1948,16 +2179,89 @@ $<HTMLInputElement>("typing-indicator-toggle").addEventListener("change", async 
 });
 $<HTMLInputElement>("push-toggle").addEventListener("change", async (event) => {
   const checkbox = event.target as HTMLInputElement;
+  const relayUrl = $<HTMLInputElement>("push-relay-url").value.trim();
   try {
-    await api.setPushRegistration(checkbox.checked);
+    await api.setPushRegistration(checkbox.checked, relayUrl);
   } catch (err) {
     checkbox.checked = !checkbox.checked;
     window.alert(errorMessage(err));
   }
 });
+$<HTMLButtonElement>("network-save").addEventListener("click", async () => {
+  const status = $<HTMLParagraphElement>("network-status");
+  const config: NetworkConfig = {
+    bootstrap_peers: $<HTMLInputElement>("network-bootstrap-peers").value.trim() || undefined,
+    turn_servers: $<HTMLInputElement>("network-turn-servers").value.trim() || undefined,
+    turn_username: $<HTMLInputElement>("network-turn-username").value.trim() || undefined,
+    turn_credential: $<HTMLInputElement>("network-turn-credential").value.trim() || undefined,
+  };
+  try {
+    await invoke("save_network_config", { config });
+    status.textContent = "Saved. Restart the app for this to take effect.";
+  } catch (err) {
+    status.textContent = errorMessage(err);
+  }
+});
 $<HTMLButtonElement>("close-security").addEventListener("click", () => {
   $<HTMLDivElement>("screen-security").hidden = true;
 });
+
+$<HTMLElement>("settings-nav").querySelectorAll<HTMLButtonElement>("button").forEach((navButton) => {
+  navButton.addEventListener("click", () => {
+    const category = navButton.dataset.category;
+    $<HTMLElement>("settings-nav")
+      .querySelectorAll<HTMLButtonElement>("button")
+      .forEach((b) => b.classList.toggle("active", b === navButton));
+    document
+      .querySelectorAll<HTMLElement>(".settings-category")
+      .forEach((section) => section.classList.toggle("active", section.dataset.category === category));
+  });
+});
+
+// ---------------- client-only UI preferences ----------------
+$<HTMLInputElement>("strip-exif-toggle").addEventListener("change", (event) => {
+  setStripExifEnabled((event.target as HTMLInputElement).checked);
+});
+$<HTMLSelectElement>("density-select").addEventListener("change", (event) => {
+  setDensity((event.target as HTMLSelectElement).value as Density);
+  applyUiPrefs($("app"));
+});
+$<HTMLSelectElement>("font-size-select").addEventListener("change", (event) => {
+  setFontSize((event.target as HTMLSelectElement).value as FontSize);
+  applyUiPrefs($("app"));
+});
+$<HTMLInputElement>("reduce-motion-toggle").addEventListener("change", (event) => {
+  setReduceMotionEnabled((event.target as HTMLInputElement).checked);
+  applyUiPrefs($("app"));
+});
+$<HTMLInputElement>("high-contrast-toggle").addEventListener("change", (event) => {
+  setHighContrastEnabled((event.target as HTMLInputElement).checked);
+  applyUiPrefs($("app"));
+});
+$<HTMLInputElement>("underline-links-toggle").addEventListener("change", (event) => {
+  setAlwaysUnderlineLinksEnabled((event.target as HTMLInputElement).checked);
+  applyUiPrefs($("app"));
+});
+$<HTMLInputElement>("quick-reactions-input").addEventListener("change", (event) => {
+  const raw = (event.target as HTMLInputElement).value;
+  const emojis = Array.from(raw).filter((ch) => ch.trim().length > 0);
+  setQuickReactions(emojis);
+  (event.target as HTMLInputElement).value = getQuickReactions().join(" ");
+});
+$<HTMLButtonElement>("clear-link-preview-cache").addEventListener("click", () => {
+  clearLinkPreviewCache();
+  $<HTMLParagraphElement>("link-preview-cache-status").textContent = "Cleared.";
+});
+function saveDndWindow() {
+  setDndWindow({
+    enabled: $<HTMLInputElement>("dnd-toggle").checked,
+    start: $<HTMLInputElement>("dnd-start").value || "22:00",
+    end: $<HTMLInputElement>("dnd-end").value || "08:00",
+  });
+}
+$<HTMLInputElement>("dnd-toggle").addEventListener("change", saveDndWindow);
+$<HTMLInputElement>("dnd-start").addEventListener("change", saveDndWindow);
+$<HTMLInputElement>("dnd-end").addEventListener("change", saveDndWindow);
 
 // ---------------- dead man's switch ----------------
 function formatDmsTimestamp(secs: number | null): string {
@@ -2089,6 +2393,120 @@ $<HTMLButtonElement>("dms-add-release").addEventListener("click", async () => {
   } catch (err) {
     errorBox.hidden = false;
     errorBox.textContent = errorMessage(err);
+  }
+});
+
+// ---------------- shareable blocklists ----------------
+$<HTMLButtonElement>("blocklist-export").addEventListener("click", async (event) => {
+  const button = event.currentTarget as HTMLButtonElement;
+  if (button.disabled) return;
+  button.disabled = true;
+  const result = $<HTMLDivElement>("blocklist-export-result");
+  result.hidden = false;
+  result.replaceChildren(el("div", "row", "Generating…"));
+  try {
+    const exported = await api.exportBlocklist();
+    result.replaceChildren();
+    const countRow = el("div", "row");
+    countRow.append(
+      el("span", undefined, "Blocked contacts"),
+      el("span", undefined, String(exported.count)),
+    );
+    result.append(countRow);
+    const linkRow = el("div", "row");
+    linkRow.append(el("span", undefined, "Link"), el("code", undefined, exported.link.slice(0, 28) + "…"));
+    result.append(linkRow);
+    const copy = el("button", "btn-outline", "Copy link");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(exported.link);
+        copy.textContent = "Copied";
+      } catch {
+        copy.textContent = "Copy failed";
+      }
+    });
+    result.append(copy);
+  } catch (err) {
+    result.replaceChildren(el("div", "error-text", errorMessage(err)));
+  } finally {
+    button.disabled = false;
+  }
+});
+
+let decodedBlocklist: DecodedBlocklistEntry[] = [];
+
+$<HTMLButtonElement>("blocklist-decode").addEventListener("click", async () => {
+  const link = $<HTMLTextAreaElement>("blocklist-import-input").value.trim();
+  const preview = $<HTMLDivElement>("blocklist-preview");
+  const applyBtn = $<HTMLButtonElement>("blocklist-apply");
+  const statusEl = $<HTMLParagraphElement>("blocklist-status");
+  statusEl.textContent = "";
+  applyBtn.hidden = true;
+  if (!link) return;
+  preview.replaceChildren(el("div", "empty-note", "Decoding…"));
+  try {
+    decodedBlocklist = await api.decodeBlocklist(link);
+    preview.replaceChildren();
+    if (decodedBlocklist.length === 0) {
+      preview.append(el("div", "empty-note", "This blocklist is empty."));
+      return;
+    }
+    let anySelectable = false;
+    for (const entry of decodedBlocklist) {
+      const row = el("div", "device-row");
+      const info = el("div");
+      const name = entry.matched_display_name || entry.label || entry.identity_public_key.slice(0, 12) + "…";
+      info.append(el("div", "name", name));
+      if (!entry.matched_contact_id) {
+        info.append(el("div", "meta mono", "not in your contacts"));
+      } else if (entry.already_blocked) {
+        info.append(el("div", "meta mono", "already blocked"));
+      } else {
+        info.append(el("div", "meta mono", "in your contacts"));
+      }
+      row.append(info);
+      if (entry.matched_contact_id && !entry.already_blocked) {
+        anySelectable = true;
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = true;
+        checkbox.dataset.contactId = entry.matched_contact_id;
+        row.append(checkbox);
+      }
+      preview.append(row);
+    }
+    applyBtn.hidden = !anySelectable;
+  } catch (err) {
+    preview.replaceChildren(el("div", "error-text", errorMessage(err)));
+  }
+});
+
+$<HTMLButtonElement>("blocklist-apply").addEventListener("click", async (event) => {
+  const button = event.currentTarget as HTMLButtonElement;
+  if (button.disabled) return;
+  const statusEl = $<HTMLParagraphElement>("blocklist-status");
+  const contactIds = Array.from(
+    $<HTMLDivElement>("blocklist-preview").querySelectorAll<HTMLInputElement>(
+      'input[type="checkbox"]:checked',
+    ),
+  )
+    .map((c) => c.dataset.contactId)
+    .filter((id): id is string => !!id);
+  if (contactIds.length === 0) return;
+  button.disabled = true;
+  try {
+    const applied = await api.applyBlocklist(contactIds);
+    statusEl.textContent = `Blocked ${applied.blocked_count}.`;
+    button.hidden = true;
+    await refreshContacts();
+    const conversation = conversations.find((c) => c.conversation_id === activeConversationId);
+    renderVerifyChip(conversation ? (contactFor(conversation) ?? null) : null);
+    renderConvList();
+  } catch (err) {
+    statusEl.textContent = errorMessage(err);
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -2693,17 +3111,42 @@ async function refreshDeviceSyncBadge(deviceId: string, badge: HTMLElement) {
   }
 }
 
+// Surfaces the 4 real API calls the ceremony always made as a visual
+// progression instead of one opaque button + status line — each step
+// lights up as its real await resolves, and the qr_svg `beginDeviceLink`
+// already returned (but never rendered) now actually shows.
+function setLinkStep(current: number) {
+  const steps = $<HTMLDivElement>("link-steps");
+  steps.hidden = false;
+  steps.querySelectorAll<HTMLSpanElement>(".link-step-dot").forEach((dot, index) => {
+    const step = index + 1;
+    dot.classList.toggle("done", step < current);
+    dot.classList.toggle("current", step === current);
+  });
+  steps.querySelectorAll<HTMLSpanElement>(".link-step-line").forEach((line, index) => {
+    line.classList.toggle("done", index + 1 < current);
+  });
+}
+
 $<HTMLButtonElement>("link-device").addEventListener("click", async () => {
   const status = $<HTMLParagraphElement>("link-status");
   const button = $<HTMLButtonElement>("link-device");
+  const qr = $<HTMLDivElement>("link-qr");
   button.disabled = true;
+  qr.hidden = true;
+  qr.replaceChildren();
   try {
+    setLinkStep(1);
     status.textContent = "Beginning link session…";
     const begun = await api.beginDeviceLink();
+    qr.innerHTML = begun.qr_svg;
+    qr.hidden = false;
 
+    setLinkStep(2);
     status.textContent = "Scanning link (local simulation)…";
     const scanned = await api.scanDeviceLink(begun.link);
 
+    setLinkStep(3);
     status.textContent = "Accepting on the trusted device…";
     const accepted = await api.acceptDeviceLink(
       begun.session_id,
@@ -2711,12 +3154,15 @@ $<HTMLButtonElement>("link-device").addEventListener("click", async () => {
       "New Device",
     );
 
+    setLinkStep(4);
     status.textContent = "Finishing on the new device…";
     const finished = await api.finishDeviceLink(
       scanned.new_device_session_id,
       accepted.response_ciphertext_b64,
     );
 
+    setLinkStep(5);
+    qr.hidden = true;
     status.textContent = finished.confirmed
       ? "Linked — a new device row was added below."
       : "Linking completed but identity confirmation failed.";
@@ -2927,6 +3373,8 @@ $<HTMLButtonElement>("enroll-passkey").addEventListener("click", async () => {
 // ---------------- boot ----------------
 window.addEventListener("DOMContentLoaded", () => {
   installBlurOnUnfocus($("app"));
+  applyUiPrefs($("app"));
+  installGlobalShortcuts();
   setInterval(pruneExpiredMessages, 5_000);
   setInterval(() => void pollIncomingNetworkCalls(), 3_000);
   boot();

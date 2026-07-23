@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use bh_storage::models::Contact;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 
@@ -16,14 +16,82 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// A purely local, client-side trust heuristic (see module doc /
+/// `compute_trust_level`) — never a substitute for actually verifying a
+/// safety number, just a UI signal for "how well do I actually know this
+/// contact." `Blocked` and `Verified` reflect real explicit user actions;
+/// `Established`/`New` are inferred from local activity alone.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevel {
+    Blocked,
+    Verified,
+    Established,
+    New,
+}
+
+/// Thresholds for the `Established` heuristic — tunable without a schema
+/// change, since `TrustLevel` is never persisted (see `ContactView`'s doc
+/// comment).
+const ESTABLISHED_MIN_MESSAGES: i64 = 10;
+const ESTABLISHED_MIN_AGE_SECONDS: i64 = 3 * 24 * 60 * 60;
+
+/// `blocked` is checked before `verified` — a blocked contact is actively
+/// distrusted right now, regardless of whether it was verified in the
+/// past. Only `Verified` reflects a real cryptographic guarantee (a
+/// confirmed safety number); `Established` is just "we've talked a fair
+/// amount over a few days," a much weaker signal shown so a longtime
+/// unverified contact doesn't look identical to one added five minutes
+/// ago.
+fn compute_trust_level(contact: &Contact, message_count: i64, now: i64) -> TrustLevel {
+    if contact.blocked {
+        return TrustLevel::Blocked;
+    }
+    if contact.verified {
+        return TrustLevel::Verified;
+    }
+    if message_count >= ESTABLISHED_MIN_MESSAGES
+        && now - contact.added_at >= ESTABLISHED_MIN_AGE_SECONDS
+    {
+        return TrustLevel::Established;
+    }
+    TrustLevel::New
+}
+
+/// The API-facing view of a contact: the stored row plus a derived trust
+/// heuristic — never persisted, computed fresh each time, same pattern as
+/// `payment_requests::PaymentRequestView`.
+#[derive(Serialize)]
+pub struct ContactView {
+    #[serde(flatten)]
+    pub contact: Contact,
+    pub trust_level: TrustLevel,
+}
+
 pub async fn list_contacts(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<Contact>>, StatusCode> {
-    state
+) -> Result<Json<Vec<ContactView>>, StatusCode> {
+    let contacts = state
         .db()
         .list_contacts()
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let counts = state
+        .db()
+        .message_counts_by_contact()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let now = now();
+    let views = contacts
+        .into_iter()
+        .map(|c| {
+            let count = counts.get(&c.contact_id).copied().unwrap_or(0);
+            let trust_level = compute_trust_level(&c, count, now);
+            ContactView {
+                contact: c,
+                trust_level,
+            }
+        })
+        .collect();
+    Ok(Json(views))
 }
 
 #[derive(Deserialize)]

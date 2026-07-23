@@ -14,6 +14,7 @@ use serde::Serialize;
 mod call_stream_bridge;
 mod daemon_lifecycle;
 mod link_preview;
+mod network_config;
 mod prf_unlock;
 
 const DEFAULT_DAEMON_PORT: u16 = 47_853;
@@ -145,6 +146,8 @@ pub fn run() {
             prf_unlock::get_prf_unlock_config,
             prf_unlock::save_prf_unlock_config,
             prf_unlock::clear_prf_unlock_config,
+            network_config::get_network_config,
+            network_config::save_network_config,
             call_stream_bridge::subscribe_call_stream,
             call_stream_bridge::unsubscribe_call_stream,
         ])

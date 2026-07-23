@@ -102,12 +102,15 @@ fn daemon_health_ok() -> bool {
 
 /// Ensures the daemon is reachable, spawning it (with `db_pin` as
 /// `BLACKHOLE_DB_PIN` if the active profile's database key is
-/// PIN-protected — see `prf_unlock.rs`) if it isn't already. Idempotent:
-/// if a daemon is already answering health checks (started manually, or
-/// by an earlier call this process made), this is a no-op rather than a
-/// second spawn racing the first for the same port.
+/// PIN-protected — see `prf_unlock.rs` — and this profile's saved
+/// `network_config::NetworkConfig`, if any, as
+/// `BLACKHOLE_BOOTSTRAP_PEERS`/`BLACKHOLE_TURN_*`) if it isn't already.
+/// Idempotent: if a daemon is already answering health checks (started
+/// manually, or by an earlier call this process made), this is a no-op
+/// rather than a second spawn racing the first for the same port.
 #[tauri::command]
 pub async fn ensure_daemon_running(
+    app: tauri::AppHandle,
     state: tauri::State<'_, DaemonProcess>,
     db_pin: Option<String>,
 ) -> Result<(), String> {
@@ -125,6 +128,9 @@ pub async fn ensure_daemon_running(
             if let Some(pin) = &db_pin {
                 cmd.env("BLACKHOLE_DB_PIN", pin);
             }
+            let network_config = crate::network_config::get_network_config(app)
+                .unwrap_or_else(|_| crate::network_config::NetworkConfig::default());
+            crate::network_config::apply_to_command(&network_config, &mut cmd);
             let child = cmd
                 .spawn()
                 .map_err(|e| format!("failed to spawn daemon: {e}"))?;
