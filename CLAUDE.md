@@ -108,12 +108,20 @@ and "what could go wrong here" questions are already answered there.
   sender, anti-spam PoW (SPEC.md §5). Real and tested against local
   multi-node scenarios (including a genuine two-daemon test in
   `bh-api`'s own test suite, not just this crate's own unit tests); not
-  yet deployed against a real network, and see THREAT_MODEL.md §3.4/§3.6
-  for the two biggest known (now hardened, not eliminated) gaps: onion
-  packet-size leak — a finer, further-extended `SIZE_BUCKETS` ladder plus
-  a smaller oversized-payload fallback stride — and mailbox manifest race
-  — jittered retry backoff (`manifest_retry_backoff`) on top of the
-  existing read-merge-write-verify loop. `mailbox.rs` also now caps a
+  yet deployed against a real network. `onion.rs`'s previously-known
+  packet-size leak (THREAT_MODEL.md §3.4) is now **resolved, not just
+  hardened**: the module was rewritten from a from-scratch bucket-padded
+  AEAD construction to a real Sphinx (Danezis-Goldberg) packet format via
+  `sphinx-packet` (the Nym mixnet project's own production
+  implementation — composition of an audited implementation, same
+  pattern as `openmls` for MLS, not homegrown crypto) — every packet at
+  every hop, route length, and payload size is now provably the exact
+  same number of bytes, confirmed by
+  `every_hop_of_every_route_length_produces_an_identically_sized_packet`.
+  The other known gap, mailbox manifest race (THREAT_MODEL.md §3.6),
+  remains hardened but not eliminated: jittered retry backoff
+  (`manifest_retry_backoff`) on top of the existing read-merge-write-verify
+  loop. `mailbox.rs` also now caps a
   manifest's serialized size (`MAX_MANIFEST_BYTES`, 96 KiB, conservative
   headroom under the DHT's 128 KiB record cap) and rejects a `push` once a
   recipient's/group's manifest is already at that cap — closes a cheap

@@ -189,29 +189,51 @@ guarantee.
 
 ### 3.4 Onion routing (`bh-network::onion`)
 
-- **Information disclosure — partially mitigated, was the most significant
-  open risk in this codebase.** Packets are now length-prefixed and padded
-  up to the nearest of a fixed set of size buckets
-  (`SIZE_BUCKETS`/`bucket_len`) before encoding at every hop, so most
-  payloads of different real sizes become indistinguishable on the wire —
+- **Information disclosure — RESOLVED, was the most significant open risk
+  in this codebase.** The module was rewritten from a from-scratch,
+  recursively-nested AEAD construction with bucket-size padding (real and
+  tested, but provably incapable of hiding position-in-circuit — each
+  outer layer necessarily contains the entire previous layer plus its own
+  header, so it can never be the same size as what it wraps) to real
+  Sphinx (Danezis-Goldberg) via `sphinx-packet` (Apache-2.0, the Nym
+  mixnet project's own production implementation — composition of an
+  existing audited implementation, the same pattern as `openmls` for MLS,
+  not homegrown protocol crypto). Every packet this module produces, for
+  any supported route length (`MIN_HOPS`=3 to `MAX_HOPS`) and any real
+  payload up to the fixed `PAYLOAD_SIZE` budget, is now *exactly* the same
+  number of bytes — provably, not just "usually the same bucket" —
   confirmed by
-  `same_bucket_payloads_produce_identically_sized_packets_at_every_hop` and
-  `packet_sizes_are_bucketed_not_exact`. The bucket ladder was later refined
-  from a coarse 2x-doubling table topping out at 64KiB to a finer ~1.5x
-  progression extended up to 1MiB, and the fallback stride for anything
-  still bigger dropped from a full extra bucket (a 1MiB jump) to a quarter
-  of one (`bucket_len_uses_a_quarter_stride_fallback_beyond_the_largest_bucket`)
-  — real, tested reductions in both average padding overhead and how coarse
-  the size categories are for large (e.g. file-chunk-sized) payloads. This
-  is a real, tested improvement, but **not** full Sphinx-style
-  constant-size padding: two payloads straddling a bucket boundary (or one
-  payload larger than every bucket) are still distinguishable by size, and
-  the module doc comment says so explicitly. Position-in-circuit inference
-  from packet size is reduced, not eliminated — refining the bucket table
-  narrows the gaps without changing that fundamental trade-off.
-- **Spoofing/tampering between hops**: each layer is authenticated
-  (ChaCha20-Poly1305, per-layer key from one-time ECDH) — a relay cannot
-  forge or modify a layer without detection, confirmed by
+  `every_hop_of_every_route_length_produces_an_identically_sized_packet`,
+  which builds a packet at every hop count and every payload size and
+  asserts the resulting set of observed lengths has exactly one member.
+  An observer watching the wire between any two hops can no longer
+  distinguish hop position, route length, or real payload size from
+  ciphertext length alone, full stop. The tradeoff every fixed-size mix
+  packet format accepts: bandwidth, not anonymity, is what's spent to get
+  this — every circuit costs the full fixed payload budget per hop even
+  for a two-byte message, and content larger than that budget is rejected
+  outright rather than silently truncated
+  (`oversized_payload_is_rejected_not_truncated_or_panicked_on`).
+  Depending on a real implementation instead of hand-rolling one closes
+  the specific "will the filler-string math be correct" risk, but this
+  integration itself — address-hashing, the timestamp/freshness
+  convention layered on top, the fixed payload sizing — has not had
+  independent review, consistent with `docs/SPEC.md` §2.2/§9's standing
+  caveat over every protocol decision in this codebase. One property
+  changed along the way: the replay-window check (`MAX_PACKET_AGE_SECONDS`/
+  `MAX_CLOCK_SKEW_SECONDS`) used to be checked at every layer since the
+  old scheme's timestamp was authenticated per-hop; Sphinx's payload stays
+  opaque to every hop but the exit by design, so a stale/replayed packet
+  is now only rejected at the exit hop instead of at hop one — it's still
+  never delivered, which is the property that actually matters here (see
+  the module's own doc comment).
+- **Spoofing/tampering between hops**: each hop's header is authenticated
+  via `sphinx-packet`'s own construction — HMAC-SHA256 header-integrity
+  MAC plus AES-128-CTR header encryption, keyed per hop from Sphinx's
+  group-element-blinding X25519 ECDH, and the payload is wrapped with
+  Lioness (a wide-block PRP, not AEAD-with-a-growing-tag, which is what
+  makes the size-preserving property possible) — a relay cannot forge or
+  modify a layer without detection, confirmed by
   `wrong_relay_key_fails_to_peel`.
 - **Information disclosure between hops**: confirmed by
   `intermediate_hops_cannot_read_final_payload` — an intermediate hop
@@ -626,16 +648,20 @@ Reviewed 2026-07-20, covering everything added in SPEC.md §15.
   variants (text/reaction/receipt/call-signal) are different sizes before
   encryption, so an observer who can measure ciphertext length across many
   messages could statistically distinguish "this looks like a receipt"
-  from "this looks like a long text message" — the same class of leak as
-  the onion packet-size gap (§3.4), not a new category of risk, but a new
-  instance of it. Now closed the same way: `encode`/`decode` length-prefix
-  and pad to a fixed set of size buckets before the ratchet/MLS layer ever
-  sees the bytes, confirmed by
+  from "this looks like a long text message" — the same class of leak
+  §3.4's onion packet-size gap originally had, not a new category of
+  risk, but a new instance of it. Closed with the same bucket-padding
+  technique §3.4 used *before* its move to full Sphinx constant-size
+  padding: `encode`/`decode` length-prefix and pad to a fixed set of size
+  buckets before the ratchet/MLS layer ever sees the bytes, confirmed by
   `different_small_variants_pad_to_the_same_bucket` (a `Reaction` and a
   multi-message `Receipt` land in the same bucket) and
-  `encoded_length_is_always_a_known_bucket_size`. Same caveat as §3.4:
-  bucket, not perfectly-constant, size — payloads near a bucket boundary
-  or larger than the biggest bucket are still distinguishable.
+  `encoded_length_is_always_a_known_bucket_size`. Unlike §3.4 today, this
+  is still bucket, not perfectly-constant, size — payloads near a bucket
+  boundary or larger than the biggest bucket are still distinguishable,
+  and there's no equivalent of Sphinx's fixed-size construction planned
+  here (this is per-message envelope framing, not a fixed-hop-count mix
+  packet, so the same fully-constant-size approach doesn't map directly).
 - **Repudiation (safety numbers)**: `bh_crypto::safety_number` computes a
   fingerprint from *whatever* public keys are handed to it — it has no way
   to know the caller resolved the correct contact. `Contact.verified` only
@@ -1090,9 +1116,11 @@ close) so cross-references elsewhere in this document keep pointing at the
 same item — a **MITIGATED**/**FIXED** tag means the item's own subsection
 now describes what closed it, not that the number was removed.
 
-1. **MITIGATED — onion routing packet-size leak** (§3.4). Bucket-size
-   padding closes the "exact size leaks hop position" version of this;
-   still not full Sphinx constant-size (see §3.4).
+1. **FIXED — onion routing packet-size leak, now full Sphinx
+   constant-size** (§3.4). The module moved from bucket-size padding to
+   a real Sphinx (Danezis-Goldberg) packet format via `sphinx-packet` —
+   every packet at every hop, route length, and payload size is now
+   provably the exact same number of bytes, not just bucketed close.
 2. **CORRECTED — `yamux` remote panic, CVE-2026-32314, not actually live**
    (§3.10). Previously ranked here as "partially mitigated"; re-verified
    against the actual dependency resolution and found not exploitable as
@@ -1151,9 +1179,11 @@ now describes what closed it, not that the number was removed.
     implemented — would require hosting a relay), and call transport still
     has no onion-routing-equivalent anonymity property, same class of gap
     as #1/#2, now also applicable to call media, not just messaging.
-11. **MITIGATED — envelope ciphertext-length side channel** (§3.11). Same
-    bucket-padding fix as #1, applied to `Envelope::encode`/`decode`;
-    same "buckets, not perfectly constant" caveat applies.
+11. **MITIGATED — envelope ciphertext-length side channel** (§3.11). The
+    same bucket-padding technique #1 used before its move to full Sphinx
+    constant-size, applied independently to `Envelope::encode`/`decode`;
+    still has the "buckets, not perfectly constant" caveat #1 no longer
+    does.
 12. **FIXED — disappearing-timer sweeper now follows profile switches**
     (§3.11). Sweeper ownership moved into `AppState`, restarted against
     the newly-active profile on every `switch_active`, confirmed by a

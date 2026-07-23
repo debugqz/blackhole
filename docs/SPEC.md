@@ -379,9 +379,15 @@ no-negociables (§2.2, CLAUDE.md).
    explícitamente fuera de esta ronda.
 - **Hardening pragmático de tres riesgos ya conocidos** (ver
    `docs/THREAT_MODEL.md` para el análisis STRIDE completo de cada uno):
-   el bucketing de tamaño de paquete onion (§3.4) se refinó a una
-   progresión más fina y un fallback de cuarto de bucket en vez de un
-   bucket entero; el merge de manifiesto de buzones (§3.6) ahora espera un
+   el módulo de onion routing (§3.4) se reescribió por completo, pasando
+   del bucketing aproximado de tamaño de paquete a un formato de paquete
+   Sphinx real (Danezis-Goldberg) vía el crate `sphinx-packet` (la
+   implementación de producción del proyecto de mixnet Nym — composición
+   de una implementación ya auditada, no cripto casera) — ahora todo
+   paquete, en todo salto, para toda longitud de ruta y tamaño de
+   payload, tiene *exactamente* el mismo tamaño, cerrando la fuga por
+   completo en vez de solo reducirla; el merge de manifiesto de buzones
+   (§3.6) ahora espera un
    backoff aleatorio entre reintentos en vez de reintentar inmediatamente,
    reduciendo colisiones bajo contención; y el desbloqueo local por
    passkey/TOTP (§3.11), que hasta ahora solo gateaba la UI *después* de
