@@ -23,8 +23,25 @@ use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpHeaderExtensionCapability, RTPCodecType,
+};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+/// Standard IANA-registered RTP header extension URIs (RFC 8843/9143).
+/// `webrtc-rs` needs both registered on the `MediaEngine` whenever a peer
+/// connection can carry more than one track of the same kind bundled over
+/// one transport (audio+video+screen here, all sharing one ICE/DTLS
+/// session) — without them, a packet whose SSRC hasn't yet been matched
+/// to a track via the SDP's own `a=ssrc` lines (a race that can happen
+/// under real network jitter/CI resource contention, not just simulcast)
+/// falls back to MID-based demuxing, which `webrtc-rs` hard-errors on
+/// (`ErrPeerConnSimulcastMidRTPExtensionRequired`/
+/// `ErrPeerConnSimulcastStreamIDRTPExtensionRequired`) if these aren't
+/// registered — silently and permanently losing that track's RTP stream
+/// for the rest of the call, not just delaying it.
+const SDES_MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
+const SDES_RTP_STREAM_ID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
 
 use crate::CallError;
 
@@ -106,6 +123,19 @@ pub async fn new_peer_connection(
     media_engine
         .register_default_codecs()
         .map_err(to_call_error)?;
+    for uri in [SDES_MID_URI, SDES_RTP_STREAM_ID_URI] {
+        for kind in [RTPCodecType::Audio, RTPCodecType::Video] {
+            media_engine
+                .register_header_extension(
+                    RTCRtpHeaderExtensionCapability {
+                        uri: uri.to_owned(),
+                    },
+                    kind,
+                    None,
+                )
+                .map_err(to_call_error)?;
+        }
+    }
     let api = APIBuilder::new().with_media_engine(media_engine).build();
     let config = RTCConfiguration {
         ice_servers,
