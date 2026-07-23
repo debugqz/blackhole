@@ -28,12 +28,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # `--workspace` pulls in `client/desktop/src-tauri`, so this needs
-      # Tauri's own Linux build deps (webkit2gtk transitively brings in
-      # glib/gtk3), not just the crypto/networking crates' own libs — see
-      # the `rust` job's own comment on the same package list below.
+      # `--workspace --all-targets` builds the same full set of crates the
+      # `rust` job does, just without `cargo build`/`cargo test` — so it
+      # needs the identical system deps: bh-calls' Opus/VP8/PipeWire/ALSA
+      # libs and Tauri's own Linux build deps (webkit2gtk transitively
+      # brings in glib/gtk3) for `client/desktop/src-tauri`. See the
+      # `rust` job's own comment on this same package list below.
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libclang-dev clang libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libopus-dev libvpx-dev libclang-dev clang libpipewire-0.3-dev libdbus-1-dev libasound2-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

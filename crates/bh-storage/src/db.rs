@@ -30,7 +30,7 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 impl CustomizeConnection<Connection, rusqlite::Error> for SetSqlCipherKey {
     fn on_acquire(&self, conn: &mut Connection) -> Result<(), rusqlite::Error> {
         // SQLCipher's `key` pragma does not support bound parameters.
-        conn.pragma_update(None, "key", format!("\"x'{}'\"", &*self.hex_key))?;
+        conn.pragma_update(None, "key", format!("\"x'{}'\"", *self.hex_key))?;
         // Force SQLCipher to actually touch the (decrypted) page cache now,
         // so a wrong key fails loudly here instead of on the first real query.
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
