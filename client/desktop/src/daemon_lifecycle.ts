@@ -10,9 +10,9 @@ import { invoke } from "@tauri-apps/api/core";
 /**
  * Ensures the daemon is reachable at `127.0.0.1:47853`, spawning it if
  * necessary. `dbPin` (when the active profile's database key is
- * PIN-protected) is passed through as the spawned process's
- * `BLACKHOLE_DB_PIN` environment variable — never logged, never sent
- * anywhere else.
+ * PIN-protected) is written to the spawned process's stdin — never
+ * logged, never placed in its environment (which other processes running
+ * as the same user can read), never sent anywhere else.
  */
 export async function ensureDaemonRunning(dbPin: string | null): Promise<void> {
   await invoke("ensure_daemon_running", { dbPin });

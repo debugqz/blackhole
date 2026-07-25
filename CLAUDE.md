@@ -6,7 +6,17 @@
 
 P2P E2EE messaging platform. Zero-knowledge by design: the operator cannot read
 content or reconstruct who talks to whom. No content moderation, ever — that's
-a design principle, not a policy. Monetization is cosmetic-only (profile
+a design principle, not a policy.
+
+> **Where the code does not yet meet that first sentence.** "Cannot
+> reconstruct who talks to whom" is the design goal, not a property the
+> current implementation has: `bh-network::{onion, cover_traffic,
+> eclipse_resistance}` are implemented and tested but have **no caller** —
+> every real send goes `Mailbox::push` → `Dht::publish` → a direct libp2p
+> connection, so the storing node sees the sender's IP and the recipient's
+> key hash together. Content confidentiality holds; sender-recipient
+> unlinkability does not. See THREAT_MODEL.md open risks #36 and #37 before
+> describing either property as delivered. Monetization is cosmetic-only (profile
 gifts/themes), paid in crypto (Monero primary), never "more privacy" as an
 upsell.
 
@@ -313,13 +323,47 @@ mailbox (`device_sync::sync_device_over_network`, reusing
 built from the `Device` row) rather than encrypting-and-immediately-
 decrypting in the same process
 (`device_sync_pushes_a_real_message_to_a_linked_device_over_the_network`).
-**Deliberately still out of scope** (see `device_link.rs`'s own module
-doc): a real linked device does not install the transferred account
-identity as its own `own_identity` — doing so would collide its
-`recipient_key_hash` with the primary's, and this codebase's `Direct`
-mailbox is delete-on-read/single-consumer (unlike `Group`'s
-`Mailbox::fan_out`), so two daemons racing to pull the same account's
-incoming mail would silently drop messages for whichever loses. Falls
+**A linked device is now a real device, not just a completed ceremony**
+(`device_role.rs`, `device_delegation.rs`, SPEC.md §19, THREAT_MODEL.md
+§3.16). A linked device still does *not* install the transferred account
+identity — but the reason is deeper than the `recipient_key_hash`
+collision and the delete-on-read `Direct` mailbox that
+`device_link.rs`'s doc comment used to give. Two devices sharing one
+account's Double Ratchet session each advance `sending_chain_key`/
+`send_count` independently and **reuse message keys**
+(`bh-crypto::ratchet::Session`) — a cryptographic break, not a mailbox
+race, so making the mailbox multi-consumer would not have fixed it.
+Instead: a **hub model**. `finish_link` now persists a secondary role
+(`bh-storage::linked_account`, schema v21) that it previously negotiated
+and threw away — leaving a genuinely separate daemon with no identity of
+its own, polling a mailbox that did not exist. A secondary speaks as its
+own per-device identity (`device_role::acting_identity_keypair`),
+receives mirrored contacts and messages for `Direct`/`Group`/`SelfNotes`
+alike (a secondary is never an MLS member — the primary decrypts and
+mirrors plaintext, which is why groups cost no new subsystem), and
+**sends by delegating**: `conversations::send_message` short-circuits into
+`Envelope::OutboundRequest`, and the primary runs it through
+`conversations::send_message_inner` — the same function its own UI uses,
+so there is exactly one encryption path in the codebase. The secondary's
+`request_id` *is* the message id, making delegation idempotent against
+the database rather than in-memory state a restart would lose; a
+transient network failure is deliberately left unanswered (an
+`OutboundResult` error is final) and retried by `device_sync`'s loop.
+Two authorization gates matter: `is_authorized_own_device` (a delegated
+send is honored only from a non-revoked own `devices` row — being a known
+contact is not enough, or any contact could make your daemon send as you)
+and `is_primary_sender` (mirrored state is accepted only from the
+recorded primary — this also closed a pre-existing hole where any contact
+could plant a `DeviceSyncMessage` attributed to a third party). Revocation
+is enforced on the primary's receive path, never by asking the revoked
+device to cooperate. **Accepted limitation**: a secondary receives nothing
+while the primary is offline, and push wakes the primary only — the
+primary is a single point of failure for the pair, but not of trust (it's
+the user's own device, not a server), which is why THREAT_MODEL.md's risk
+#14 is now MITIGATED rather than FIXED. `device_sync` also finally runs on
+a cadence (`spawn_default_device_sync_loop`) instead of only when someone
+presses "Sync now". Proven by a real three-daemon test,
+`a_secondary_device_delegates_a_send_that_reaches_a_real_contact`. Falls
 back to the pre-existing same-daemon simulation whenever there's no live
 network (or, for sync, no `identity_agreement_key` on record for that
 device yet) — same-daemon device linking exercises the real 4-step
@@ -408,12 +452,18 @@ encryption scheme. STUN is wired in (`transport::default_ice_servers`
 by every `new_peer_connection` call site including group-mesh edges), so
 ordinary-NAT peers no longer both need to be directly reachable. **TURN
 is now configurable too** — `BLACKHOLE_TURN_SERVERS` (comma-separated
-`turn:`/`turns:` URLs) plus `BLACKHOLE_TURN_USERNAME`/
-`BLACKHOLE_TURN_CREDENTIAL`, all three required together or none is added
-(`default_ice_servers` fails soft with a `tracing::warn!` rather than
-building a config `webrtc-rs` would reject at connection time) — but no
-TURN server is deployed for this project, so unless an operator sets all
-three, a symmetric NAT on either side still won't connect.
+`turn:`/`turns:` URLs) plus one of two credential schemes:
+`BLACKHOLE_TURN_AUTH_SECRET` (coturn's `use-auth-secret`/TURN REST API
+scheme — `default_ice_servers` derives a fresh, HMAC-SHA1 time-limited
+`username`/`credential` pair per call, `BLACKHOLE_TURN_CREDENTIAL_TTL_SECS`
+default 24h, so a leaked derived credential expires on its own; preferred,
+takes priority if both schemes are set) or the original fixed
+`BLACKHOLE_TURN_USERNAME`/`BLACKHOLE_TURN_CREDENTIAL` pair (simpler, but
+permanent until an operator rotates it and restarts every daemon by hand).
+Either way, `default_ice_servers` fails soft with a `tracing::warn!`
+rather than building a config `webrtc-rs` would reject at connection time
+if neither scheme is fully configured. A real TURN relay is deployed for
+this project now (see `infra/` below) — see that entry for the address.
 Needs `opus`, `libvpx`, and `pkg-config` installed at build time (see
 `crates/bh-calls/Cargo.toml`); the Linux screen-capture backend
 additionally needs `libpipewire`/`libdbus` headers (see
@@ -503,12 +553,20 @@ block is applied), client-only **UI preferences**
 (`src/ui_prefs.ts` — density and font-size, pure `localStorage`,
 deliberately not profile-scoped since these describe the device's
 screen, not any identity), opt-in link previews (resolved
-**client-side only**, via a dedicated Tauri command
-(`fetch_link_preview`, `src-tauri/src/link_preview.rs`) that never goes
-through `daemon_call`/the daemon at all — enabling it reveals the
-user's IP to whatever site is linked, stated explicitly in the toggle's
-copy rather than hidden), opt-in wake-push registration, and local
-message search (a search overlay with FTS5-highlighted snippets).
+**client-side only**, via two dedicated Tauri commands
+(`fetch_link_preview`/`fetch_link_preview_image`,
+`src-tauri/src/link_preview.rs`) that never go through
+`daemon_call`/the daemon at all — enabling it reveals the user's IP to
+whatever site is linked, stated explicitly in the toggle's copy rather
+than hidden; **per-link and never automatic**, since rendering a message
+must not hand its sender a covert read receipt, so an enabled preview is
+a "Load preview" button until pressed, and the `og:image` is fetched by
+that same Rust command and inlined as a `data:` URL rather than being
+handed to the webview as a remote `<img src>` the linked page chose —
+that second request would bypass the module's own host validation and
+public-addresses-only DNS resolver entirely), opt-in wake-push
+registration, and local message search (a search overlay with
+FTS5-highlighted snippets).
 Talks to the daemon only through a single generic `daemon_call` Tauri
 command (`src-tauri/src/lib.rs`) proxying raw HTTP over loopback — the
 typed request/response surface lives in `src/api.ts`. The Tauri shell
@@ -575,12 +633,18 @@ the open conversation's real `contact_id` and pass it to `POST /calls`,
 which — per `bh-api::calls`'s own module doc — routes the offer through
 that contact's real mailbox instead of the same-daemon demo path; falls
 back to the old same-daemon demo automatically for conversations with no
-resolved `contact_id` (e.g. "Notes to self"). There's still no unprompted
-"incoming call" ringing UI — the daemon auto-answers a real incoming
-offer server-side — but the client now polls `GET /calls/network`
-(`bh-api::calls::list_network_calls`) and shows a minimal banner
-("Call with X" + Join/Dismiss) once a call it didn't place itself goes
-live. **Group calls remain the same-daemon demo** (matching the existing
+resolved `contact_id` (e.g. "Notes to self"). **An incoming call now
+rings instead of connecting itself**: the daemon used to auto-answer a
+real offer server-side, which meant `wire_live_media` opened the
+microphone with no prompt and no pre-connect state — any contact could
+listen in, and the client's only visibility was a poll that fired after
+audio was already flowing. An `Offer` now lands in
+`CallRegistry::ringing` (bounded, cancelled by a `Hangup`) and is
+surfaced by `GET /calls/ringing`; media is wired only by
+`POST /calls/ringing/:call_id/answer`, with `.../decline` dropping it and
+notifying the caller. The client's banner ("Call from X" +
+Answer/Decline) drives those two routes; `GET /calls/network` still
+reports calls that are already live. **Group calls remain the same-daemon demo** (matching the existing
 "device linking (local simulation, labeled as such in the UI)"
 precedent): `bh-api::calls`'s own module doc explains `GroupOffer`/
 `GroupAnswer` are deliberately not routed over the network yet, so every
@@ -634,13 +698,45 @@ bootstrap node (Dockerfile + systemd unit wrapping the ordinary
 `BLACKHOLE_KEYSTORE_BACKEND=file`), the opaque wake-push relay
 (Dockerfile + systemd unit around `bh-push-relay`, fronted by Caddy for
 automatic TLS), and a TURN relay (`docker-compose.yml`'s `coturn`
-service — coturn itself, not this repo's code; static credentials only,
-see `infra/README.md`'s own limitation note). Nothing here is deployed
-to a real domain by this repo itself — `infra/README.md` is the
-step-by-step guide for an operator who wants to. **Genuinely exercised
-against a real deployment, not just written**: a real bootstrap node and
-TURN relay were stood up and used to validate two independent daemons
-finding each other over the public DHT and a real `typ relay` ICE
+service — coturn itself, not this repo's code; supports either a static
+long-term credential or coturn's `use-auth-secret`/TURN REST API
+ephemeral scheme, see THREAT_MODEL.md §3.15/`infra/README.md`'s TURN
+section).
+
+**A real, persistent deployment of all three now exists** (a single AWS
+Lightsail instance), not just a one-off validation run:
+
+- Bootstrap nodes (two, in different AWS regions/hosts for redundancy —
+  `infra/README.md`'s recommendation to run ≥2, now actually done):
+  - `/ip4/13.221.175.136/tcp/4001/p2p/12D3KooWKLwn3VqANVSf6QiHRoqSYkH1vf3me6rCxSTz3pXUeGfe`
+    (AWS Lightsail, `us-east-1`)
+  - `/ip4/34.215.163.120/tcp/4001/p2p/12D3KooWS5WqhkFTsJgrCfVBdk6FNkVFiHACLh29suxXQUryrxWF`
+    (AWS Lightsail, `us-west-2`)
+  
+  Both identities confirmed stable across restarts via
+  `BLACKHOLE_PERSISTENT_NETWORK_IDENTITY`. Each is also configured with
+  `BLACKHOLE_BOOTSTRAP_PEERS` pointing at the other, so they join one DHT
+  swarm rather than being two disjoint islands a new peer could only
+  reach half of depending on which address it dialed first.
+- Push relay: `https://push.vanglaw.org`, TLS via a `docker compose`-managed
+  Caddy (real Let's Encrypt cert) reverse-proxying to `bh-push-relay` over
+  the compose-internal network only — the relay itself has no host port
+  mapping at all, closing the "token travels in cleartext" gap a direct,
+  unproxied deployment would have. `forward_to_push_provider` is still the
+  `// TODO(real-push)` stub described below — the relay is live and
+  reachable, but doesn't wake a real device yet.
+- TURN: coturn on the same host (`13.221.175.136:3478`/`:5349`), currently
+  using the static long-term-credential scheme (not yet switched to the
+  newer ephemeral `TURN_AUTH_SECRET` scheme above — an available follow-up,
+  not done as part of introducing that scheme).
+
+Bootstrap node and coturn are still managed via standalone `docker run`
+(deliberately not migrated to `docker compose` yet, to avoid any risk to
+the bootstrap node's persistent on-disk identity); push-relay and Caddy
+are `docker compose`-managed (`infra/docker-compose.yml`). **Genuinely
+exercised against a real deployment, not just written**: a real bootstrap
+node and TURN relay were stood up and used to validate two independent
+daemons finding each other over the public DHT and a real `typ relay` ICE
 candidate — see the `client/desktop` entry above.
 
 ## Testing & CI status

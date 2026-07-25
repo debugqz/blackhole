@@ -132,6 +132,14 @@ fn fetch_link_preview(url: String) -> Result<link_preview::LinkPreviewResponse, 
     link_preview::fetch(&url)
 }
 
+/// Fetches a preview image through the same SSRF guards as
+/// `fetch_link_preview`, so the webview never points an `<img src>` at a
+/// host the linked page picked — see `link_preview::fetch_image`.
+#[tauri::command]
+fn fetch_link_preview_image(url: String) -> Result<link_preview::LinkPreviewImageResponse, String> {
+    link_preview::fetch_image(&url)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -141,6 +149,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             daemon_call,
             fetch_link_preview,
+            fetch_link_preview_image,
             daemon_lifecycle::ensure_daemon_running,
             daemon_lifecycle::stop_daemon,
             prf_unlock::get_prf_unlock_config,

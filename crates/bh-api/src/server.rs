@@ -12,9 +12,9 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     call_stream, calls, contacts, conversations, cosmetics, dead_mans_switch, device_link,
-    device_sync, ephemeral_identity, export, files, groups, identity, invites, local_auth,
-    moderation, network, panic_wipe, payment_requests, presence, profiles, push, reactions,
-    receipts, safety_number, search, security, stickers, ApiError, AppState,
+    device_role, device_sync, ephemeral_identity, export, files, groups, identity, invites,
+    local_auth, moderation, network, panic_wipe, payment_requests, presence, profiles, push,
+    reactions, receipts, safety_number, search, security, stickers, ApiError, AppState,
 };
 
 /// Rejects any request carrying a browser-set `Origin` header.
@@ -208,6 +208,8 @@ impl ApiServer {
             )
             .route("/groups/:id/mls-self-test", post(groups::mls_self_test))
             .route("/devices", get(device_link::list_devices))
+            .route("/devices/role", get(device_role::get_role))
+            .route("/devices/unlink-self", post(device_role::unlink_self))
             .route("/devices/:id/revoke", post(device_link::revoke_device))
             .route("/devices/:id/sync", get(device_sync::sync_device))
             .route("/devices/:id/sync/status", get(device_sync::sync_status))
@@ -349,6 +351,15 @@ impl ApiServer {
             .route("/calls/:call_id", get(calls::call_status))
             .route("/calls/network", get(calls::list_network_calls))
             .route("/calls/incoming", post(calls::accept_call))
+            .route("/calls/ringing", get(calls::list_ringing_calls))
+            .route(
+                "/calls/ringing/:call_id/answer",
+                post(calls::answer_ringing_call),
+            )
+            .route(
+                "/calls/ringing/:call_id/decline",
+                post(calls::decline_ringing_call),
+            )
             .route("/calls/:call_id/complete", post(calls::complete_call))
             .route("/calls/:call_id/hangup", post(calls::hangup_call))
             .route(

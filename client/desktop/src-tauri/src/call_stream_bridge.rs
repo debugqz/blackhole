@@ -50,6 +50,30 @@ struct CallFramePayload {
     bytes_b64: String,
 }
 
+/// `call_id` is spliced straight into the WebSocket URL below, on a
+/// request that carries the daemon's bearer token — the same reasoning
+/// `lib.rs`'s `validate_method_and_path` already applies to `daemon_call`.
+/// Every call id this client ever produces is a `crypto.randomUUID()`
+/// (`main.ts`'s `startCall`/`startTestGroupCall`) or one the daemon itself
+/// handed back, so requiring the UUID shape costs nothing and keeps a
+/// future webview bug from rewriting the request target with `/`, `?`, or
+/// `#`.
+fn validate_call_id(call_id: &str) -> Result<(), String> {
+    let shaped = call_id.len() == 36
+        && call_id.as_bytes().iter().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                *b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        });
+    if shaped {
+        Ok(())
+    } else {
+        Err("invalid call id".to_string())
+    }
+}
+
 /// Opens (or re-opens) the bridge for `call_id`, emitting `call-event`
 /// (JSON body: `{call_id, event}`, `event` shaped like
 /// `bh_api::call_stream::CallEvent`'s serde form) and `call-frame`
@@ -64,6 +88,7 @@ pub async fn subscribe_call_stream(
     state: tauri::State<'_, CallStreamBridges>,
     call_id: String,
 ) -> Result<(), String> {
+    validate_call_id(&call_id)?;
     {
         let mut guard = state
             .0
@@ -150,5 +175,36 @@ pub fn unsubscribe_call_stream(state: tauri::State<'_, CallStreamBridges>, call_
         if let Some(stop_tx) = guard.remove(&call_id) {
             let _ = stop_tx.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_a_real_uuid() {
+        assert!(validate_call_id("8b383c7a-d875-4d01-9688-244a34eec6a8").is_ok());
+        assert!(validate_call_id("8B383C7A-D875-4D01-9688-244A34EEC6A8").is_ok());
+    }
+
+    /// Regression test: without this, a call id could rewrite the path of
+    /// a request that carries the daemon's bearer token.
+    #[test]
+    fn rejects_an_id_that_would_rewrite_the_request_target() {
+        assert!(validate_call_id("../../health").is_err());
+        assert!(validate_call_id("8b383c7a-d875-4d01-9688-244a34eec6a8/../x").is_err());
+        assert!(validate_call_id("8b383c7a-d875-4d01-9688-244a34eec6a8?x=1").is_err());
+        assert!(validate_call_id("8b383c7a-d875-4d01-9688-244a34eec6a8#f").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_ids() {
+        assert!(validate_call_id("").is_err());
+        assert!(validate_call_id("not-a-uuid").is_err());
+        // Right length, wrong shape (dashes in the wrong places).
+        assert!(validate_call_id("8b383c7ad-875-4d01-9688-244a34eec6a8").is_err());
+        // Right length and dash positions, non-hex payload.
+        assert!(validate_call_id("zb383c7a-d875-4d01-9688-244a34eec6a8").is_err());
     }
 }

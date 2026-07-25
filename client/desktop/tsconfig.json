@@ -3,7 +3,10 @@
     "target": "ES2020",
     "useDefineForClassFields": true,
     "module": "ESNext",
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    /* ES2022 for `Intl.Segmenter`'s types (see ui_prefs.ts's
+       `splitGraphemes`) — every webview Tauri v2 targets ships it, and
+       the code feature-detects anyway. */
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "skipLibCheck": true,
 
     /* Bundler mode */

@@ -728,6 +728,34 @@ input[type="checkbox"] {
   gap: 6px;
 }
 
+/* The opt-in "Load preview" affordance. Previews are never fetched on
+   render (see link_preview.ts's `renderLinkPreviewSlot`), so this button
+   is what stands in for the card until the user asks for it. */
+.link-preview-slot {
+  margin-top: 4px;
+}
+.link-preview-load {
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px dashed rgba(243, 241, 236, 0.18);
+  border-radius: 8px;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.link-preview-load:hover:not(:disabled) {
+  border-color: var(--text-faint);
+  color: var(--text);
+}
+.link-preview-load:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .link-preview-card {
   display: block;
   border: 1px solid rgba(243, 241, 236, 0.09);
@@ -1281,6 +1309,16 @@ input[type="checkbox"] {
 .device-list {
   display: flex;
   flex-direction: column;
+}
+.device-role {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+.device-role-title {
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 .device-row {
   display: flex;

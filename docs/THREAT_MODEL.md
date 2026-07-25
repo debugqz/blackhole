@@ -30,6 +30,7 @@ rather than describing the aspirational end state.
   - [3.12 Second post-v0.1 batch](#312-second-post-v01-batch-bh-apidevice_synccosmeticsstickerspresencepushsearchgroupsconversations-bh-storagepushsearchcosmeticsmessage_stickers-cratesbh-push-relay-bh-callsgroupscreen-bh-cryptomlsexport_call_base_key-clientdesktopsrc-taurisrclink_previewrs)
   - [3.13 Network-wired direct messages and call streaming](#313-network-wired-direct-messages-and-call-streaming-bh-apimessage_cryptomessage_receive-bh-apicall_streamcall_audio-clientdesktopsrc-taurisrccall_stream_bridgers)
   - [3.14 Shareable blocklists, trust level, UI prefs, fourth hardening pass](#314-shareable-blocklists-contact-trust-level-client-ui-prefs-and-a-fourth-hardening-pass-bh-apimoderationcontacts-bh-storagecontacts-clientdesktopsrcui_prefsts-plus-the-mailboxkeystoretokenparser-fixes-folded-into-363739312-above)
+  - [3.15 Ephemeral TURN REST API credentials](#315-ephemeral-turn-rest-api-credentials-bh-callstransport-infradocker-composeyml)
 - [4. Ranked open risks (28 tracked items)](#4-ranked-open-risks)
 
 ---
@@ -84,7 +85,7 @@ flowchart TB
         Operator["Blackhole operator<br/>/ maintainers"]
     end
 
-    Sender -->|"ciphertext, sealed sender,<br/>onion-routed"| untrusted
+    Sender -->|"ciphertext + sealed sender.<br/>NOT onion-routed today —<br/>see open risk #37"| untrusted
     untrusted -->|"ciphertext only"| Recipient
 
     Contact["Malicious contact<br/>(real, authenticated peer)"] -.->|"trusted only with<br/>what the user chooses to send"| Recipient
@@ -134,8 +135,17 @@ flowchart TB
   design would need independent, cross-checked monitors, which is
   explicitly out of scope for a per-identity self-published log. Tested
   in `bh-crypto::key_transparency`'s own unit tests (valid/tampered-field/
-  wrong-signer cases) and `bh-network::tree_head`'s two-node integration
-  tests (publish/fetch/verify round trip, republish-replaces-old-value).
+  wrong-signer cases), `bh-network::tree_head`'s two-node integration
+  tests (publish/fetch/verify round trip, republish-replaces-old-value),
+  and now also end-to-end between two genuinely independent daemon
+  processes — `bh-api/tests/api_smoke.rs`'s
+  `key_transparency_corroborates_a_contacts_identity_between_two_real_daemons`
+  drives the whole stack the same way
+  `direct_message_travels_a_real_network_between_two_daemons_and_decrypts`
+  does for messages: real HTTP `POST /identity` on two independent
+  `AppState`s, B's background publish, and A's real `GET
+  /contacts/:id/safety-number` call actually fetching and verifying B's
+  tree head over a real two-node DHT.
 - **Tampering**: X3DH's signed prekey is Ed25519-signed by the identity key
   and verified before use (`ratchet.rs::PreKeyBundle::verify_signed_prekey`,
   tested). Double Ratchet messages are AEAD-authenticated
@@ -156,9 +166,36 @@ flowchart TB
 
 ### 3.2 Groups (`bh-crypto::mls`)
 
+> **Spoofing — open, see risk #36.** A member's MLS credential is a
+> `BasicCredential` holding whatever identity bytes that member chose, with
+> nothing tying it to their account's Ed25519 identity key, and the receive
+> path attributes group messages by comparing exactly those bytes. Any
+> group member can therefore post as any other identity. `add_member` over
+> the real network now at least refuses a key package whose credential
+> doesn't match the contact being added (risk #34), but that constrains who
+> can be *invited*, not what an admitted member may claim.
+
+
 - Uses `openmls`, the reference MLS (RFC 9420) implementation, rather than
   a custom group ratchet — the highest-confidence piece of the crypto
   stack precisely because it's an integration, not new protocol code.
+- **Known gap, deliberately not closed yet — no post-quantum ciphersuite.**
+  Unlike `bh-crypto::ratchet`'s 1:1 sessions (real X25519 + ML-KEM-768
+  hybrid via `bh_crypto::pq_hybrid`), groups still use the classical
+  `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` ciphersuite. Researched
+  and deliberately deferred, not overlooked: see
+  `docs/PQ_MLS_RESEARCH.md` for the full findings — a hybrid PQ
+  ciphersuite codepoint (X-Wing, `MLS_256_XWING_CHACHA20POLY1305_
+  SHA256_Ed25519`) is already reserved in `openmls_traits`, and an
+  official `openmls`-org crate (`openmls_libcrux_crypto`) does implement
+  it, but both X-Wing itself and the MLS ciphersuite wrapping it remain
+  IETF Internet-Drafts (Informational track, no RFC), and a 2026
+  independent audit found real vulnerabilities in the specific
+  `libcrux-ml-kem` implementation that backend depends on — including one
+  that broke Signal's own production PQ ratchet. Revisiting this is
+  gated on both the ciphersuite reaching at least IETF WG adoption with a
+  stable codepoint and a clean re-audit of the implementation, per
+  `docs/SPEC.md` §2.2's standing bar against adopting unaudited crypto.
 - **Elevation of privilege**: removed members can no longer decrypt new
   epochs (MLS's core property) — covered by
   `mls.rs::removed_member_can_no_longer_be_reasoned_about_as_current`.
@@ -234,6 +271,15 @@ flowchart TB
   a break in either leg alone doesn't silently succeed.
 
 ### 3.4 Onion routing (`bh-network::onion`)
+
+> **Read this section knowing that nothing calls this module.** The
+> analysis below is about the packet format the module implements, and it
+> is accurate about that. It is not a statement about what the running
+> daemon does: `onion.rs` has no caller anywhere outside its own tests and
+> fuzz target, and neither does `cover_traffic.rs`. Real sends go straight
+> out over the DHT (`Mailbox::push` → `Dht::publish`), so none of the
+> anonymity properties described here currently apply to any message this
+> software actually sends. See open risk #37.
 
 - **Information disclosure — RESOLVED, was the most significant open risk
   in this codebase.** The module was rewritten from a from-scratch,
@@ -500,9 +546,11 @@ flowchart TB
   `POST /security/db-pin` (set, from an already-unlocked daemon) /
   `POST /security/db-pin/clear` (requires the current PIN) are the HTTP
   surface (`bh-api::security`); `daemon/src/main.rs::
-  load_or_create_db_key` enforces it at startup via `BLACKHOLE_DB_PIN`,
-  refusing to start (rather than silently minting a fresh key or starting
-  unprotected) if a PIN is set but not supplied. `POST /profiles/:id/
+  load_or_create_db_key` enforces it at startup via `db_pin()` (one line
+  on stdin when `BLACKHOLE_DB_PIN_STDIN=1`, else the `BLACKHOLE_DB_PIN`
+  environment variable for hand-run daemons), refusing to start (rather
+  than silently minting a fresh key or starting unprotected) if a PIN is
+  set but not supplied. `POST /profiles/:id/
   activate` is PIN-aware too (`db_pin` field), so switching *into* a
   PIN-protected profile requires it — confirmed by
   `switching_into_a_pin_protected_profile_requires_the_pin`, which also
@@ -524,8 +572,16 @@ flowchart TB
   has been enrolled specifically for this (`POST /security/db-pin` sealed
   under `hex(prf_secret)`, reusing the mechanism directly above rather
   than inventing a second one) — waits on a passkey assertion *first*,
-  deriving the PRF secret and passing it as `BLACKHOLE_DB_PIN` to the
-  spawned process. The daemon genuinely does not exist as a process,
+  deriving the PRF secret and writing it to the spawned process's
+  **stdin** (not its environment: a child's environment is readable by
+  any process running as the same user, which would put the secret that
+  unwraps the SQLCipher key somewhere the key itself never sits — the
+  same class of leak already closed for the TURN credential). The gate
+  config (`prf_unlock_gate.json`) is written only *after* `POST
+  /security/db-pin` succeeds, so a failed call can no longer leave a gate
+  on disk that demands a passkey at every launch while
+  `load_or_create_db_key` takes its `Unprotected` branch and opens the
+  database anyway. The daemon genuinely does not exist as a process,
   let alone have an open database, until that assertion succeeds. This
   is sound specifically *because* PRF is hardware-derived (secure
   enclave/TPM/security key) rather than something that has to sit
@@ -1155,6 +1211,102 @@ storage or synthetic tests.
   real" work actually lands (see §3.7's file-keystore-backend entry for
   the precedent of documenting `infra/`-level decisions in this file).
 
+### 3.15 Ephemeral TURN REST API credentials (`bh-calls::transport`, `infra/docker-compose.yml`)
+
+- **MITIGATED — TURN credentials no longer have to be permanent**: every
+  earlier mention of the TURN section above (§3.11, §3.14 item 28) called
+  out the same open gap — `default_ice_servers()` only supported one fixed
+  long-term `BLACKHOLE_TURN_USERNAME`/`_CREDENTIAL` pair, so a leaked
+  credential was leaked forever until an operator rotated it and restarted
+  every daemon by hand. `default_ice_servers()` now also supports
+  `BLACKHOLE_TURN_AUTH_SECRET` — coturn's own `use-auth-secret`/TURN REST
+  API scheme. When set, a fresh `username`/`credential` pair is derived
+  per call (`ephemeral_turn_username`/`ephemeral_turn_credential`):
+  `username` embeds a Unix-timestamp expiry (plus an optional operator
+  label from `BLACKHOLE_TURN_USERNAME`), `credential` is
+  `base64(HMAC-SHA1(secret, username))` — exactly what coturn's own spec
+  defines, so coturn itself recomputes and checks it, no repo-invented
+  verification logic. HMAC-SHA1 is a protocol interop requirement (coturn
+  expects it), not a cryptographic choice made here — same "compose an
+  audited primitive, don't invent one" pattern `bh-crypto::webhook.rs`
+  already established with HMAC-SHA256 for webhook signing. The shared
+  secret itself never travels over the wire or appears in any SDP/ICE
+  candidate; only the derived, time-limited pair does, and that pair
+  expires on its own (`BLACKHOLE_TURN_CREDENTIAL_TTL_SECS`, default 24h)
+  even if a specific offer/answer exchange leaks. Takes priority over the
+  static pair when both are configured, checked consistently on both the
+  daemon side (`default_ice_servers`) and the reference `infra/
+  docker-compose.yml` coturn entrypoint, so the two ends can't disagree
+  about which scheme is actually in effect. Not tagged FIXED: this is
+  strictly opt-in (an operator still has to set `TURN_AUTH_SECRET` instead
+  of `TURN_USERNAME`/`TURN_CREDENTIAL`) — the static, permanent-credential
+  path documented in §3.11/§3.14 still exists and is still the default an
+  operator reaches for first unless they read this far, so the underlying
+  risk is closed for anyone who opts in, not eliminated from the codebase
+  entirely.
+
+### 3.16 Multi-device delegation (`bh-api::{device_role,device_delegation}`, `bh-storage::{linked_account,delegated_sends}`, `bh-crypto::envelope`)
+
+The hub model: an account has exactly one primary, holding the account
+identity, every Double Ratchet session and all MLS group state. A
+secondary holds only its own per-device identity and asks the primary to
+send for it. Full rationale in
+`docs/superpowers/specs/2026-07-24-multidevice-delegation-design.md`.
+
+**Why not per-device sessions.** The obvious alternative — every device
+gets its own identity and senders address them all — was rejected for
+this round because it requires publishing a signed device directory, which
+makes "how many devices does this account have" observable to anyone who
+can read the DHT, and multiplies ciphertext copies per message. The hub
+model publishes nothing new: from the outside an account with five devices
+is indistinguishable from one with a single device. That is a privacy
+property gained, not merely the simpler design.
+
+**Why not a shared account identity.** Two daemons holding the same
+identity is a cryptographic break, not a mailbox race. `bh_crypto::
+ratchet::Session` advances `sending_chain_key`/`send_count` on every
+encrypt; two devices each advancing their own copy reuse message keys.
+Receiving would converge, sending would not. This is recorded here
+because the mailbox's delete-on-read behavior is the *visible* symptom and
+an obvious-looking fix (make the mailbox multi-consumer) does not address
+the actual problem.
+
+| Threat | Vector | Mitigation | Residual |
+|---|---|---|---|
+| **S**poofing | Any contact sends `Envelope::OutboundRequest`, making the primary send messages under the account identity | `device_role::is_authorized_own_device` — the sender must match a non-revoked `devices` row with `owner = self`; being a known contact is explicitly not enough | A compromised secondary can send as the account until revoked |
+| **S**poofing | A contact sends `ContactSync`/`DeviceSyncMessage`/`DeviceRevoked` to a secondary, injecting identities, planting messages attributed to third parties, or silencing the device | `device_role::is_primary_sender` — must match the stored `account_public_key` | None known |
+| **T**ampering | A delegated send is replayed to make the primary send twice | `request_id` *is* the message id; the primary re-answers an existing message instead of re-sending. A database property, so it survives restarts on both sides | None known |
+| **R**epudiation | — | Out of scope, same as everywhere else in this system | — |
+| **I**nformation disclosure | A mailbox operator distinguishes delegation traffic from chat, inferring the account has a second device | Every variant rides the same sealed-sender/ratchet path and the same `Envelope::encode` size buckets; a delegated send's length is always also some ordinary message's length (tested) | Bucketing, not constant size — the caveat §3.11 already records for envelopes generally |
+| **I**nformation disclosure | A secondary holds the full message history in its own SQLCipher database | Same protections as any profile database (PIN/passkey gate, panic wipe) | **Real and inherent**: linking a device duplicates the endpoint attack surface. Revocation limits future damage, never past |
+| **D**enial of service | A revoked device keeps delegating | Enforced on the primary's receive path, not by asking the device to stop; `Envelope::DeviceRevoked` is a courtesy notification | A revoked device that never comes online still holds its copy of history |
+| **D**enial of service | A secondary floods its primary's mailbox with requests | The mailbox's own proof-of-work and `MAX_MANIFEST_BYTES` cap (§3.6) | No delegation-specific rate limit |
+| **E**levation of privilege | A secondary performs account-level actions (add a group member, verify a safety number, issue an invite, place a call) | Those routes require a real `own_identity` and keep failing on a secondary | None known — the surface a secondary reaches is deliberately just "send a message" |
+
+**Deliberately accepted.** The primary is a single point of failure for
+the pair. It is not a single point of *trust*: it is one of the user's own
+devices, not a server, so nothing about "the operator cannot read content"
+changes. A secondary that is offline when the primary sends simply catches
+up on the next sweep; a secondary whose primary is offline queues its
+sends until the TTL, which is the same store-and-forward semantics the
+rest of the system has.
+
+**Covered by tests.** Both authorization gates, against real daemons over
+a real network: `only_an_authorized_linked_device_can_make_the_primary_send`
+drives three phases — a sender that is merely a *contact* is refused, the
+same daemon registered as a device succeeds (so the refusals aren't
+vacuous), and a revoked device is refused again without being told.
+`a_delegated_send_with_no_reachable_primary_stays_pending` pins the
+transient-vs-final distinction, and
+`a_secondary_device_delegates_a_send_that_reaches_a_real_contact` covers
+the whole round trip plus on-demand pseudo-contact recovery.
+
+**Not covered by any test.** Behavior when a secondary's clock is far from
+the primary's, beyond the existing `MAX_TIMESTAMP_SKEW_SECONDS` envelope
+check; and contention when two secondaries delegate simultaneously (each
+has its own `request_id`, so no correctness issue is expected, but it is
+untested).
+
 ## 4. Ranked open risks
 
 Numbering is kept stable across revisions (rather than renumbered as items
@@ -1248,10 +1400,22 @@ now describes what closed it, not that the number was removed.
     actually verifying the address against a second channel — that residual
     is inherent to any consent-gate UI, not something this change (or any
     software fix) can close.
-14. **Device linking is a same-daemon simulation, not real multi-device**
-    (§3.11) — proves the crypto path, not cross-process/cross-device
-    behavior; must be reworked once a second physical device can actually
-    be reached.
+14. **MITIGATED — a linked secondary device is now real, but depends on
+    the primary being online** (§3.16). Linking used to leave no trace on
+    the device that linked: `finish_link` returned the negotiated keys in
+    an HTTP response and dropped them, so a genuinely separate daemon
+    finished the ceremony with no identity of its own and polled a mailbox
+    that did not exist. A secondary now persists its role
+    (`bh-storage::linked_account`), listens on its own per-device mailbox,
+    receives mirrored contacts and messages, and sends by delegating to
+    the primary (`bh-api::device_delegation`) — proven by a real
+    three-daemon test where the secondary never holds the account
+    identity at all. **Not FIXED**: this is a hub model, so a secondary
+    receives nothing while the primary is offline, and the wake-push relay
+    wakes the primary only. Independence from the primary needs a signed
+    device directory and per-device sessions (the Signal model), which
+    would also make a user's device *count* observable — deliberately not
+    built, see §3.16.
 15. **PARTIALLY MITIGATED — file attachments now swept by the
     disappearing-message timer, still have no resumability** (§3.11). The
     orphaned-chunk-files-on-disk gap is closed: `bh-storage`'s expiry
@@ -1378,8 +1542,115 @@ now describes what closed it, not that the number was removed.
     host process listing** (§3.14). `infra/docker-compose.yml`'s `coturn`
     service now reads it from a generated config file instead of a
     `--user=...` CLI flag, removing it from `ps`/`docker inspect`/`docker
-    top` output — deployment-side hardening, the underlying
-    static-credential-only tradeoff itself is unchanged.
+    top` output — deployment-side hardening; see item 29 for the
+    underlying static-credential-only tradeoff itself.
+29. **MITIGATED — TURN credentials can now be ephemeral, not just
+    static** (§3.15). `BLACKHOLE_TURN_AUTH_SECRET` (coturn's
+    `use-auth-secret`/TURN REST API scheme) is now supported alongside the
+    original fixed `BLACKHOLE_TURN_USERNAME`/`_CREDENTIAL` pair —
+    `default_ice_servers` derives a fresh, time-limited credential per
+    call via HMAC-SHA1, matching coturn's own spec. Opt-in: the static,
+    permanent-credential path is unchanged and still the path an operator
+    reaches for unless they choose the new one.
+
+30. **FIXED — a replayed mailbox envelope could permanently break a
+    conversation** (§3.1/§3.6). `bh_crypto::ratchet::Session::decrypt`
+    advanced the receiving chain, ran `dh_ratchet`, and consumed a chain
+    key *before* the AEAD check, and `bh-api::message_receive` persisted
+    the resulting state regardless of outcome. Mailbox entries are plain
+    public DHT records and `Mailbox::delete` only prunes the manifest, so
+    anyone could re-publish a manifest entry pointing at an
+    already-delivered envelope — signature and all — and desynchronize the
+    recipient's ratchet, after which every subsequent *legitimate* message
+    also failed. `decrypt` now runs against a throwaway copy and commits
+    only on success (`trial_copy`, matching libsignal's own behavior), and
+    the receive loop persists only the session that actually decrypted.
+    Covered by `a_replayed_message_does_not_desynchronize_the_session`,
+    `a_forged_ratchet_header_does_not_destroy_the_session`, and
+    `a_failed_decrypt_does_not_consume_a_cached_skipped_key`.
+31. **MITIGATED — replayed envelopes are no longer acted on twice**
+    (§3.6). `message_receive::ReplayGuard` remembers a bounded set of
+    already-processed envelope digests, and `process_one` now rejects an
+    envelope whose signed timestamp is more than
+    `MAX_TIMESTAMP_SKEW_SECONDS` from local time. `process_one` also no
+    longer rebuilds a responder session from an `InitialMessage`
+    unconditionally: the stored session is tried first, with the
+    freshly-derived one kept only as a fallback for a peer that genuinely
+    lost state. Bounded and in-process, so it is a mitigation rather than
+    a protocol-level replay window — a real fix needs per-message
+    server-side deduplication the plain-DHT mailbox can't provide (§3.6's
+    standing "dedicated mailbox-node protocol" direction).
+32. **FIXED — incoming calls no longer auto-answer** (§3.11). A
+    `CallSignal::Offer` arriving over the network went straight into
+    `session::accept_incoming_call` + `wire_live_media`, which captures and
+    transmits the system microphone. There was no ring, no prompt, and no
+    pre-connect state a client could show: the only visibility was a poll
+    of `GET /calls/network`, by which point audio was already flowing.
+    Offers now land in `CallRegistry::ringing` (bounded by
+    `MAX_RINGING_CALLS`) and are surfaced by `GET /calls/ringing`;
+    `POST /calls/ringing/:call_id/answer` is the only path that wires
+    media, and `.../decline` drops the offer and tells the caller. The
+    desktop client's banner now offers Answer/Decline instead of
+    attaching to an already-live call.
+33. **FIXED — blocking a contact had no effect on anything arriving over
+    the network** (§3.9/§3.11). Nothing in `message_receive`'s path read
+    `Contact::blocked`, so a blocked identity's messages were still
+    inserted, its `GroupInvite`s still joined, and its call offers still
+    reached the call registry. `process_one` now drops a blocked
+    contact's envelopes (as `Unprocessable`, so the mailbox entry is
+    deleted rather than pinned).
+34. **FIXED — DHT-sourced key material is now bound to the contact it was
+    fetched for** (§3.5/§3.6). Kademlia here authenticates no records and
+    `get_record` takes the first answer, so any node can publish a prekey
+    bundle or MLS key package under anyone's key hash. `x3dh_initiate`
+    only checks a bundle is internally self-consistent, which a stranger's
+    bundle also is. `message_crypto::bundle_belongs_to` now compares both
+    halves of the fetched bundle's identity against
+    `Contact::identity_public_key`, and `groups::fetch_real_key_package`
+    compares a fetched key package's credential (via
+    `bh_crypto::mls::key_package_identity`) the same way, falling back to
+    the local shadow member rather than committing a substituted leaf.
+    This closes the substitution, not the underlying unauthenticated-DHT
+    problem — see item 36.
+35. **MITIGATED — unknown-sender mailbox entries no longer pin a mailbox
+    open** (§3.6). Entries from senders this profile doesn't know are
+    deliberately retained (so a stranger's first message survives until
+    they're added), but retention was unbounded while `MAX_MANIFEST_BYTES`
+    is not: an attacker cycling throwaway identities could fill a
+    manifest with entries `pull` never prunes and make the victim
+    unreachable for up to the pushed TTL (30 days). Retention is now
+    capped at `MAX_RETAINED_UNKNOWN_SENDER_ENTRIES`; the surplus is
+    deleted.
+36. **MLS credentials are not bound to any identity — group message
+    sender spoofing** (§3.2). `MlsMember::new` accepts arbitrary bytes as
+    a `BasicCredential`, nothing signs that credential with the account's
+    Ed25519 identity key, and `message_receive`'s
+    `find_contact_by_identity_public_key` attributes an incoming group
+    message by comparing exactly those self-asserted bytes. Any member of
+    a group can therefore join claiming another member's identity and have
+    their messages displayed as that person's. MLS delegates credential
+    validation to an Authentication Service; this codebase has none. Item
+    34's key-package check narrows *who can be added as whom* over the
+    real-network path, but does not close this. The fix is a signature
+    over the MLS signature key by the identity key, verified on add and on
+    join — a protocol change, not yet attempted.
+37. **Onion routing, cover traffic, and Eclipse-resistant hop selection
+    are implemented but not wired into any real data path** (§3.4/§3.5).
+    `bh-network::{onion, cover_traffic, eclipse_resistance}` have no
+    caller anywhere in `crates/` or `daemon/` outside their own tests and
+    fuzz targets. Every real send is `Mailbox::push` → `Dht::publish` → a
+    direct libp2p connection, so the node storing a record observes the
+    sender's IP address and the recipient's `recipient_key_hash` at the
+    same moment — enough to reconstruct the social graph, which is
+    precisely the property `CLAUDE.md` names as non-negotiable and §2's
+    own trust-boundary diagram depicts as "sealed sender, onion-routed."
+    §3.4 analyses the Sphinx construction in depth and is accurate about
+    the module; it did not previously state that the module is
+    unreachable. Connecting it is a transport-layer redesign (circuit
+    construction, hop discovery, per-circuit state, and the bandwidth cost
+    of fixed-size packets on every hop), not a patch. **Until that exists,
+    Blackhole should not be described as providing sender-recipient
+    unlinkability against a network-level or mailbox-node observer.**
 
 Two entries deliberately excluded from this list: the `hickory-proto`
 alerts (§3.10) are dormant with no path to becoming live short of

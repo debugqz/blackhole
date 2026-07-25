@@ -49,6 +49,45 @@ pub enum ReceiptKind {
     Read,
 }
 
+/// Which conversation a delegated send or a mirrored message belongs to,
+/// named in terms both devices of one account can agree on.
+///
+/// Deliberately *not* a `conversation_id`: those are locally-generated
+/// UUIDs, so the primary's id for a conversation and the secondary's id
+/// for the same conversation are different strings. `contact_id` is
+/// shared only because `Envelope::ContactSync` mirrors contact rows
+/// verbatim, ids included — that mirroring is what makes this reference
+/// well-defined, not an incidental detail of it. `group_id` needs no such
+/// arrangement: it is the real MLS group id, global by construction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConversationRef {
+    Direct { contact_id: String },
+    Group { group_id: String },
+    SelfNotes,
+}
+
+/// One contact row mirrored from the primary to a linked secondary device
+/// (`Envelope::ContactSync`).
+///
+/// Carries only the contact's *public* identity — there is no session
+/// state, no ratchet material and no prekey here, because a secondary
+/// never encrypts to a contact (see `docs/superpowers/specs/
+/// 2026-07-24-multidevice-delegation-design.md` §3). This exists so the
+/// secondary can render a name and a verification badge instead of a raw
+/// id, and so [`ConversationRef::Direct`] resolves on both sides.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncedContact {
+    pub contact_id: String,
+    pub identity_public_key: Vec<u8>,
+    pub display_name: Option<String>,
+    /// Mirrored rather than recomputed: safety-number verification is a
+    /// human act performed against the *account's* identity, so it belongs
+    /// to the account, not to whichever device happened to perform it.
+    pub verified: bool,
+    pub blocked: bool,
+    pub added_at: i64,
+}
+
 /// One call-signaling message, carried end-to-end alongside (or instead
 /// of) chat content over the same already-authenticated session — see
 /// `docs/SPEC.md` calls section for why signaling reuses this channel
@@ -166,20 +205,79 @@ pub enum Envelope {
     /// identity_agreement_key`) instead of a contact's — a pseudo-`Contact`
     /// built from that `Device` row is all `message_crypto::
     /// send_encrypted_over_network` needs, so no new transport code exists
-    /// for this, only this envelope variant. `peer_contact_id` is who the
-    /// synced message's conversation is *with* (not necessarily who sent
-    /// it — `sender_contact_id` is `None` for a message the primary itself
-    /// sent), letting the receiving device materialize/reuse the right
-    /// local `Direct` conversation via `ensure_direct_conversation`. Scoped
-    /// to `Direct` conversations only for this pass — group/self-notes
-    /// sync over the real network is a follow-up.
+    /// for this, only this envelope variant. `conversation` says which
+    /// conversation the message belongs to in terms both devices agree on
+    /// (see [`ConversationRef`]) — not necessarily who *sent* it, which is
+    /// `sender_contact_id` (`None` for a message the account itself sent,
+    /// from any of its devices). The receiving device materializes or
+    /// reuses the matching local conversation from that reference.
+    ///
+    /// Covers `Direct`, `Group` and `SelfNotes` alike, because under the
+    /// hub model a secondary is never an MLS member of anything: the
+    /// primary decrypts a group message with real MLS state and mirrors
+    /// the resulting plaintext here, exactly as it does for a 1:1 message.
+    /// That is why group sync costs no new subsystem — see the design
+    /// doc's §4.
     DeviceSyncMessage {
         message_id: String,
-        peer_contact_id: String,
+        conversation: ConversationRef,
         sender_contact_id: Option<String>,
         body: Option<String>,
         sent_at: i64,
     },
+    /// A linked secondary device asking its primary to send on its behalf
+    /// (`bh-api::device_delegation`).
+    ///
+    /// This is the load-bearing variant of the hub model: a secondary
+    /// holds no ratchet session with any contact and no MLS state for any
+    /// group, so it cannot encrypt outbound content itself — and must not
+    /// try. Two devices sharing one account's Double Ratchet session would
+    /// each advance `sending_chain_key`/`send_count` independently and
+    /// reuse message keys, which is a cryptographic break rather than a
+    /// synchronization inconvenience (see `ratchet.rs`'s `Session`).
+    /// Delegating the send keeps exactly one device holding that state.
+    ///
+    /// `request_id` is chosen by the secondary and is the idempotency key:
+    /// the primary answers a repeat of an already-processed id with the
+    /// original [`Envelope::OutboundResult`] instead of sending twice, so
+    /// retrying an unacknowledged request is always safe.
+    OutboundRequest {
+        request_id: String,
+        conversation: ConversationRef,
+        body: String,
+        reply_to_message_id: Option<String>,
+    },
+    /// The primary's answer to an [`Envelope::OutboundRequest`].
+    ///
+    /// `error` is `None` on success, and `message_id` then carries the id
+    /// the message really got on the primary, so the secondary can promote
+    /// its local pending row rather than keep a duplicate. A populated
+    /// `error` is a *final* rejection (a broadcast channel the account
+    /// doesn't own, a group it is no longer a member of, a blocked
+    /// contact, a revoked device) — the secondary surfaces it as a failed
+    /// send instead of leaving the message pending forever.
+    OutboundResult {
+        request_id: String,
+        message_id: Option<String>,
+        error: Option<String>,
+    },
+    /// A batch of contact rows mirrored from primary to secondary.
+    ///
+    /// Sent in bounded batches rather than as one list: [`Envelope::encode`]
+    /// pads to size buckets up to 64 KiB and then grows in whole 64 KiB
+    /// blocks, so a single envelope carrying a large contact book would
+    /// both waste padding and risk the DHT record size cap
+    /// `bh-network::mailbox` enforces.
+    ContactSync {
+        contacts: Vec<SyncedContact>,
+    },
+    /// The primary telling a secondary it has been unlinked, so the device
+    /// can stop delegating and explain why it went quiet instead of
+    /// failing silently. Best-effort by nature — a revoked device that is
+    /// offline never receives this, which is precisely why revocation is
+    /// *also* enforced on the primary's own receive path rather than
+    /// relying on the secondary's cooperation.
+    DeviceRevoked,
     /// Ephemeral "is typing…" presence ping (opt-in — see
     /// `bh-api::presence`). Carries no payload beyond the variant tag
     /// itself: there is nothing to persist, nothing to read back later,
@@ -209,7 +307,14 @@ impl Envelope {
         let malformed = || CryptoError::NotImplemented("envelope: malformed payload");
         let real_len_bytes: [u8; 4] = bytes.get(..4).ok_or_else(malformed)?.try_into().unwrap();
         let real_len = u32::from_be_bytes(real_len_bytes) as usize;
-        let json = bytes.get(4..4 + real_len).ok_or_else(malformed)?;
+        // `real_len` is attacker/sender-declared (the sending device chose
+        // these bytes, and a compromised or malicious contact's client can
+        // send anything a successfully-decrypted ciphertext contains) — a
+        // declared length near `u32::MAX` must not be allowed to overflow
+        // `4 + real_len` (`checked_add` rather than `+`, which would wrap on
+        // a 32-bit target), same reasoning as `push_relay.rs::read_string`.
+        let end = 4usize.checked_add(real_len).ok_or_else(malformed)?;
+        let json = bytes.get(4..end).ok_or_else(malformed)?;
         serde_json::from_slice(json).map_err(|_| malformed())
     }
 }
@@ -217,6 +322,18 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the overflow guard in `decode`: a maliciously
+    /// huge declared length must be rejected cleanly (not panic via
+    /// `4 + real_len` overflowing `usize`), matching `push_relay.rs`'s own
+    /// `a_huge_declared_length_is_rejected_not_a_panic`.
+    #[test]
+    fn a_huge_declared_length_is_rejected_not_a_panic() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.extend_from_slice(b"way too short to satisfy that length");
+        assert!(Envelope::decode(&bytes).is_err());
+    }
 
     #[test]
     fn text_envelope_roundtrips() {
@@ -227,6 +344,132 @@ mod tests {
         let decoded = Envelope::decode(&env.encode().unwrap()).unwrap();
         matches!(decoded, Envelope::Text { body, reply_to_message_id }
             if body == "hello" && reply_to_message_id == Some("m0".to_string()));
+    }
+
+    #[test]
+    fn outbound_request_roundtrips_for_every_conversation_kind() {
+        for conversation in [
+            ConversationRef::Direct {
+                contact_id: "c1".into(),
+            },
+            ConversationRef::Group {
+                group_id: "abcdef".into(),
+            },
+            ConversationRef::SelfNotes,
+        ] {
+            let env = Envelope::OutboundRequest {
+                request_id: "req-1".into(),
+                conversation: conversation.clone(),
+                body: "sent from my phone".into(),
+                reply_to_message_id: None,
+            };
+            let bytes = env.encode().unwrap();
+            let Envelope::OutboundRequest {
+                request_id,
+                conversation: decoded,
+                body,
+                ..
+            } = Envelope::decode(&bytes).unwrap()
+            else {
+                panic!("expected OutboundRequest variant");
+            };
+            assert_eq!(request_id, "req-1");
+            assert_eq!(decoded, conversation);
+            assert_eq!(body, "sent from my phone");
+        }
+    }
+
+    #[test]
+    fn outbound_result_roundtrips_both_success_and_failure() {
+        let ok = Envelope::OutboundResult {
+            request_id: "req-1".into(),
+            message_id: Some("m-7".into()),
+            error: None,
+        };
+        let Envelope::OutboundResult {
+            message_id, error, ..
+        } = Envelope::decode(&ok.encode().unwrap()).unwrap()
+        else {
+            panic!("expected OutboundResult variant");
+        };
+        assert_eq!(message_id, Some("m-7".to_string()));
+        assert!(error.is_none());
+
+        let failed = Envelope::OutboundResult {
+            request_id: "req-2".into(),
+            message_id: None,
+            error: Some("broadcast channel: only the owner may post".into()),
+        };
+        let Envelope::OutboundResult { error, .. } =
+            Envelope::decode(&failed.encode().unwrap()).unwrap()
+        else {
+            panic!("expected OutboundResult variant");
+        };
+        assert!(error.unwrap().contains("only the owner may post"));
+    }
+
+    #[test]
+    fn contact_sync_roundtrips() {
+        let env = Envelope::ContactSync {
+            contacts: vec![SyncedContact {
+                contact_id: "c1".into(),
+                identity_public_key: vec![4u8; 64],
+                display_name: Some("Ana".into()),
+                verified: true,
+                blocked: false,
+                added_at: 1_700_000_000,
+            }],
+        };
+        let Envelope::ContactSync { contacts } = Envelope::decode(&env.encode().unwrap()).unwrap()
+        else {
+            panic!("expected ContactSync variant");
+        };
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].contact_id, "c1");
+        assert!(contacts[0].verified);
+        assert_eq!(contacts[0].identity_public_key, vec![4u8; 64]);
+    }
+
+    /// A delegated send must not be identifiable *as* a delegated send
+    /// from ciphertext length alone — otherwise a mailbox operator could
+    /// infer "this account has a second device" from traffic shape, which
+    /// is precisely the metadata the hub model avoids leaking by not
+    /// publishing a device directory at all.
+    ///
+    /// The property that actually holds is bucket-level, not byte-level:
+    /// an `OutboundRequest` carries two real UUIDs of routing metadata on
+    /// top of the body, so with an *identical* body it lands one bucket
+    /// higher than a bare `Text` would. What matters is that it lands on
+    /// the same bucket ladder every other variant uses, so its size is
+    /// always also the size of some perfectly ordinary message — checked
+    /// here by producing a byte-for-byte length match against a `Text`
+    /// whose body is merely a bit longer. Same caveat the module doc
+    /// already states for bucketing in general: this collapses lengths
+    /// into a handful of classes, it does not make them constant.
+    #[test]
+    fn a_delegated_send_is_indistinguishable_from_some_ordinary_message() {
+        let body = "the quick brown fox jumps over the lazy dog";
+        let delegated = Envelope::OutboundRequest {
+            request_id: "00000000-0000-0000-0000-000000000000".into(),
+            conversation: ConversationRef::Direct {
+                contact_id: "00000000-0000-0000-0000-000000000000".into(),
+            },
+            body: body.into(),
+            reply_to_message_id: None,
+        }
+        .encode()
+        .unwrap();
+
+        let ordinary = Envelope::Text {
+            body: body.repeat(3),
+            reply_to_message_id: Some("00000000-0000-0000-0000-000000000000".into()),
+        }
+        .encode()
+        .unwrap();
+
+        assert_eq!(delegated.len(), ordinary.len());
+        // And it is on the shared ladder, not some delegation-specific size.
+        assert!(SIZE_BUCKETS.contains(&delegated.len()));
     }
 
     #[test]
@@ -355,7 +598,9 @@ mod tests {
     fn device_sync_message_envelope_roundtrips() {
         let env = Envelope::DeviceSyncMessage {
             message_id: "m1".into(),
-            peer_contact_id: "contact-a".into(),
+            conversation: ConversationRef::Direct {
+                contact_id: "contact-a".into(),
+            },
             sender_contact_id: Some("contact-a".into()),
             body: Some("hi".into()),
             sent_at: 1234,
@@ -363,7 +608,7 @@ mod tests {
         let bytes = env.encode().unwrap();
         let Envelope::DeviceSyncMessage {
             message_id,
-            peer_contact_id,
+            conversation,
             sender_contact_id,
             body,
             sent_at,
@@ -372,7 +617,12 @@ mod tests {
             panic!("expected DeviceSyncMessage variant");
         };
         assert_eq!(message_id, "m1");
-        assert_eq!(peer_contact_id, "contact-a");
+        assert_eq!(
+            conversation,
+            ConversationRef::Direct {
+                contact_id: "contact-a".to_string()
+            }
+        );
         assert_eq!(sender_contact_id, Some("contact-a".to_string()));
         assert_eq!(body, Some("hi".to_string()));
         assert_eq!(sent_at, 1234);

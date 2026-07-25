@@ -114,8 +114,19 @@ pub struct GroupRegistry {
     /// gets re-attempted once and (for anything already processed) fails
     /// harmlessly against `openmls`'s own per-epoch/per-generation replay
     /// protection, the same as it would mid-session.
-    seen_group_mailbox_ids: Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
+    /// Bounded by [`MAX_SEEN_GROUP_MAILBOX_IDS`] — see
+    /// `mark_group_message_attempted`.
+    seen_group_mailbox_ids: Mutex<HashMap<String, indexmap::IndexSet<Vec<u8>>>>,
 }
+
+/// How many attempted group-mailbox ids to remember per group. This set is
+/// pure de-duplication bookkeeping with no correctness role (re-attempting
+/// a forgotten entry is wasted work, not a wrong result — see the field's
+/// own doc), but it used to grow for the whole daemon's lifetime with one
+/// entry per group message ever seen. Bounded and evicted oldest-first, so
+/// the entries retained are the recent ones a tick is actually likely to
+/// re-encounter.
+const MAX_SEEN_GROUP_MAILBOX_IDS: usize = 2048;
 
 impl GroupRegistry {
     /// `true` if `message_id` was already attempted for `group_id` this
@@ -133,12 +144,12 @@ impl GroupRegistry {
     }
 
     pub(crate) fn mark_group_message_attempted(&self, group_id: &str, message_id: Vec<u8>) {
-        self.seen_group_mailbox_ids
-            .lock()
-            .expect(LOCK_POISON_MSG)
-            .entry(group_id.to_string())
-            .or_default()
-            .insert(message_id);
+        let mut seen = self.seen_group_mailbox_ids.lock().expect(LOCK_POISON_MSG);
+        let per_group = seen.entry(group_id.to_string()).or_default();
+        per_group.insert(message_id);
+        while per_group.len() > MAX_SEEN_GROUP_MAILBOX_IDS {
+            per_group.shift_remove_index(0);
+        }
     }
 
     /// Caches a just-joined group's own member/live state in-process —
@@ -317,6 +328,30 @@ async fn fetch_real_key_package(
             .await
             .ok()
             .flatten()?;
+
+    // The DHT is an unauthenticated store: any node can publish any record
+    // under any key, and `get_record` takes the first answer it gets. So a
+    // key package fetched under this contact's key hash is only a *claim*
+    // that it belongs to them until it's checked against the identity this
+    // profile already trusts. Without this, anyone could substitute their
+    // own key package for a contact's and get themselves committed into
+    // the group as that contact's leaf — at minimum breaking the real
+    // contact's ability to ever join (the `Welcome` would be encrypted to
+    // a key package they don't hold the private half of).
+    //
+    // `create_group`/`add_shadow_contact_to_live_group` use the full
+    // 64-byte `identity_public_key` as an MLS credential identity, which
+    // is exactly what this compares against.
+    let claimed_identity = bh_crypto::mls::key_package_identity(&key_package_bytes).ok()?;
+    if claimed_identity != contact.identity_public_key {
+        tracing::warn!(
+            contact_id = %contact.contact_id,
+            "fetched MLS key package claims a different identity than this contact — \
+             refusing it and falling back to the local shadow member"
+        );
+        return None;
+    }
+
     Some((contact, key_package_bytes))
 }
 

@@ -10,9 +10,14 @@
 //! mailbox operator sees identical-looking ciphertext either way (see
 //! `envelope.rs`'s module doc). The receiving daemon's own
 //! `message_receive.rs` loop decrypts it and dispatches into
-//! [`handle_incoming_call_signal`], which answers automatically and
-//! pushes the `Answer` back the same way; a `Hangup` signal travels the
-//! same path from either side. `POST /calls`'s `contact_id` is optional —
+//! [`handle_incoming_call_signal`], which records it as *ringing* and
+//! stops there — answering it (and only then wiring the microphone and
+//! pushing the `Answer` back the same way) requires an explicit
+//! [`answer_ringing_call`] call, i.e. a real user action. It used to
+//! auto-accept instead, which meant any contact could open this machine's
+//! microphone with no ring, no prompt, and no way to notice; see
+//! [`CallRegistry::ringing`]. A `Hangup` signal travels the same path from
+//! either side, and also cancels a pending ring. `POST /calls`'s `contact_id` is optional —
 //! omitting it (or no live `state.network`) keeps the older
 //! same-daemon/manual-ferry behavior (`accept_call`/`complete_call`
 //! consuming a signal a client copied over HTTP itself), which the
@@ -142,7 +147,34 @@ pub struct CallRegistry {
     /// uses this to know who to notify, without threading a `Contact`
     /// through every handler.
     network_peers: Mutex<HashMap<String, Contact>>,
+    /// Incoming network call offers that have arrived but which the user
+    /// has **not** yet answered. This map is the whole reason
+    /// [`handle_incoming_call_signal`] no longer connects media on
+    /// arrival: an `Offer` is a request from a remote party, and honoring
+    /// it immediately meant any contact could open this machine's
+    /// microphone with no ring, no prompt, and no UI state to notice it
+    /// by (the client only learned about the call from a *poll* of
+    /// `GET /calls/network`, by which point audio was already flowing).
+    /// Offers land here instead, and only
+    /// [`answer_ringing_call`] — driven by an explicit user action —
+    /// performs the WebRTC accept and wires hardware.
+    ringing: Mutex<HashMap<String, RingingCall>>,
 }
+
+/// One not-yet-answered incoming call offer (see [`CallRegistry::ringing`]).
+struct RingingCall {
+    offer: CallSignal,
+    contact: Contact,
+    video: bool,
+    received_at: i64,
+}
+
+/// How many unanswered offers to hold at once. Bounded because an offer
+/// costs a remote caller almost nothing to send and this map would
+/// otherwise grow for the daemon's whole lifetime; past the cap the
+/// oldest offer is evicted, so a flood can bury *older* rings but can't
+/// exhaust memory.
+const MAX_RINGING_CALLS: usize = 16;
 
 impl CallRegistry {
     /// The stream sender for `call_id`, if it's currently live — every
@@ -202,6 +234,13 @@ impl CallRegistry {
             handle.capture_task.abort();
         }
     }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before 1970")
+        .as_secs() as i64
 }
 
 fn to_status(err: bh_calls::CallError) -> StatusCode {
@@ -428,50 +467,35 @@ pub(crate) async fn handle_incoming_call_signal(
     signal: CallSignal,
 ) {
     match &signal {
-        CallSignal::Offer { .. } => {
-            let (session, sframe, answer) = match session::accept_incoming_call(&signal).await {
-                Ok(result) => result,
-                Err(err) => {
-                    tracing::warn!(%err, "failed to accept an incoming network call offer");
-                    return;
-                }
-            };
-            let session = Arc::new(session);
-            let call_id = session.call_id.clone();
-
-            let tx = state.calls.create_stream(&call_id).await;
-            let audio_handle =
-                wire_live_media(&session, sframe, bh_calls::signaling::CALLER_SENDER_TAG, tx);
-            if let Some(audio_handle) = audio_handle {
-                state
-                    .calls
-                    .audio_handles
-                    .lock()
-                    .await
-                    .insert(call_id.clone(), audio_handle);
-            }
-            state
-                .calls
-                .record_event(&call_id, call_stream::CallEvent::Connected)
-                .await;
-            state
-                .calls
-                .active
-                .lock()
-                .await
-                .insert(call_id.clone(), session);
-            state
-                .calls
-                .network_peers
-                .lock()
-                .await
-                .insert(call_id, contact.clone());
-
-            if let Some(network) = state.network.as_ref() {
-                if let Err(err) = send_call_signal(state, network, contact, answer).await {
-                    tracing::warn!(?err, "failed to send call answer back over the network");
+        CallSignal::Offer { call_id, video, .. } => {
+            // Deliberately does *not* accept the call or touch any audio/
+            // video hardware — see `CallRegistry::ringing`. Answering is a
+            // user decision, so all this does is record that someone is
+            // ringing; `answer_ringing_call` is what actually connects.
+            let call_id = call_id.clone();
+            let mut ringing = state.calls.ringing.lock().await;
+            if ringing.len() >= MAX_RINGING_CALLS && !ringing.contains_key(&call_id) {
+                // Evict the oldest rather than refusing the newest: a
+                // flood of stale offers shouldn't make the *current* ring
+                // undeliverable.
+                if let Some(oldest) = ringing
+                    .iter()
+                    .min_by_key(|(_, r)| r.received_at)
+                    .map(|(id, _)| id.clone())
+                {
+                    ringing.remove(&oldest);
                 }
             }
+            ringing.insert(
+                call_id.clone(),
+                RingingCall {
+                    offer: signal.clone(),
+                    contact: contact.clone(),
+                    video: *video,
+                    received_at: now(),
+                },
+            );
+            tracing::info!(%call_id, contact_id = %contact.contact_id, "incoming call ringing");
         }
         CallSignal::Answer { call_id, .. } => {
             let call_id = call_id.clone();
@@ -519,6 +543,10 @@ pub(crate) async fn handle_incoming_call_signal(
             }
             state.calls.pending_outgoing.lock().await.remove(&call_id);
             state.calls.network_peers.lock().await.remove(&call_id);
+            // A caller who gives up before we answer must stop the ring
+            // too, otherwise a dead offer stays listed as ringing until
+            // it's evicted by `MAX_RINGING_CALLS`.
+            state.calls.ringing.lock().await.remove(&call_id);
         }
         CallSignal::GroupOffer { .. }
         | CallSignal::GroupAnswer { .. }
@@ -569,14 +597,11 @@ pub struct NetworkCallSummary {
 
 /// Every currently-active call that has a real network peer attached
 /// (`network_peers` — populated for both an outgoing `start_call` with a
-/// `contact_id` and an incoming `Offer` handled by
-/// `handle_incoming_call_signal`). There's no separate "ringing, not yet
-/// answered" state today — `handle_incoming_call_signal` auto-accepts an
-/// incoming offer immediately (see its own doc comment) — so this is
-/// deliberately minimal: a client polls it to notice "a call with this
-/// contact just went live" and surface *some* visibility, not a full
-/// pre-accept ringing UI. A client that already knows about a given
-/// `call_id` (e.g. one it placed itself) just ignores that entry.
+/// `contact_id` and an incoming offer the user answered via
+/// [`answer_ringing_call`]). Calls listed here are already *connected*;
+/// offers that haven't been answered yet live in [`list_ringing_calls`]
+/// instead. A client that already knows about a given `call_id` (e.g. one
+/// it placed itself) just ignores that entry.
 pub async fn list_network_calls(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<NetworkCallSummary>> {
@@ -591,6 +616,120 @@ pub async fn list_network_calls(
         })
         .collect();
     Json(calls)
+}
+
+#[derive(Serialize)]
+pub struct RingingCallSummary {
+    pub call_id: String,
+    pub contact_id: String,
+    pub video: bool,
+    pub received_at: i64,
+}
+
+/// Incoming call offers that have arrived over the network and are waiting
+/// for the user to answer or decline. Nothing here has touched the
+/// microphone, the camera, or WebRTC — see [`CallRegistry::ringing`].
+pub async fn list_ringing_calls(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<RingingCallSummary>> {
+    let ringing = state.calls.ringing.lock().await;
+    let mut calls: Vec<RingingCallSummary> = ringing
+        .iter()
+        .map(|(call_id, r)| RingingCallSummary {
+            call_id: call_id.clone(),
+            contact_id: r.contact.contact_id.clone(),
+            video: r.video,
+            received_at: r.received_at,
+        })
+        .collect();
+    calls.sort_by_key(|c| c.received_at);
+    Json(calls)
+}
+
+/// Answers a ringing call: **this** is where an incoming offer finally
+/// becomes a live WebRTC session with real microphone capture, and it
+/// only ever runs because a user asked for it. Completes the handshake,
+/// wires media, and pushes the `Answer` back over the caller's mailbox.
+pub async fn answer_ringing_call(
+    State(state): State<Arc<AppState>>,
+    Path(call_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let ringing = state
+        .calls
+        .ringing
+        .lock()
+        .await
+        .remove(&call_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let (session, sframe, answer) = session::accept_incoming_call(&ringing.offer)
+        .await
+        .map_err(to_status)?;
+    let session = Arc::new(session);
+
+    let tx = state.calls.create_stream(&call_id).await;
+    let audio_handle =
+        wire_live_media(&session, sframe, bh_calls::signaling::CALLER_SENDER_TAG, tx);
+    if let Some(audio_handle) = audio_handle {
+        state
+            .calls
+            .audio_handles
+            .lock()
+            .await
+            .insert(call_id.clone(), audio_handle);
+    }
+    state
+        .calls
+        .record_event(&call_id, call_stream::CallEvent::Connected)
+        .await;
+    state
+        .calls
+        .active
+        .lock()
+        .await
+        .insert(call_id.clone(), session);
+    state
+        .calls
+        .network_peers
+        .lock()
+        .await
+        .insert(call_id, ringing.contact.clone());
+
+    if let Some(network) = state.network.as_ref() {
+        if let Err(err) = send_call_signal(&state, network, &ringing.contact, answer).await {
+            tracing::warn!(?err, "failed to send call answer back over the network");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Declines a ringing call: drops the offer without ever accepting it, and
+/// best-effort tells the caller to stop ringing. No media is ever wired,
+/// so there is nothing to tear down locally.
+pub async fn decline_ringing_call(
+    State(state): State<Arc<AppState>>,
+    Path(call_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let ringing = state
+        .calls
+        .ringing
+        .lock()
+        .await
+        .remove(&call_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if let Some(network) = state.network.as_ref() {
+        let hangup = CallSignal::Hangup {
+            call_id: call_id.clone(),
+        };
+        if let Err(err) = send_call_signal(&state, network, &ringing.contact, hangup).await {
+            tracing::debug!(
+                ?err,
+                "failed to notify the caller that the call was declined"
+            );
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

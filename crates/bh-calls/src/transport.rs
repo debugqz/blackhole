@@ -8,11 +8,28 @@
 //! STUN is wired in via [`default_ice_servers`] (a public server by
 //! default, configurable via `BLACKHOLE_STUN_SERVERS`). TURN is now
 //! configurable too, via `BLACKHOLE_TURN_SERVERS` (comma-separated
-//! `turn:`/`turns:` URLs) plus `BLACKHOLE_TURN_USERNAME`/
-//! `BLACKHOLE_TURN_CREDENTIAL` — but no TURN server is deployed for this
-//! project, so unless an operator sets all three, a symmetric NAT on
-//! either side still won't connect; STUN alone only resolves the more
-//! common NAT types.
+//! `turn:`/`turns:` URLs) plus one of two credential schemes — but no TURN
+//! server is deployed for this project, so unless an operator sets one of
+//! them, a symmetric NAT on either side still won't connect; STUN alone
+//! only resolves the more common NAT types.
+//!
+//! - `BLACKHOLE_TURN_USERNAME`/`BLACKHOLE_TURN_CREDENTIAL`: one fixed
+//!   long-term-credential pair (coturn's `lt-cred-mech`). Simple, but a
+//!   leaked credential is leaked forever until an operator rotates it and
+//!   restarts every daemon.
+//! - `BLACKHOLE_TURN_AUTH_SECRET`: coturn's TURN REST API scheme
+//!   (`use-auth-secret`/`static-auth-secret` on the coturn side) instead —
+//!   a shared secret never leaves this process; what actually goes out on
+//!   the wire to the ICE-server config is a fresh `username`/`credential`
+//!   pair per call, time-limited (`BLACKHOLE_TURN_CREDENTIAL_TTL_SECS`,
+//!   default 24h) via HMAC-SHA1 over an expiry-embedding username, exactly
+//!   as coturn's own REST API spec defines it (HMAC-SHA1 because that's
+//!   what coturn interop requires, not a choice made here — same "audited
+//!   primitive composition" pattern `bh-crypto::webhook.rs` already uses
+//!   for HMAC-SHA256). Preferred when available: closes the "a leaked
+//!   credential is leaked forever" gap `infra/README.md`'s TURN section
+//!   used to call out as needing a code change first — this is that
+//!   change. Takes priority over the static pair if both are set.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -62,17 +79,101 @@ fn parse_url_list(env_var: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Default TTL for a `BLACKHOLE_TURN_AUTH_SECRET`-derived credential
+/// (seconds) when `BLACKHOLE_TURN_CREDENTIAL_TTL_SECS` isn't set —
+/// generous since a fresh credential is minted per [`default_ice_servers`]
+/// call (i.e. per connection) rather than reused across many calls, so
+/// this only needs to outlast one call's duration, not a long-lived
+/// session.
+const DEFAULT_TURN_CREDENTIAL_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Builds a coturn TURN-REST-API username: `"<expiry-unix-ts>"`, or
+/// `"<expiry-unix-ts>:<user_label>"` when a non-empty label is given —
+/// exactly the format coturn's `use-auth-secret` mode expects to find the
+/// embedded expiry in.
+fn ephemeral_turn_username(user_label: &str, ttl_secs: u64) -> String {
+    let expiry_unix_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(ttl_secs);
+    if user_label.is_empty() {
+        expiry_unix_secs.to_string()
+    } else {
+        format!("{expiry_unix_secs}:{user_label}")
+    }
+}
+
+/// The credential half of coturn's TURN REST API scheme:
+/// `base64(HMAC-SHA1(secret, username))`. coturn recomputes this same
+/// value from its own `static-auth-secret` and the username the client
+/// presented — matching confirms both the credential is authentic *and*
+/// (by checking the embedded expiry) not stale, without the secret itself
+/// ever having to leave this process.
+fn ephemeral_turn_credential(secret: &str, username: &str) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    type HmacSha1 = Hmac<Sha1>;
+
+    let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(username.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// Resolves which of the two TURN credential schemes documented on this
+/// module is configured, if either — see the module doc for
+/// `BLACKHOLE_TURN_AUTH_SECRET` vs
+/// `BLACKHOLE_TURN_USERNAME`/`BLACKHOLE_TURN_CREDENTIAL`. Returns `None`
+/// (after a `tracing::warn!`) when neither scheme is fully configured, so
+/// [`default_ice_servers`] doesn't build a TURN config `webrtc-rs` would
+/// reject at connection time with a much less obvious error. Only called
+/// once `BLACKHOLE_TURN_SERVERS` itself is known to be non-empty.
+fn resolve_turn_credentials() -> Option<(String, String)> {
+    let auth_secret = std::env::var("BLACKHOLE_TURN_AUTH_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let username_env = std::env::var("BLACKHOLE_TURN_USERNAME").unwrap_or_default();
+    let static_credential = std::env::var("BLACKHOLE_TURN_CREDENTIAL").unwrap_or_default();
+
+    if let Some(secret) = auth_secret {
+        if !static_credential.is_empty() {
+            tracing::warn!(
+                "both BLACKHOLE_TURN_AUTH_SECRET and BLACKHOLE_TURN_CREDENTIAL are set — \
+                 using ephemeral REST-API credentials derived from BLACKHOLE_TURN_AUTH_SECRET \
+                 and ignoring the static BLACKHOLE_TURN_CREDENTIAL"
+            );
+        }
+        let ttl_secs = std::env::var("BLACKHOLE_TURN_CREDENTIAL_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TURN_CREDENTIAL_TTL_SECS);
+        let username = ephemeral_turn_username(&username_env, ttl_secs);
+        let credential = ephemeral_turn_credential(&secret, &username);
+        return Some((username, credential));
+    }
+
+    if username_env.is_empty() || static_credential.is_empty() {
+        tracing::warn!(
+            "BLACKHOLE_TURN_SERVERS is set but neither BLACKHOLE_TURN_AUTH_SECRET nor a \
+             complete BLACKHOLE_TURN_USERNAME/_CREDENTIAL pair is — skipping TURN, calls \
+             will only work for NAT types STUN alone can traverse"
+        );
+        return None;
+    }
+
+    Some((username_env, static_credential))
+}
+
 /// Default ICE server list: `BLACKHOLE_STUN_SERVERS` (comma-separated
 /// `stun:host:port` URLs) if set, otherwise a single public STUN server
 /// (Google's, widely used as a default by other WebRTC apps — no account
 /// or credentials needed for STUN, unlike TURN). A second `RTCIceServer`
 /// entry for TURN is appended when `BLACKHOLE_TURN_SERVERS` (comma-
-/// separated `turn:`/`turns:` URLs) *and* both `BLACKHOLE_TURN_USERNAME`/
-/// `BLACKHOLE_TURN_CREDENTIAL` are set — all three are required together
-/// (a TURN entry with urls but no credentials would otherwise fail later,
-/// inside `webrtc-rs`'s own `RTCIceServer::validate()`, with a much less
-/// obvious error at connection time, so this checks it upfront and warns
-/// instead).
+/// separated `turn:`/`turns:` URLs) is set *and* [`resolve_turn_credentials`]
+/// finds one of the two credential schemes documented on this module fully
+/// configured — see the module doc for `BLACKHOLE_TURN_AUTH_SECRET` vs
+/// `BLACKHOLE_TURN_USERNAME`/`BLACKHOLE_TURN_CREDENTIAL`.
 pub fn default_ice_servers() -> Vec<webrtc::ice_transport::ice_server::RTCIceServer> {
     use webrtc::ice_transport::ice_server::RTCIceServer;
 
@@ -92,15 +193,7 @@ pub fn default_ice_servers() -> Vec<webrtc::ice_transport::ice_server::RTCIceSer
 
     let turn_urls = parse_url_list("BLACKHOLE_TURN_SERVERS");
     if !turn_urls.is_empty() {
-        let username = std::env::var("BLACKHOLE_TURN_USERNAME").unwrap_or_default();
-        let credential = std::env::var("BLACKHOLE_TURN_CREDENTIAL").unwrap_or_default();
-        if username.is_empty() || credential.is_empty() {
-            tracing::warn!(
-                "BLACKHOLE_TURN_SERVERS is set but BLACKHOLE_TURN_USERNAME/_CREDENTIAL are \
-                 missing — skipping TURN, calls will only work for NAT types STUN alone can \
-                 traverse"
-            );
-        } else {
+        if let Some((username, credential)) = resolve_turn_credentials() {
             servers.push(RTCIceServer {
                 urls: turn_urls,
                 username,
@@ -387,6 +480,92 @@ mod tests {
 
         let servers = default_ice_servers();
         assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn default_ice_servers_uses_ephemeral_rest_credentials_when_auth_secret_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _stun = EnvVarGuard::set("BLACKHOLE_STUN_SERVERS", "stun:stun.example:3478");
+        let _turn_urls = EnvVarGuard::set("BLACKHOLE_TURN_SERVERS", "turn:turn.example:3478");
+        let _secret = EnvVarGuard::set("BLACKHOLE_TURN_AUTH_SECRET", "top-secret");
+        let _label = EnvVarGuard::set("BLACKHOLE_TURN_USERNAME", "blackhole");
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var("BLACKHOLE_TURN_CREDENTIAL");
+            std::env::remove_var("BLACKHOLE_TURN_CREDENTIAL_TTL_SECS");
+        }
+
+        let servers = default_ice_servers();
+        assert_eq!(servers.len(), 2);
+        let turn = &servers[1];
+        assert_eq!(turn.urls, vec!["turn:turn.example:3478"]);
+
+        let (expiry_str, label) = turn
+            .username
+            .split_once(':')
+            .expect("username must embed expiry:label");
+        assert_eq!(label, "blackhole");
+        let expiry: u64 = expiry_str.parse().expect("expiry must be a unix timestamp");
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(expiry > now, "expiry must be in the future");
+        assert!(
+            expiry <= now + DEFAULT_TURN_CREDENTIAL_TTL_SECS + 5,
+            "expiry must respect the default TTL"
+        );
+
+        let expected_credential = ephemeral_turn_credential("top-secret", &turn.username);
+        assert_eq!(turn.credential, expected_credential);
+    }
+
+    #[test]
+    fn default_ice_servers_prefers_auth_secret_over_a_static_credential_when_both_are_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _stun = EnvVarGuard::set("BLACKHOLE_STUN_SERVERS", "stun:stun.example:3478");
+        let _turn_urls = EnvVarGuard::set("BLACKHOLE_TURN_SERVERS", "turn:turn.example:3478");
+        let _secret = EnvVarGuard::set("BLACKHOLE_TURN_AUTH_SECRET", "top-secret");
+        let _user = EnvVarGuard::set("BLACKHOLE_TURN_USERNAME", "alice");
+        let _cred = EnvVarGuard::set("BLACKHOLE_TURN_CREDENTIAL", "s3cret-static");
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::remove_var("BLACKHOLE_TURN_CREDENTIAL_TTL_SECS") };
+
+        let servers = default_ice_servers();
+        assert_eq!(servers.len(), 2);
+        assert_ne!(
+            servers[1].credential, "s3cret-static",
+            "must not fall back to the static credential when the auth secret is present"
+        );
+    }
+
+    #[test]
+    fn ephemeral_turn_username_embeds_expiry_and_optional_label() {
+        let without_label = ephemeral_turn_username("", 60);
+        assert!(!without_label.contains(':'));
+        without_label
+            .parse::<u64>()
+            .expect("must be a bare unix timestamp");
+
+        let with_label = ephemeral_turn_username("alice", 60);
+        let (expiry_str, label) = with_label.split_once(':').unwrap();
+        assert_eq!(label, "alice");
+        expiry_str
+            .parse::<u64>()
+            .expect("prefix must be a unix timestamp");
+    }
+
+    #[test]
+    fn ephemeral_turn_credential_is_a_deterministic_hmac_sha1_of_the_username() {
+        let a = ephemeral_turn_credential("secret", "1234567890:alice");
+        let b = ephemeral_turn_credential("secret", "1234567890:alice");
+        assert_eq!(a, b, "same inputs must produce the same credential");
+
+        let different = ephemeral_turn_credential("secret", "1234567890:bob");
+        assert_ne!(
+            a, different,
+            "different usernames must produce different credentials"
+        );
     }
 
     async fn wait_connected(pc: &Arc<RTCPeerConnection>) {

@@ -480,7 +480,9 @@ no-negociables (§2.2, CLAUDE.md).
    un secreto de 32 bytes vía la extensión PRF de WebAuthn (hardware —
    Secure Enclave/TPM/llave de seguridad — no algo que tenga que vivir
    legible en el keystore del SO), y el shell Tauri no lanza el proceso
-   del daemon hasta tener ese secreto, pasándolo como `BLACKHOLE_DB_PIN`.
+   del daemon hasta tener ese secreto, escribiéndolo en la stdin del
+   proceso hijo (no como variable de entorno: el entorno de un proceso lo
+   puede leer cualquier otro proceso del mismo usuario).
    TOTP se investigó y se descartó deliberadamente para este camino
    específico — un secreto TOTP tiene que ser legible por el cliente para
    verificar un código sin la base abierta, lo que lo vuelve tan expuesto
@@ -635,6 +637,78 @@ para el análisis STRIDE completo.
     no aparece en `ps aux`/`docker inspect`/`docker top` del host —
     hardening de despliegue, no cambia el hecho ya aceptado de que es una
     credencial estática, no efímera (`infra/README.md`).
+
+---
+
+## 19. Multi-dispositivo real por delegación (post-§18)
+
+Hasta esta ronda, "multi-dispositivo" era una ceremonia de enlace que no
+dejaba rastro: `finish_link` negociaba una identidad de dispositivo real,
+la devolvía en la respuesta HTTP y la descartaba. Un daemon genuinamente
+separado terminaba de enlazarse sin identidad propia, sin saber que era un
+secundario y sin manera de direccionar al primario — y como el receive
+loop consulta el buzón de `own_identity`, ese daemon no escuchaba nada.
+
+**El bloqueo real no era el buzón.** `crates/bh-api/src/device_link.rs`
+lo documentaba como una carrera: el buzón `Direct` es
+delete-on-read/single-consumer, así que dos daemons con la misma identidad
+se pisan al hacer `pull`. Eso es cierto y tiene solución conocida dentro
+de este mismo repo (los grupos ya la usan: nunca borrar, cursor por
+consumidor). El problema grande está una capa más abajo, en
+`bh_crypto::ratchet::Session`: el Double Ratchet es estado mutable de
+avance monótono. En recepción, dos dispositivos convergen. **En envío no**
+— si uno cifra, avanza `sending_chain_key`/`send_count`, el otro no se
+entera, y su siguiente envío reutiliza la misma posición del ratchet. Eso
+es reutilización de clave de mensaje, una rotura criptográfica, no una
+molestia de sincronización.
+
+**Modelo elegido: hub.** Una cuenta = una identidad, y vive solo en el
+primario. El secundario tiene identidad propia de dispositivo, nunca
+instala la de la cuenta, y para enviar le pide al primario que envíe por
+él (`Envelope::OutboundRequest` → `Envelope::OutboundResult`). El primario
+es el único que toca sesiones de ratchet de contactos y estado MLS de
+grupos.
+
+- **Direccionamiento, sin inventar nada.** La identidad de la cuenta *es*
+  la dirección del primario, porque es el único dispositivo que la tiene;
+  el secundario ya la recibe al enlazarse y el primario ya publica su
+  bundle de prekeys. En sentido inverso, `device_sync` ya direccionaba un
+  dispositivo enlazado por `Device.public_key || identity_agreement_key`.
+- **Cero metadata nueva expuesta.** No hay directorio de dispositivos
+  firmado, así que desde afuera una cuenta con cinco dispositivos es
+  indistinguible de una con uno. El modelo alternativo (sesiones por
+  dispositivo, estilo Signal) hace observable el número de dispositivos y
+  multiplica copias de ciphertext — se descarta explícitamente, ver
+  `docs/THREAT_MODEL.md` §3.16.
+- **Los grupos salen gratis.** El secundario nunca es miembro MLS de
+  nada: el primario descifra con MLS real y le espeja el texto. `Group`
+  y `SelfNotes` pasan a ser el mismo mecanismo que `Direct`.
+- **Idempotencia contra la base de datos.** El `request_id` del
+  secundario *es* el `message_id` que usa el primario, así que un
+  reintento encuentra el mensaje y re-informa el resultado en vez de
+  enviar dos veces — y eso sobrevive a un reinicio de cualquiera de los
+  dos lados. Un fallo transitorio de red deliberadamente no se responde
+  (una respuesta con error es final), y el secundario reintenta solo.
+- **Autorización, no confianza implícita.** Un `OutboundRequest` solo se
+  honra si viene de una fila `devices` propia y no revocada: ser un
+  contacto conocido no alcanza, o cualquiera podría hacer que tu daemon
+  enviara mensajes en tu nombre. Simétricamente, el estado espejado
+  (contactos, mensajes, revocación) solo se acepta del primario
+  registrado. La revocación se aplica en el receive path del primario, no
+  pidiéndole cooperación al dispositivo revocado.
+
+**Limitación aceptada y explícita**: el secundario no recibe nada con el
+primario apagado, y el relay de push despierta al primario. El primario es
+punto único de fallo *de producto*, no de seguridad — es un dispositivo
+del propio usuario, no un servidor. Por eso el riesgo #14 del threat model
+pasa a MITIGADO, no a FIXED.
+
+Verificado por un test de tres daemons reales sobre red real
+(`a_secondary_device_delegates_a_send_that_reaches_a_real_contact`): el
+secundario aprende quién es el contacto por `Envelope::ContactSync`,
+delega un envío que el contacto recibe y descifra como un mensaje
+ordinario del primario, y su fila local pasa de `pending` a `sent`
+únicamente porque llegó el `OutboundResult` real.
 
 ---
 

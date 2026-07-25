@@ -89,11 +89,34 @@ const API_TOKEN_FILE_NAME: &str = "api_token";
 /// client mid-request against a since-restarted daemon just gets a fresh
 /// `401` and re-reads the file, same as any other "daemon restarted"
 /// case it already has to handle.
+/// The mode is applied by `OpenOptions` at creation time rather than by a
+/// follow-up `set_permissions`: writing first and restricting afterwards
+/// leaves a window in which the file exists with whatever the process
+/// umask allows, and this file's whole content is the bearer token that
+/// authenticates every request to the daemon's API. That's the same race
+/// `bh_storage::keystore`'s file backend already closed for its own key
+/// material (THREAT_MODEL.md §3.7); this call site had been left behind.
 fn write_api_token_file(data_dir: &std::path::Path, token: &str) {
+    use std::io::Write;
+
     let path = data_dir.join(API_TOKEN_FILE_NAME);
-    std::fs::write(&path, token).expect("failed to write API token file");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .expect("failed to create the API token file");
+    file.write_all(token.as_bytes())
+        .expect("failed to write API token file");
+    #[cfg(unix)]
+    {
+        // `OpenOptions::mode` only applies when the file is *created*, so
+        // a token file left over from a previous run keeps whatever mode
+        // it already had. Reassert it for that case.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("failed to restrict API token file permissions");
@@ -110,6 +133,40 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// The database-unlock PIN this process was started with, if any.
+///
+/// Two sources, in priority order:
+///
+/// 1. `BLACKHOLE_DB_PIN_STDIN=1` — read exactly one line from stdin. This
+///    is what the Tauri client uses (`client/desktop/src-tauri/src/
+///    daemon_lifecycle.rs`), because a child process's *environment* is
+///    readable by anything running as the same user (`ps -E`,
+///    `/proc/<pid>/environ`), and the secret that unwraps the SQLCipher
+///    key has no business being more exposed than the key itself — same
+///    reasoning as the TURN-credential fix (SPEC.md §18).
+/// 2. `BLACKHOLE_DB_PIN` — the original environment variable, kept for
+///    hand-run daemons and scripts that already depend on it.
+///
+/// Cached, because `load_or_create_db_key` runs once per database
+/// (messaging, payments, MLS) and stdin can only be drained once.
+fn db_pin() -> Option<&'static str> {
+    static PIN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PIN.get_or_init(|| {
+        if std::env::var("BLACKHOLE_DB_PIN_STDIN").as_deref() == Ok("1") {
+            use std::io::BufRead;
+            let mut line = String::new();
+            if std::io::stdin().lock().read_line(&mut line).is_ok() {
+                let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+        std::env::var("BLACKHOLE_DB_PIN").ok()
+    })
+    .as_deref()
+}
+
 /// Loads a SQLCipher database key from the platform keystore under `label`,
 /// generating and storing a fresh one on first run. Never logged, never
 /// persisted outside the keystore (SPEC.md §7). Shared by the messaging
@@ -119,8 +176,8 @@ fn now() -> i64 {
 ///
 /// If a PIN has been set for this label (`POST /security/db-pin` — see
 /// `bh_storage::db_key_lock`, THREAT_MODEL.md §3.7), the stored entry is a
-/// sealed blob rather than the raw key, and `BLACKHOLE_DB_PIN` must supply
-/// the PIN to unseal it. Deliberately fails loudly rather than either
+/// sealed blob rather than the raw key, and [`db_pin`] must supply the PIN
+/// to unseal it. Deliberately fails loudly rather than either
 /// silently minting a brand-new key (which would look like "it just
 /// works" but actually orphans the real encrypted database) or silently
 /// starting unprotected.
@@ -128,14 +185,15 @@ fn load_or_create_db_key(keystore: &Keystore, label: &str) -> [u8; 32] {
     match db_key_lock::load_db_key_state(keystore, label).expect("keystore access failed") {
         Some(DbKeyState::Unprotected(key)) => key,
         Some(DbKeyState::PinProtected(sealed)) => {
-            let pin = std::env::var("BLACKHOLE_DB_PIN").unwrap_or_else(|_| {
+            let pin = db_pin().unwrap_or_else(|| {
                 panic!(
-                    "database key '{label}' is PIN-protected but BLACKHOLE_DB_PIN is not set; \
+                    "database key '{label}' is PIN-protected but no PIN was supplied \
+                     (BLACKHOLE_DB_PIN_STDIN=1 + one line on stdin, or BLACKHOLE_DB_PIN); \
                      the daemon cannot start without it (docs/THREAT_MODEL.md §3.7)"
                 )
             });
-            db_key_lock::unlock_with_pin(&pin, &sealed)
-                .expect("BLACKHOLE_DB_PIN did not unlock the database key")
+            db_key_lock::unlock_with_pin(pin, &sealed)
+                .expect("the supplied database PIN did not unlock the database key")
         }
         None => {
             let mut key = [0u8; 32];
@@ -343,6 +401,16 @@ async fn main() {
     // does (this loop's own per-tick check already covers "no live
     // network").
     bh_api::message_receive::spawn_receive_loop(state.clone(), MESSAGE_RECEIVE_INTERVAL);
+
+    // Multi-device sync (`bh_api::device_sync`): on a primary, mirrors
+    // contacts and new messages to every linked device on a cadence; on a
+    // linked secondary, re-pushes delegated sends still waiting on a
+    // primary that was offline. Previously this only ever ran when a
+    // client called `GET /devices/:id/sync` by hand, which made a linked
+    // device a viewer rather than a device. Same "no-op tick when
+    // `state.network` is `None`" property as the receive loop above, so it
+    // is likewise spawned unconditionally.
+    bh_api::device_sync::spawn_default_device_sync_loop(state.clone());
 
     // Dead man's switch (`bh_api::dead_mans_switch`): follows whichever
     // profile is active on every tick (reads `state.db()` fresh, same

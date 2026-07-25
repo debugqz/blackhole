@@ -111,8 +111,17 @@ impl HybridCiphertext {
             .get(32..36)
             .ok_or(CryptoError::Malformed("hybrid ciphertext: truncated"))?;
         let len = u32::from_be_bytes(len_bytes.try_into().expect("checked length")) as usize;
+        // `len` is parsed from a peer's handshake message before this KEM
+        // exchange has produced any shared secret to authenticate anything
+        // with — a declared length near `u32::MAX` must not be allowed to
+        // overflow `36 + len` (`checked_add` rather than `+`, which would
+        // wrap on a 32-bit target), same reasoning as
+        // `push_relay.rs::read_string`.
+        let end = 36usize
+            .checked_add(len)
+            .ok_or(CryptoError::Malformed("hybrid ciphertext: truncated"))?;
         let ml_kem_ciphertext = bytes
-            .get(36..36 + len)
+            .get(36..end)
             .ok_or(CryptoError::Malformed("hybrid ciphertext: truncated"))?
             .to_vec();
         Ok(Self {
@@ -264,6 +273,18 @@ mod tests {
         let decoded = HybridCiphertext::from_bytes(&ciphertext.to_bytes()).unwrap();
         let decoded_secret = hybrid_decapsulate(&responder_key, &decoded).unwrap();
         assert_eq!(secret, decoded_secret);
+    }
+
+    /// Regression test for the overflow guard in `HybridCiphertext::
+    /// from_bytes`: a maliciously huge declared length must be rejected
+    /// cleanly (not panic via `36 + len` overflowing `usize`), matching
+    /// `push_relay.rs`'s own `a_huge_declared_length_is_rejected_not_a_panic`.
+    #[test]
+    fn a_huge_declared_ciphertext_length_is_rejected_not_a_panic() {
+        let mut bytes = vec![0u8; 32];
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.extend_from_slice(b"way too short to satisfy that length");
+        assert!(HybridCiphertext::from_bytes(&bytes).is_err());
     }
 
     #[test]

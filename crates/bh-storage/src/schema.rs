@@ -7,7 +7,7 @@ use rusqlite::Connection;
 
 use crate::StorageError;
 
-pub const CURRENT_VERSION: i64 = 20;
+pub const CURRENT_VERSION: i64 = 22;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS own_identity (
@@ -565,6 +565,72 @@ const SCHEMA_V20: &str = r#"
 ALTER TABLE push_registration ADD COLUMN relay_url TEXT;
 "#;
 
+// v21 records that *this* daemon is a linked secondary device rather than
+// the account's primary — the one thing `bh-api::device_link::finish_link`
+// previously threw away. It returned the freshly-negotiated keys in its
+// HTTP response and dropped the in-memory `NewDevice` session, so a real
+// second daemon finished the linking ceremony holding no persistent trace
+// of it: no `own_identity` (deliberately — see that module's doc comment
+// on why installing the account identity would collide `recipient_key_
+// hash` with the primary's), but also no device identity of its own and
+// no way to address the primary. `message_receive.rs` polls
+// `recipient_key_hash(own_identity)`, so that daemon listened to nothing.
+//
+// A single row (`id = 1`, same convention as `own_identity`/`push_
+// registration`). Its presence *without* an `own_identity` row is the
+// definition of "this daemon is a secondary."
+//
+// `device_private_key` is this device's own identity in the 64-byte form
+// `IdentityKeyPair::export_bytes` produces (`bh_crypto::device_link::
+// NewDevice::device_identity`) — never the account's, and stored as one
+// blob rather than split per leg for the same reason `own_identity.
+// identity_private_key` is. `device_public_key` is the matching
+// 64-byte `signing || agreement` public half, the same layout
+// `Contact.identity_public_key` and `Device.public_key || Device.
+// identity_agreement_key` already use, so the primary can address this
+// device through the ordinary `prekey_directory`/mailbox path with no
+// special-casing.
+//
+// `account_public_key` is the account's 64-byte public identity. It does
+// double duty: verifying that an inbound envelope really came from the
+// primary, and *addressing* the primary — the account identity is the
+// primary's mailbox, because the primary is the only device that holds
+// it. That's why there is no separate "primary address" column.
+const SCHEMA_V21: &str = r#"
+CREATE TABLE IF NOT EXISTS linked_account (
+    id                            INTEGER PRIMARY KEY CHECK (id = 1),
+    device_id                     TEXT NOT NULL,
+    device_public_key             BLOB NOT NULL,
+    device_private_key            BLOB NOT NULL,
+    account_public_key            BLOB NOT NULL,
+    linked_at                     INTEGER NOT NULL,
+    revoked_at                    INTEGER
+);
+"#;
+
+// v22 tracks the delivery state of a message a linked *secondary* device
+// asked its primary to send on its behalf (`bh-api::device_delegation`).
+//
+// A sibling table keyed by `message_id` rather than a column on
+// `messages`, following the same convention `files`/`reactions`/
+// `payment_requests` already use: only a secondary ever writes here, and
+// on a primary the table stays permanently empty, so this keeps a
+// role-specific concern out of the row type every other module reads.
+//
+// `message_id` is deliberately the secondary's own `request_id` — that is
+// what makes a delegated send idempotent against the *database* rather
+// than against in-memory state a restart would lose. A retry of an
+// already-processed request finds the message and re-reports its outcome
+// instead of sending twice.
+const SCHEMA_V22: &str = r#"
+CREATE TABLE IF NOT EXISTS delegated_sends (
+    message_id  TEXT PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+    state       TEXT NOT NULL CHECK (state IN ('pending','sent','failed')),
+    error       TEXT,
+    updated_at  INTEGER NOT NULL
+);
+"#;
+
 /// Each step's DDL runs together with `PRAGMA user_version = N` for that
 /// same step. `SCHEMA_V2`/`SCHEMA_V5` contain `ALTER TABLE ... ADD COLUMN`,
 /// which is *not* idempotent (SQLite errors on a column that already
@@ -599,6 +665,8 @@ const STEPS: &[(i64, &str, bool)] = &[
     (18, SCHEMA_V18, false),
     (19, SCHEMA_V19, false),
     (20, SCHEMA_V20, false),
+    (21, SCHEMA_V21, false),
+    (22, SCHEMA_V22, false),
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StorageError> {

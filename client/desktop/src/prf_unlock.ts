@@ -7,8 +7,10 @@
 // exactly as exposed as the key it would protect).
 //
 // The derived PRF secret never leaves this machine and is never sent to
-// the daemon over any channel other than as `BLACKHOLE_DB_PIN` — a local
-// environment variable for a local child process — reusing the existing
+// the daemon over any channel other than the stdin of the local child
+// process the Tauri shell spawns (not an environment variable — a child's
+// environment is readable by anything running as the same user; see
+// `src-tauri/src/daemon_lifecycle.rs`), reusing the existing
 // `bh-storage::db_key_lock` PIN mechanism (`POST /security/db-pin`)
 // exactly as if the user had typed a (very long, random) PIN themselves.
 
@@ -23,7 +25,10 @@ export async function getPrfUnlockConfig(): Promise<PrfUnlockConfig | null> {
   return invoke<PrfUnlockConfig | null>("get_prf_unlock_config");
 }
 
-async function savePrfUnlockConfig(config: PrfUnlockConfig): Promise<void> {
+/// Commits a gate config to disk. Call this only once the daemon has
+/// accepted the matching secret as its database PIN — see
+/// {@link enrollDatabaseUnlockGate}'s doc for why the ordering matters.
+export async function savePrfUnlockConfig(config: PrfUnlockConfig): Promise<void> {
   await invoke("save_prf_unlock_config", { config });
 }
 
@@ -106,6 +111,11 @@ export async function derivePrfSecret(config: PrfUnlockConfig): Promise<Uint8Arr
   return new Uint8Array(first);
 }
 
+export interface EnrolledUnlockGate {
+  config: PrfUnlockConfig;
+  secret: Uint8Array;
+}
+
 /**
  * Enrolls a *new* passkey credential dedicated to the database-unlock
  * gate (separate from `main.ts`'s existing UI-only local-unlock passkey,
@@ -115,8 +125,17 @@ export async function derivePrfSecret(config: PrfUnlockConfig): Promise<Uint8Arr
  * even though `create()` can request the extension to check support.
  * Throws if the authenticator doesn't support PRF; callers should catch
  * that and point the user at the manual-PIN flow instead.
+ *
+ * **Deliberately does not persist anything.** The returned `config` is
+ * only meaningful once the daemon has actually accepted the derived
+ * secret as its database PIN, so the caller commits it with
+ * {@link savePrfUnlockConfig} *after* that succeeds. Persisting here
+ * instead meant a failed `POST /security/db-pin` left a gate on disk with
+ * no PIN behind it: every later launch demanded the passkey while
+ * `load_or_create_db_key` took its `Unprotected` branch and opened the
+ * database regardless — the gate looked enabled and protected nothing.
  */
-export async function enrollDatabaseUnlockGate(rpId: string): Promise<Uint8Array> {
+export async function enrollDatabaseUnlockGate(rpId: string): Promise<EnrolledUnlockGate> {
   const createOptions: CredentialCreationOptions = {
     publicKey: {
       challenge: crypto.getRandomValues(new Uint8Array(32)),
@@ -154,6 +173,5 @@ export async function enrollDatabaseUnlockGate(rpId: string): Promise<Uint8Array
   if (!secret) {
     throw new Error("The passkey did not return a PRF result right after enrollment.");
   }
-  await savePrfUnlockConfig(config);
-  return secret;
+  return { config, secret };
 }

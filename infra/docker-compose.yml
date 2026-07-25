@@ -66,19 +66,24 @@ services:
     environment:
       TURN_REALM: "${TURN_REALM:?set TURN_REALM in infra/.env}"
       TURN_PUBLIC_IP: "${TURN_PUBLIC_IP:?set TURN_PUBLIC_IP in infra/.env}"
-      TURN_USERNAME: "${TURN_USERNAME:?set TURN_USERNAME in infra/.env}"
-      TURN_CREDENTIAL: "${TURN_CREDENTIAL:?set TURN_CREDENTIAL in infra/.env}"
-    # The long-term credential used to be passed as a `--user=...`
-    # command-line flag — visible in plaintext to anyone on the host who
-    # can run `ps aux`/read `/proc/<pid>/cmdline`, or `docker inspect`/
-    # `docker top` against the container, a lower-friction local exposure
-    # on top of the already-accepted "this credential is leaked forever if
-    # it leaks" risk the README calls out. `environment:` values aren't
-    # immune to a sufficiently privileged local reader either, but they're
-    # not in the default `ps`/`docker top` output, and writing the
-    # credential into a generated config file coturn reads via `-c` (rather
-    # than a CLI flag) means the actually-running `turnserver` process's
-    # own argv never contains it either way.
+      # Exactly one of these two schemes needs to be set — see
+      # .env.example's coturn section. Left optional here (not `:?`)
+      # because either one alone is valid; the entrypoint below picks
+      # whichever is present (TURN_AUTH_SECRET wins if both are, matching
+      # bh-calls::transport::default_ice_servers's own priority) and fails
+      # loudly if neither is.
+      TURN_AUTH_SECRET: "${TURN_AUTH_SECRET:-}"
+      TURN_USERNAME: "${TURN_USERNAME:-}"
+      TURN_CREDENTIAL: "${TURN_CREDENTIAL:-}"
+    # Any long-term credential is written into a generated config file
+    # coturn reads via `-c` rather than passed as a `--user=...`/
+    # `--static-auth-secret=...` command-line flag — a CLI flag would be
+    # visible in plaintext to anyone on the host who can run `ps aux`/read
+    # `/proc/<pid>/cmdline`, or `docker inspect`/`docker top` against the
+    # container. `environment:` values aren't immune to a sufficiently
+    # privileged local reader either, but they're not in the default
+    # `ps`/`docker top` output, and this way the actually-running
+    # `turnserver` process's own argv never contains the secret either way.
     entrypoint:
       - /bin/sh
       - -c
@@ -86,6 +91,16 @@ services:
         set -eu
         conf=/tmp/turnserver.generated.conf
         umask 077
+        if [ -n "$$TURN_AUTH_SECRET" ]; then
+          auth_lines="use-auth-secret
+        static-auth-secret=$$TURN_AUTH_SECRET"
+        elif [ -n "$$TURN_USERNAME" ] && [ -n "$$TURN_CREDENTIAL" ]; then
+          auth_lines="lt-cred-mech
+        user=$$TURN_USERNAME:$$TURN_CREDENTIAL"
+        else
+          echo "set either TURN_AUTH_SECRET, or both TURN_USERNAME and TURN_CREDENTIAL, in infra/.env" >&2
+          exit 1
+        fi
         cat > "$$conf" <<EOF
         listening-port=3478
         tls-listening-port=5349
@@ -94,8 +109,7 @@ services:
         realm=$$TURN_REALM
         server-name=$$TURN_REALM
         external-ip=$$TURN_PUBLIC_IP
-        lt-cred-mech
-        user=$$TURN_USERNAME:$$TURN_CREDENTIAL
+        $$auth_lines
         no-cli
         fingerprint
         stale-nonce=600

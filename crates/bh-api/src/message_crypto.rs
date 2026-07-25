@@ -330,6 +330,39 @@ async fn wake_recipient_best_effort(
     }
 }
 
+/// Checks that a bundle fetched from the DHT actually belongs to the
+/// contact it was fetched for.
+///
+/// `x3dh_initiate` verifies a bundle is *internally* consistent — its
+/// prekeys are signed by the identity key the bundle itself carries. A
+/// bundle minted wholesale by a stranger passes that check just fine. And
+/// `prekey_directory` reads from plain Kademlia, where any node can
+/// publish any key and `get_record` takes the first answer: substituting
+/// a bundle needs no race to be won, only a node that answers quickly.
+///
+/// Without this comparison, anyone could park a bundle of their own under
+/// a target's key hash and every first message to that target would be
+/// encrypted against a session the real recipient can't derive — a silent,
+/// indefinite denial of first contact, invisible to both parties. Both
+/// halves are checked because both feed the handshake: the signing key
+/// authenticates the prekeys, and the agreement key is a direct DH input
+/// (`dh2`) as well as part of the session's associated data.
+fn bundle_belongs_to(bundle: &PreKeyBundle, contact: &Contact) -> Result<(), StatusCode> {
+    let expected = &contact.identity_public_key;
+    let signing_matches = expected.get(..32) == Some(bundle.identity_signing_key.as_bytes());
+    let agreement_matches =
+        expected.get(32..64) == Some(bundle.identity_agreement_key.as_bytes().as_slice());
+    if signing_matches && agreement_matches {
+        return Ok(());
+    }
+    tracing::warn!(
+        contact_id = %contact.contact_id,
+        "fetched prekey bundle does not match this contact's known identity key — \
+         refusing to start a session with it"
+    );
+    Err(StatusCode::BAD_GATEWAY)
+}
+
 fn contact_agreement_key(contact: &Contact) -> Result<X25519PublicKey, StatusCode> {
     let bytes: [u8; 32] = contact
         .identity_public_key
@@ -377,6 +410,7 @@ async fn load_or_establish_session(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let bundle = PreKeyBundle::from_bytes(&bundle_bytes).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    bundle_belongs_to(&bundle, contact)?;
 
     let (shared_secret, initial_message) =
         ratchet::x3dh_initiate(identity, &bundle).map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -401,7 +435,13 @@ pub(crate) async fn send_encrypted_over_network(
     message_id: &str,
     plaintext: &[u8],
 ) -> Result<(), StatusCode> {
-    let identity = own_identity_keypair(state)?;
+    // The acting identity, not strictly the account's: on a linked
+    // secondary this is the device's own identity, which is how a
+    // delegated send reaches the primary and how the primary's mirror
+    // reaches back. A secondary never reaches a *contact* through here —
+    // `conversations::send_message` short-circuits into
+    // `device_delegation` before this is called.
+    let identity = crate::device_role::acting_identity_keypair(state)?;
     let signed_prekey = ensure_own_signed_prekey(state, &identity)?;
 
     let (mut session, initial_message) =
@@ -461,4 +501,64 @@ pub(crate) async fn send_encrypted_over_network(
     publish_own_bundle_best_effort(network, &identity, &signed_prekey).await;
     wake_recipient_best_effort(network, &contact.identity_public_key, &their_key_hash).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bh_crypto::ratchet::SignedPreKey;
+
+    fn contact_for(identity: &IdentityKeyPair) -> Contact {
+        Contact {
+            contact_id: "c1".to_string(),
+            identity_public_key: identity.public_identity_bytes().to_vec(),
+            display_name: None,
+            verified: false,
+            blocked: false,
+            added_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_bundle_from_the_expected_contact_is_accepted() {
+        let identity = IdentityKeyPair::generate().unwrap();
+        let prekey = SignedPreKey::generate(&identity, 1);
+        let bundle = own_prekey_bundle(&identity, &prekey);
+        assert!(bundle_belongs_to(&bundle, &contact_for(&identity)).is_ok());
+    }
+
+    /// The substitution `bundle_belongs_to` exists to catch: a bundle that
+    /// is perfectly valid on its own terms (`x3dh_initiate`'s internal
+    /// signature check passes — it's signed by the identity the bundle
+    /// itself carries) but belongs to somebody else entirely. Anyone can
+    /// publish one under a target's DHT key, so "internally consistent"
+    /// has to stop being sufficient.
+    #[test]
+    fn a_bundle_minted_by_a_different_identity_is_refused() {
+        let real = IdentityKeyPair::generate().unwrap();
+        let impostor = IdentityKeyPair::generate().unwrap();
+        let impostor_prekey = SignedPreKey::generate(&impostor, 1);
+        let impostor_bundle = own_prekey_bundle(&impostor, &impostor_prekey);
+
+        // Sanity: the substituted bundle really would have been usable —
+        // this is what made the substitution silent before the check.
+        assert!(ratchet::x3dh_initiate(&real, &impostor_bundle).is_ok());
+
+        assert!(bundle_belongs_to(&impostor_bundle, &contact_for(&real)).is_err());
+    }
+
+    /// A bundle that keeps the right signing key but swaps the agreement
+    /// key must also be refused: the agreement key is a direct DH input
+    /// (`dh2`) and part of the session's associated data, so accepting a
+    /// mismatched one derives a secret the real contact cannot reproduce.
+    #[test]
+    fn a_bundle_with_a_swapped_agreement_key_is_refused() {
+        let real = IdentityKeyPair::generate().unwrap();
+        let other = IdentityKeyPair::generate().unwrap();
+        let prekey = SignedPreKey::generate(&real, 1);
+        let mut bundle = own_prekey_bundle(&real, &prekey);
+        bundle.identity_agreement_key = other.public_agreement_key();
+
+        assert!(bundle_belongs_to(&bundle, &contact_for(&real)).is_err());
+    }
 }

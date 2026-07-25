@@ -46,6 +46,8 @@ openmls_rust_crypto = "0.5"
 # generically over both the persistent (own-member) and in-memory
 # (shadow-member) providers.
 openmls_traits = "0.5"
+sha2 = "0.10"
+indexmap = "2"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

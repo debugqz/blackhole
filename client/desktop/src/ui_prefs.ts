@@ -92,10 +92,32 @@ export function setStripExifEnabled(value: boolean): void {
 
 const DEFAULT_QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢"];
 
+/// Splits a run of emoji into individual ones. Deliberately NOT
+/// `Array.from`/spread, which splits by code point and so tears apart
+/// every emoji that isn't a single code point: `❤️` is U+2764 U+FE0F,
+/// `👍🏽` is a base plus a skin-tone modifier, `👨‍👩‍👧` is three
+/// code points joined by ZWJ. That is how the saved list came back
+/// mangled after a round trip through settings. `Intl.Segmenter` with
+/// `granularity: "grapheme"` is the operation actually wanted here — one
+/// entry per thing a user perceives as one character.
+export function splitGraphemes(value: string): string[] {
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  const Segmenter = (Intl as { Segmenter?: typeof Intl.Segmenter }).Segmenter;
+  if (!Segmenter) {
+    // No `Intl.Segmenter` (very old webview): keep the whole string as one
+    // entry rather than shredding composed emoji into unusable fragments.
+    return [trimmed];
+  }
+  return Array.from(new Segmenter(undefined, { granularity: "grapheme" }).segment(trimmed))
+    .map((s) => s.segment)
+    .filter((s) => s.trim().length > 0);
+}
+
 export function getQuickReactions(): string[] {
   const raw = getString("quick-reactions", "");
   if (!raw) return DEFAULT_QUICK_REACTIONS;
-  const parsed = Array.from(raw.trim()).filter((ch) => ch.trim().length > 0);
+  const parsed = splitGraphemes(raw);
   return parsed.length > 0 ? parsed.slice(0, 8) : DEFAULT_QUICK_REACTIONS;
 }
 export function setQuickReactions(emojis: string[]): void {

@@ -150,6 +150,30 @@ fn signed_paid_request(uri: &str, secret: &[u8; 32], purchase_id: &str) -> Reque
         .unwrap()
 }
 
+/// Dials `state_b`'s network into `state_a`'s and waits for the dial to
+/// settle — the one-directional-dial shortcut every real-network test in
+/// this file uses (dialing both directions isn't needed for two nodes to
+/// reach each other over the DHT once one side knows the other's address).
+async fn dial_a_into_b(state_a: &AppState, state_b: &AppState) {
+    let network_a = state_a.network.as_ref().unwrap();
+    let a_addr = network_a
+        .listen_addrs()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .with_p2p(network_a.peer_id())
+        .unwrap();
+    state_b
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(a_addr)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
 #[tokio::test]
 async fn health_check_responds_ok() {
     use_mock_keychain();
@@ -4671,6 +4695,117 @@ async fn direct_message_travels_a_real_network_between_two_daemons_and_decrypts(
     );
 }
 
+/// Closes the specific gap `docs/THREAT_MODEL.md` §3.1's Key Transparency
+/// write-up left open at the unit/two-node level: `bh_crypto::
+/// key_transparency` and `bh_network::tree_head` each have their own
+/// tests, and `bh-api::tree_head` wires `create_identity` to fire a
+/// best-effort publish and `safety_number.rs` to fetch-and-verify — but
+/// nothing before this test exercised the *whole* stack (HTTP → identity
+/// bootstrap → background publish → DHT → contact's own HTTP call →
+/// fetch-and-verify) between two genuinely independent daemon processes,
+/// the same bar `direct_message_travels_a_real_network_between_two_daemons_
+/// and_decrypts` above already set for message delivery.
+#[tokio::test]
+async fn key_transparency_corroborates_a_contacts_identity_between_two_real_daemons() {
+    use_mock_keychain();
+
+    let dir_a = test_dir("kt-network-a");
+    let manager_a = ProfileManager::new(&dir_a, "bh-api-smoke-kt-a");
+    let profile_a = manager_a.create_profile("A", 0).unwrap();
+    let session_a = open_profile_session(&manager_a, &profile_a.id, true);
+    let network_a = bh_network::supervised::SupervisedNetwork::spawn(
+        "/ip4/127.0.0.1/tcp/0",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let state_a = Arc::new(AppState::new(manager_a, session_a).with_network(network_a));
+    let app_a = ApiServer::router(state_a.clone());
+
+    let dir_b = test_dir("kt-network-b");
+    let manager_b = ProfileManager::new(&dir_b, "bh-api-smoke-kt-b");
+    let profile_b = manager_b.create_profile("B", 0).unwrap();
+    let session_b = open_profile_session(&manager_b, &profile_b.id, true);
+    let network_b = bh_network::supervised::SupervisedNetwork::spawn(
+        "/ip4/127.0.0.1/tcp/0",
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let state_b = Arc::new(AppState::new(manager_b, session_b).with_network(network_b));
+    let app_b = ApiServer::router(state_b.clone());
+
+    dial_a_into_b(&state_a, &state_b).await;
+
+    // A's own identity is created only to give A's daemon somewhere to
+    // record the contact/verify against; this test never inspects A's own
+    // keys, only publishes/fetches B's. `POST /identity` on each daemon
+    // fires `tree_head::publish_own_tree_head` in a spawned background
+    // task (`identity.rs`) — nothing else in this test needs to trigger
+    // that publish.
+    app_a
+        .clone()
+        .oneshot(json_request("POST", "/identity", json!({})))
+        .await
+        .unwrap();
+    let identity_b: Value = body_json(
+        app_b
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let signing_b = identity_b["public_signing_key"].as_str().unwrap();
+    let agreement_b = identity_b["public_agreement_key"].as_str().unwrap();
+
+    let response = app_a
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/contacts",
+            json!({
+                "contact_id": signing_b,
+                "identity_public_key": format!("{signing_b}{agreement_b}"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Same DHT-convergence shortcut every other real-network test in this
+    // file takes: B's publish and/or A's fetch of it may transiently fail
+    // the first few tries on a freshly-dialed 2-node routing table even
+    // though nothing is actually broken.
+    let mut corroborated = None;
+    for attempt in 0..30 {
+        let response: Value = body_json(
+            app_a
+                .clone()
+                .oneshot(get_request(&format!("/contacts/{signing_b}/safety-number")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        corroborated = response["key_transparency_corroborated"].as_bool();
+        if corroborated == Some(true) {
+            break;
+        }
+        assert!(
+            attempt < 29,
+            "key transparency corroboration never became Some(true) after retries, last saw {:?}",
+            response["key_transparency_corroborated"]
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        corroborated,
+        Some(true),
+        "A must fetch and verify B's real, DHT-published tree head and find it matches B's identity key on file"
+    );
+}
+
 /// Wires `bh-push-relay` into the real send path end-to-end (SPEC.md §5.6,
 /// `bh-api::push`/`message_crypto::wake_recipient_best_effort`): B enables
 /// push against a genuine, separately-listening `RelayServer` instance —
@@ -5051,6 +5186,59 @@ async fn call_signaling_travels_a_real_network_between_two_daemons_and_connects(
         "starting a call over a live network must succeed"
     );
 
+    // B must *ring*, not connect. An incoming offer no longer opens B's
+    // microphone on arrival — that required no user involvement at all,
+    // so any contact could listen in. It lands in `GET /calls/ringing`
+    // and stays there until B explicitly answers.
+    let mut ringing = json!([]);
+    for _ in 0..150 {
+        ringing = body_json(
+            app_b
+                .clone()
+                .oneshot(get_request("/calls/ringing"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if !ringing.as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        ringing.as_array().unwrap().len(),
+        1,
+        "B must have received A's real network call offer as a ringing call"
+    );
+    assert_eq!(ringing[0]["call_id"], json!(call_id));
+    assert_eq!(ringing[0]["contact_id"], json!(signing_a));
+
+    // And critically: nothing is connected until B says so.
+    let status: Value = body_json(
+        app_b
+            .clone()
+            .oneshot(get_request(&format!("/calls/{call_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_ne!(
+        status["status"],
+        json!("active"),
+        "an unanswered incoming offer must not be a live call"
+    );
+
+    let response = app_b
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/calls/ringing/{call_id}/answer"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
     let mut b_active = false;
     for _ in 0..150 {
         let status: Value = body_json(
@@ -5069,7 +5257,7 @@ async fn call_signaling_travels_a_real_network_between_two_daemons_and_connects(
     }
     assert!(
         b_active,
-        "B must have received and auto-answered A's real network call offer"
+        "answering the ringing call must complete B's side of the handshake"
     );
 
     let mut a_active = false;
@@ -5601,20 +5789,36 @@ async fn device_sync_pushes_a_real_message_to_a_linked_device_over_the_network()
             .unwrap(),
     )
     .await;
-    let identity_d: Value = body_json(
-        app_d
-            .clone()
-            .oneshot(json_request("POST", "/identity", json!({})))
-            .await
-            .unwrap(),
-    )
-    .await;
     let signing_a = identity_a["public_signing_key"].as_str().unwrap();
     let agreement_a = identity_a["public_agreement_key"].as_str().unwrap();
     let signing_c = identity_c["public_signing_key"].as_str().unwrap();
     let agreement_c = identity_c["public_agreement_key"].as_str().unwrap();
-    let signing_d = identity_d["public_signing_key"].as_str().unwrap();
-    let agreement_d = identity_d["public_agreement_key"].as_str().unwrap();
+
+    // D is a genuine linked *secondary*: it deliberately never calls
+    // `POST /identity`, because a secondary has no account identity — it
+    // has an identity of its own and a `linked_account` row naming the
+    // account it belongs to (`bh-api::device_role`). Written directly here
+    // for the same reason A's `devices` row below is: this test exercises
+    // sync, not the linking ceremony (which
+    // `device_linking_completes_a_real_ceremony_between_two_daemons_over_the_network`
+    // covers). What that row buys is exactly what a real `finish_link`
+    // would have persisted, and without it D has no basis to trust
+    // anything A mirrors to it — see `device_role::is_primary_sender`.
+    let device_identity_d = bh_crypto::identity::IdentityKeyPair::generate().unwrap();
+    let device_public_d = device_identity_d.public_identity_bytes();
+    let signing_d = &hex::encode(&device_public_d[..32]);
+    let agreement_d = &hex::encode(&device_public_d[32..]);
+    state_d
+        .db()
+        .set_linked_account(&bh_storage::models::LinkedAccount {
+            device_id: signing_d.to_string(),
+            device_public_key: device_public_d.to_vec(),
+            device_private_key: device_identity_d.export_bytes().to_vec(),
+            account_public_key: hex::decode(format!("{signing_a}{agreement_a}")).unwrap(),
+            linked_at: 0,
+            revoked_at: None,
+        })
+        .unwrap();
 
     bh_api::message_receive::spawn_receive_loop(state_a.clone(), Duration::from_millis(150));
     bh_api::message_receive::spawn_receive_loop(state_c.clone(), Duration::from_millis(150));
@@ -5985,4 +6189,613 @@ async fn device_linking_completes_a_real_ceremony_between_two_daemons_over_the_n
         .find(|d| d["device_id"] == json!(device_id_on_p))
         .expect("linked device must be listed on P");
     assert_eq!(device["public_key"], json!(device_id_on_p));
+}
+
+/// The capstone test for multi-device delegation (`bh-api::device_role`,
+/// `device_delegation`, `device_sync`'s contact mirroring): three
+/// genuinely independent daemons — P the primary, S a linked secondary,
+/// R an ordinary contact — with no shared process state anywhere.
+///
+/// S never calls `POST /identity`. It has no account identity at all, by
+/// design: a secondary holds only its own per-device identity, because two
+/// devices sharing one account's Double Ratchet session would each advance
+/// `sending_chain_key`/`send_count` independently and reuse message keys
+/// (see `device_role.rs`'s module doc). So the message S "sends" is really
+/// an `Envelope::OutboundRequest` to P, which P carries out with the
+/// account's real session — and R, who knows nothing about any of this,
+/// receives an ordinary message from P.
+///
+/// What this proves that a same-process test could not: S learns who R
+/// even is over the network (`Envelope::ContactSync`), the delegated send
+/// crosses a real mailbox in both directions, and S's local record of the
+/// message is promoted from `pending` to `sent` only because P's real
+/// `Envelope::OutboundResult` came back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_secondary_device_delegates_a_send_that_reaches_a_real_contact() {
+    use_mock_keychain();
+
+    async fn spawn_daemon(name: &str) -> (axum::Router, Arc<AppState>) {
+        let dir = test_dir(&format!("e2e-delegation-{name}"));
+        let manager = ProfileManager::new(&dir, format!("bh-api-smoke-e2e-delegation-{name}"));
+        let profile = manager.create_profile(name, 0).unwrap();
+        let session = open_profile_session(&manager, &profile.id, true);
+        let network = bh_network::supervised::SupervisedNetwork::spawn(
+            "/ip4/127.0.0.1/tcp/0",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(manager, session).with_network(network));
+        let app = ApiServer::router(state.clone());
+        (app, state)
+    }
+
+    let (app_p, state_p) = spawn_daemon("p").await;
+    let (app_s, state_s) = spawn_daemon("s").await;
+    let (app_r, state_r) = spawn_daemon("r").await;
+
+    // S and R dial P (same one-directional-dial shortcut the other
+    // real-network tests here use).
+    let p_addr = state_p
+        .network
+        .as_ref()
+        .unwrap()
+        .listen_addrs()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .with_p2p(state_p.network.as_ref().unwrap().peer_id())
+        .unwrap();
+    for state in [&state_s, &state_r] {
+        state
+            .network
+            .as_ref()
+            .unwrap()
+            .dial(p_addr.clone())
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let identity_p: Value = body_json(
+        app_p
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let identity_r: Value = body_json(
+        app_r
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let signing_p = identity_p["public_signing_key"].as_str().unwrap();
+    let agreement_p = identity_p["public_agreement_key"].as_str().unwrap();
+    let signing_r = identity_r["public_signing_key"].as_str().unwrap();
+    let agreement_r = identity_r["public_agreement_key"].as_str().unwrap();
+
+    // S is a secondary: its own device identity, and a `linked_account`
+    // row naming P's account. Written directly rather than driven through
+    // the four-step ceremony, which
+    // `device_linking_completes_a_real_ceremony_between_two_daemons_over_the_network`
+    // already covers — this test is about what happens *after* linking.
+    let device_identity_s = bh_crypto::identity::IdentityKeyPair::generate().unwrap();
+    let device_public_s = device_identity_s.public_identity_bytes();
+    let signing_s = hex::encode(&device_public_s[..32]);
+    let agreement_s = hex::encode(&device_public_s[32..]);
+    state_s
+        .db()
+        .set_linked_account(&bh_storage::models::LinkedAccount {
+            device_id: signing_s.clone(),
+            device_public_key: device_public_s.to_vec(),
+            device_private_key: device_identity_s.export_bytes().to_vec(),
+            account_public_key: hex::decode(format!("{signing_p}{agreement_p}")).unwrap(),
+            linked_at: 0,
+            revoked_at: None,
+        })
+        .unwrap();
+
+    // P knows S as one of its own devices — the authorization that lets S
+    // delegate at all (`device_role::is_authorized_own_device`).
+    state_p
+        .db()
+        .upsert_device(&Device {
+            device_id: signing_s.clone(),
+            owner: DeviceOwner::Own,
+            contact_id: None,
+            name: Some("S".to_string()),
+            public_key: hex::decode(&signing_s).unwrap(),
+            identity_agreement_key: Some(hex::decode(&agreement_s).unwrap()),
+            linked_at: 0,
+            last_seen_at: None,
+            revoked_at: None,
+        })
+        .unwrap();
+
+    bh_api::message_receive::spawn_receive_loop(state_p.clone(), Duration::from_millis(150));
+    bh_api::message_receive::spawn_receive_loop(state_s.clone(), Duration::from_millis(150));
+    bh_api::message_receive::spawn_receive_loop(state_r.clone(), Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // P <-> R are ordinary contacts of each other. S is told about R
+    // by nobody yet — that is what contact mirroring is for.
+    for (app, their_signing, their_agreement) in [
+        (&app_p, signing_r, agreement_r),
+        (&app_r, signing_p, agreement_p),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/contacts",
+                json!({
+                    "contact_id": their_signing,
+                    "identity_public_key": format!("{their_signing}{their_agreement}"),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // S reports itself as a secondary over HTTP, with no account identity.
+    let role: Value = body_json(
+        app_s
+            .clone()
+            .oneshot(get_request("/devices/role"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(role["role"], json!("secondary"));
+    assert_eq!(role["device_id"], json!(signing_s));
+
+    // P mirrors its contact book to S. Retried for DHT convergence, same
+    // as every other real-network operation in this file.
+    let mut s_knows_r = false;
+    for _ in 0..40 {
+        let _ = app_p
+            .clone()
+            .oneshot(get_request(&format!("/devices/{signing_s}/sync?limit=10")))
+            .await
+            .unwrap();
+        let contacts: Value = body_json(
+            app_s
+                .clone()
+                .oneshot(get_request("/contacts"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if contacts
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["contact_id"] == json!(signing_r))
+        {
+            s_knows_r = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        s_knows_r,
+        "S must learn about R over the network via Envelope::ContactSync — \
+         a secondary is never told who anyone is at link time"
+    );
+
+    // Self-healing, asserted rather than assumed: this test wrote S's
+    // `linked_account` row directly and never created the pseudo-contact
+    // for P that a real `finish_link` would have. S derived it from state
+    // already on disk the first time P wrote to it — without that, a
+    // secondary whose row exists but whose pseudo-contact doesn't (a
+    // partial restore, a link recorded by an older build) would classify
+    // every envelope from its own primary as an unknown sender and stay
+    // permanently, silently deaf.
+    let p_contact_id = hex::encode(hex::decode(signing_p).unwrap());
+    assert!(
+        state_s
+            .db()
+            .get_contact(&p_contact_id)
+            .unwrap()
+            .is_some_and(|c| c.identity_public_key
+                == hex::decode(format!("{signing_p}{agreement_p}")).unwrap()),
+        "S must materialize the primary's contact row on demand"
+    );
+
+    // S sends. It cannot encrypt this itself and does not try.
+    let conversation: Value = body_json(
+        app_s
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/conversations",
+                json!({"contact_id": signing_r}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let conversation_id = conversation["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let sent: Value = body_json(
+        app_s
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/conversations/{conversation_id}/messages"),
+                json!({"body": "sent from my second device"}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let request_id = sent["message"]["message_id"].as_str().unwrap().to_string();
+
+    // R receives it as an ordinary message from P, knowing nothing about S.
+    let mut r_body = None;
+    for _ in 0..200 {
+        let conversations: Value = body_json(
+            app_r
+                .clone()
+                .oneshot(get_request("/conversations"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if let Some(conv) = conversations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["contact_id"] == json!(signing_p))
+        {
+            let conv_id = conv["conversation_id"].as_str().unwrap();
+            let messages: Value = body_json(
+                app_r
+                    .clone()
+                    .oneshot(get_request(&format!("/conversations/{conv_id}/messages")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if let Some(msg) = messages.as_array().unwrap().first() {
+                r_body = msg["body"].as_str().map(str::to_string);
+                break;
+            }
+        }
+        // Drain any delegated send still waiting on DHT convergence — the
+        // production equivalent is `device_sync`'s own periodic tick.
+        if let Some(linked) = state_s.db().get_linked_account().unwrap() {
+            bh_api::device_delegation::retry_pending_delegations(&state_s, &linked).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        r_body,
+        Some("sent from my second device".to_string()),
+        "the delegated send must reach R as a real, decrypted message from P"
+    );
+
+    // And S learns it went out, from P's real OutboundResult — not by
+    // assuming its own push succeeded.
+    let mut final_state = None;
+    for _ in 0..200 {
+        if let Some(row) = state_s.db().get_delegated_send(&request_id).unwrap() {
+            if row.state != bh_storage::delegated_sends::DelegationState::Pending {
+                final_state = Some(row.state);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        final_state,
+        Some(bh_storage::delegated_sends::DelegationState::Sent),
+        "S's pending row must be promoted by P's real OutboundResult"
+    );
+
+    // The invariant the whole design rests on: S never held the account
+    // identity, so it could not have encrypted anything to R itself.
+    assert!(
+        state_s.db().get_own_identity().unwrap().is_none(),
+        "a secondary must never install the account identity"
+    );
+}
+
+/// Regression test for the authorization gate on delegated sending
+/// (`device_role::is_authorized_own_device`), and for revocation actually
+/// taking effect.
+///
+/// `Envelope::OutboundRequest` asks the receiving daemon to encrypt and
+/// send under the *account's* identity. Being a known contact must not be
+/// enough to ask for that — otherwise anyone in your contact list could
+/// put that envelope in your mailbox and have your daemon send messages as
+/// you. And a device you unlinked must stop being able to, without
+/// depending on that device's cooperation, since a revoked device is
+/// exactly the one you can no longer trust to behave.
+///
+/// Three phases against the same pair of daemons, because a test that only
+/// asserts "nothing happened" proves nothing on its own — the middle phase
+/// is what shows the setup can succeed at all, so the two negatives are
+/// real refusals rather than a broken harness.
+///
+/// Uses the "Notes to self" conversation deliberately: the primary
+/// resolves it locally and stores with no network I/O, so an authorized
+/// delegation succeeds deterministically instead of depending on DHT
+/// convergence — which keeps the negative assertions sharp.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_an_authorized_linked_device_can_make_the_primary_send() {
+    use_mock_keychain();
+
+    async fn spawn_daemon(name: &str) -> (axum::Router, Arc<AppState>) {
+        let dir = test_dir(&format!("e2e-delegation-authz-{name}"));
+        let manager = ProfileManager::new(&dir, format!("bh-api-smoke-delegation-authz-{name}"));
+        let profile = manager.create_profile(name, 0).unwrap();
+        let session = open_profile_session(&manager, &profile.id, true);
+        let network = bh_network::supervised::SupervisedNetwork::spawn(
+            "/ip4/127.0.0.1/tcp/0",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(manager, session).with_network(network));
+        let app = ApiServer::router(state.clone());
+        (app, state)
+    }
+
+    let (app_p, state_p) = spawn_daemon("p").await;
+    let (app_s, state_s) = spawn_daemon("s").await;
+
+    let p_addr = state_p
+        .network
+        .as_ref()
+        .unwrap()
+        .listen_addrs()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .with_p2p(state_p.network.as_ref().unwrap().peer_id())
+        .unwrap();
+    state_s
+        .network
+        .as_ref()
+        .unwrap()
+        .dial(p_addr)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let identity_p: Value = body_json(
+        app_p
+            .clone()
+            .oneshot(json_request("POST", "/identity", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let signing_p = identity_p["public_signing_key"].as_str().unwrap();
+    let agreement_p = identity_p["public_agreement_key"].as_str().unwrap();
+
+    let device_identity_s = bh_crypto::identity::IdentityKeyPair::generate().unwrap();
+    let device_public_s = device_identity_s.public_identity_bytes();
+    let signing_s = hex::encode(&device_public_s[..32]);
+    let agreement_s = hex::encode(&device_public_s[32..]);
+    state_s
+        .db()
+        .set_linked_account(&bh_storage::models::LinkedAccount {
+            device_id: signing_s.clone(),
+            device_public_key: device_public_s.to_vec(),
+            device_private_key: device_identity_s.export_bytes().to_vec(),
+            account_public_key: hex::decode(format!("{signing_p}{agreement_p}")).unwrap(),
+            linked_at: 0,
+            revoked_at: None,
+        })
+        .unwrap();
+
+    // The setup that makes this test meaningful: P knows S as an ordinary
+    // *contact*, and nothing more. That is precisely the standing an
+    // attacker would have — someone already in your contact list.
+    let response = app_p
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/contacts",
+            json!({
+                "contact_id": signing_s,
+                "identity_public_key": format!("{signing_s}{agreement_s}"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    bh_api::message_receive::spawn_receive_loop(state_p.clone(), Duration::from_millis(150));
+    bh_api::message_receive::spawn_receive_loop(state_s.clone(), Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // S's own "Notes to self" conversation, lazily created by this call.
+    async fn self_conversation_id(app: &axum::Router) -> String {
+        let conversations: Value = body_json(
+            app.clone()
+                .oneshot(get_request("/conversations"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        conversations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["kind"] == json!("self"))
+            .expect("every profile has a Notes to self conversation")["conversation_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn delegate(app: &axum::Router, conversation_id: &str, body: &str) -> String {
+        let sent: Value = body_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/conversations/{conversation_id}/messages"),
+                    json!({ "body": body }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        sent["message"]["message_id"]
+            .as_str()
+            .expect("a delegated send is still stored locally on the secondary")
+            .to_string()
+    }
+
+    /// Gives the request ample time to cross the real network and be acted
+    /// on, then reports whether P created the message. Waiting the full
+    /// window on the negative cases is the point — a refusal that is really
+    /// just slowness would show up as a flake here rather than a pass.
+    async fn primary_created(state_p: &Arc<AppState>, request_id: &str, window: u32) -> bool {
+        for _ in 0..window {
+            if state_p.db().get_message(request_id).unwrap().is_some() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    let conversation_id = self_conversation_id(&app_s).await;
+
+    // Phase 1 — a contact that is not a linked device.
+    let unauthorized = delegate(&app_s, &conversation_id, "from a mere contact").await;
+    assert!(
+        !primary_created(&state_p, &unauthorized, 25).await,
+        "a contact that is not one of the account's own devices must not be able to \
+         make the primary send — being a known contact is not authorization"
+    );
+
+    // Phase 2 — the same daemon, now genuinely registered as a device.
+    // Proves the two negatives aren't vacuous.
+    state_p
+        .db()
+        .upsert_device(&Device {
+            device_id: signing_s.clone(),
+            owner: DeviceOwner::Own,
+            contact_id: None,
+            name: Some("S".to_string()),
+            public_key: hex::decode(&signing_s).unwrap(),
+            identity_agreement_key: Some(hex::decode(&agreement_s).unwrap()),
+            linked_at: 0,
+            last_seen_at: None,
+            revoked_at: None,
+        })
+        .unwrap();
+    let authorized = delegate(&app_s, &conversation_id, "from a real device").await;
+    assert!(
+        primary_created(&state_p, &authorized, 150).await,
+        "once S is a registered device its delegated send must go through"
+    );
+
+    // Phase 3 — revoked. Enforced on the primary's own receive path, so it
+    // holds even though S is never told and keeps trying.
+    state_p.db().revoke_device(&signing_s, 1).unwrap();
+    let after_revocation = delegate(&app_s, &conversation_id, "after being unlinked").await;
+    assert!(
+        !primary_created(&state_p, &after_revocation, 25).await,
+        "a revoked device must not be able to make the primary send, without \
+         relying on that device to stop asking"
+    );
+}
+
+/// Regression test for the transient-vs-final distinction in
+/// `device_delegation`.
+///
+/// A message the user typed must survive the push failing. The secondary
+/// persists locally *before* it pushes, and an unreachable primary leaves
+/// the row `pending` — never `failed`, which is reserved for a real
+/// refusal the primary reported and which is never retried. Getting this
+/// backwards would strand messages that were going to work seconds later.
+#[tokio::test]
+async fn a_delegated_send_with_no_reachable_primary_stays_pending() {
+    use_mock_keychain();
+    let dir = test_dir("delegation-pending");
+    let manager = ProfileManager::new(&dir, "bh-api-smoke-delegation-pending".to_string());
+    let profile = manager.create_profile("s", 0).unwrap();
+    let session = open_profile_session(&manager, &profile.id, true);
+    // Deliberately no network attached: the primary is unreachable in the
+    // most complete way possible.
+    let state = Arc::new(AppState::new(manager, session));
+    let app = ApiServer::router(state.clone());
+
+    let device_identity = bh_crypto::identity::IdentityKeyPair::generate().unwrap();
+    let device_public = device_identity.public_identity_bytes();
+    state
+        .db()
+        .set_linked_account(&bh_storage::models::LinkedAccount {
+            device_id: hex::encode(&device_public[..32]),
+            device_public_key: device_public.to_vec(),
+            device_private_key: device_identity.export_bytes().to_vec(),
+            account_public_key: vec![9u8; 64],
+            linked_at: 0,
+            revoked_at: None,
+        })
+        .unwrap();
+
+    let conversations: Value = body_json(
+        app.clone()
+            .oneshot(get_request("/conversations"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let conversation_id = conversations
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == json!("self"))
+        .unwrap()["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let sent: Value = body_json(
+        app.clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/conversations/{conversation_id}/messages"),
+                json!({"body": "typed while the primary was off"}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let message_id = sent["message"]["message_id"].as_str().unwrap();
+
+    // The message itself is not lost.
+    assert_eq!(
+        state.db().get_message(message_id).unwrap().unwrap().body,
+        Some("typed while the primary was off".to_string()),
+    );
+    // And it is queued, not written off.
+    let row = state.db().get_delegated_send(message_id).unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        bh_storage::delegated_sends::DelegationState::Pending,
+        "an unreachable primary is a delay, not a refusal"
+    );
+    assert!(row.error.is_none());
+    assert_eq!(
+        state.db().list_pending_delegated_sends(10).unwrap().len(),
+        1
+    );
 }

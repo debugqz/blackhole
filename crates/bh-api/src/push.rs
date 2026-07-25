@@ -62,7 +62,16 @@ const RELAY_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 /// "best-effort background wake" want different bounds.
 pub(crate) fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        // Same no-redirect posture as `pinned_relay_client` builds, for
+        // the same reason (see there) — this is only reached on the
+        // explicitly-opted-out `ALLOW_PRIVATE_RELAY_ENV` path, but a relay
+        // endpoint has no legitimate reason to redirect either way.
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// Env var that disables this module's SSRF guard on `relay_url` — off by
@@ -199,6 +208,18 @@ pub(crate) async fn pinned_relay_client(url: &url::Url) -> Result<reqwest::Clien
     };
     reqwest::Client::builder()
         .resolve(host, addr)
+        // Without this the DNS pin above is decorative: `reqwest` follows
+        // up to 10 redirects by default, and `ClientBuilder::resolve` only
+        // overrides resolution for `host` — a `302` to any *other* host is
+        // resolved and connected to normally. A hostile relay could
+        // therefore answer the wake request with a redirect to
+        // `169.254.169.254`, loopback, or an internal service and have
+        // this daemon fetch it, which is precisely the SSRF the guard
+        // exists to prevent. The Tauri client's own `link_preview.rs`
+        // already validates every redirect hop; the daemon has no reason
+        // to follow any, since both endpoints it calls
+        // (`POST /register`, `POST /wake/:token`) answer directly.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "failed to build a DNS-pinned relay HTTP client")
 }

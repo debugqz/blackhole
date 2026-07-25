@@ -93,7 +93,18 @@ export async function subscribeToCallStream(
     }
   });
 
-  await invoke("subscribe_call_stream", { callId });
+  try {
+    await invoke("subscribe_call_stream", { callId });
+  } catch (err) {
+    // The two listeners above are already registered — without this they'd
+    // stay attached for the lifetime of the window (and keep invoking
+    // `handlers` for any later call that reuses this id) even though the
+    // caller got a rejected promise and will never call the unsubscribe
+    // function this function never returned.
+    unlistenEvent();
+    unlistenFrame();
+    throw err;
+  }
 
   return async () => {
     unlistenEvent();

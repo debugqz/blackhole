@@ -8,20 +8,21 @@ import {
   type FileMetaPublic,
   type GroupDTO,
   type Message,
-  type NetworkCallSummary,
   type PaymentAsset,
   type PaymentRequestView,
   type ProfileMeta,
+  type RingingCallSummary,
   type TrustLevel,
 } from "./api";
 import {
   isLinkPreviewsEnabled,
   setLinkPreviewsEnabled,
   LINK_PREVIEW_SETTING_COPY,
-  renderLinkPreviewCard,
+  renderLinkPreviewSlot,
 } from "./link_preview";
 import { ensureDaemonRunning } from "./daemon_lifecycle";
 import { invoke } from "@tauri-apps/api/core";
+import { openExternal } from "./external_link";
 import { subscribeToCallStream, FrameKind, Vp8CanvasRenderer, type CallEvent } from "./calls";
 import {
   bytesToHex,
@@ -29,6 +30,7 @@ import {
   derivePrfSecret,
   enrollDatabaseUnlockGate,
   getPrfUnlockConfig,
+  savePrfUnlockConfig,
 } from "./prf_unlock";
 import {
   applyUiPrefs,
@@ -48,6 +50,7 @@ import {
   setQuickReactions,
   setReduceMotionEnabled,
   setStripExifEnabled,
+  splitGraphemes,
   type Density,
   type FontSize,
 } from "./ui_prefs";
@@ -238,6 +241,19 @@ function resetAppState() {
   currentAttachments = new Map();
   reportMode = false;
   reportSelection.clear();
+  // Everything else that holds content derived from this profile: link
+  // preview titles/descriptions/URLs and their fetched images, decrypted
+  // voice audio, a decoded blocklist, the contact being verified. The
+  // arrays above were being cleared while these quietly survived a panic
+  // wipe.
+  clearLinkPreviewCache();
+  releaseVoiceObjectUrls();
+  decodedBlocklist = [];
+  verifyingContact = null;
+  seenNetworkCallIds.clear();
+  ringingCallIds.clear();
+  ringingQueue = [];
+  $<HTMLDivElement>("incoming-call-banner").hidden = true;
   $<HTMLDivElement>("thread-empty").hidden = false;
   $<HTMLDivElement>("thread-active").hidden = true;
   // Clear rendered plaintext out of the DOM, not just the JS-side arrays
@@ -266,7 +282,7 @@ function resetAppState() {
 /// Ensures the daemon is actually running before anything else — either
 /// starting it plainly, or, if a PRF database-unlock gate is configured
 /// (`prf_unlock.ts`), waiting on a passkey assertion first and starting
-/// the daemon with the derived secret as `BLACKHOLE_DB_PIN`. This is the
+/// the daemon with the derived secret on its stdin. This is the
 /// real gate THREAT_MODEL.md §3.7 describes: unlike the *client-UI-only*
 /// passkey/TOTP screen further down in `boot()` (which runs after the
 /// daemon has already opened the database), the daemon process here
@@ -483,7 +499,16 @@ function showSeedScreen(seedPhrase: string) {
 // ---------------- main app ----------------
 async function enterApp() {
   showOnly("screen-app");
-  await Promise.all([refreshContacts(), refreshConversations(), refreshGroups(), refreshRequestsBadge()]);
+  await Promise.all([
+    refreshContacts(),
+    refreshConversations(),
+    refreshGroups(),
+    refreshRequestsBadge(),
+    // An equipped theme has to be re-applied on every entry — it lives in
+    // the daemon's cosmetics state, not in the DOM, so previously it was
+    // only ever (attempted to be) applied at the moment of equipping.
+    applyEquippedTheme(),
+  ]);
 }
 
 async function refreshContacts() {
@@ -632,6 +657,9 @@ async function openConversation(conversationId: string) {
 
   const msgs = $<HTMLDivElement>("msgs");
   msgs.replaceChildren(el("div", "msg-meta", "Loading…"));
+  // The outgoing thread's players are gone as of that `replaceChildren` —
+  // don't leave their decrypted audio pinned in memory behind them.
+  releaseVoiceObjectUrls();
   currentAttachments = new Map();
   try {
     const [messages, attachments] = await Promise.all([
@@ -802,48 +830,108 @@ async function attachCallStream(callId: string) {
   });
 }
 
-// Minimal visibility for a real-network call this client didn't place
-// itself (`GET /calls/network`, `bh-api::calls::list_network_calls`) —
-// there's no "ringing, not yet answered" state to notify on, since the
-// daemon auto-accepts an incoming `Offer` immediately, so this only ever
-// surfaces calls that are already connected (a banner + a way to attach to
-// the stream), not a full pre-accept ringing UI.
+// A real incoming call now rings before anything connects: the daemon
+// records the offer and stops (`GET /calls/ringing`), and nothing touches
+// the microphone until Answer is clicked here. Declining tells the caller
+// to stop ringing. `GET /calls/network` is still polled separately, for
+// calls that are already live (e.g. one this client placed itself from
+// another device's answer).
 const seenNetworkCallIds = new Set<string>();
+const ringingCallIds = new Set<string>();
+// Calls waiting for an answer/decline, oldest first. There is one banner
+// with one pair of buttons, so only the head is ever displayed: attaching
+// a second call's handlers to those same buttons (as this used to, via
+// `addEventListener` per banner) meant one press of "Answer" fired every
+// queued call's handler at once.
+let ringingQueue: RingingCallSummary[] = [];
 
-function showIncomingCallBanner(summary: NetworkCallSummary) {
-  const name = contactsById.get(summary.contact_id)?.display_name || "Someone";
+function renderRingingBanner() {
   const banner = $<HTMLDivElement>("incoming-call-banner");
-  $<HTMLSpanElement>("incoming-call-banner-text").textContent = `Call with ${name}`;
+  const summary = ringingQueue[0];
+  if (!summary) {
+    banner.hidden = true;
+    return;
+  }
+
+  const name = contactsById.get(summary.contact_id)?.display_name || "Someone";
+  const kind = summary.video ? "Video call" : "Call";
+  const waiting = ringingQueue.length > 1 ? ` (+${ringingQueue.length - 1} more)` : "";
+  $<HTMLSpanElement>("incoming-call-banner-text").textContent = `${kind} from ${name}${waiting}`;
   banner.hidden = false;
 
-  const joinBtn = $<HTMLButtonElement>("incoming-call-banner-join");
-  const dismissBtn = $<HTMLButtonElement>("incoming-call-banner-dismiss");
-  const cleanup = () => {
-    banner.hidden = true;
-    joinBtn.removeEventListener("click", onJoin);
-    dismissBtn.removeEventListener("click", onDismiss);
+  const answerBtn = $<HTMLButtonElement>("incoming-call-banner-join");
+  const declineBtn = $<HTMLButtonElement>("incoming-call-banner-dismiss");
+  answerBtn.textContent = "Answer";
+  declineBtn.textContent = "Decline";
+
+  // `onclick =` rather than `addEventListener`, so re-rendering the banner
+  // replaces the previous call's handler instead of stacking another one.
+  answerBtn.onclick = () => {
+    dropRingingCall(summary.call_id);
+    void (async () => {
+      try {
+        await api.answerRingingCall(summary.call_id);
+      } catch {
+        window.alert("Could not answer the call — the caller may have hung up.");
+        return;
+      }
+      seenNetworkCallIds.add(summary.call_id);
+      openCallOverlay(`${kind} with ${name}`, false);
+      void attachCallStream(summary.call_id);
+    })();
   };
-  const onJoin = () => {
-    cleanup();
-    openCallOverlay(`Call with ${name}`, false);
-    void attachCallStream(summary.call_id);
+  declineBtn.onclick = () => {
+    dropRingingCall(summary.call_id);
+    void api.declineRingingCall(summary.call_id).catch(() => {
+      /* best-effort — the caller finding out is a courtesy, not required */
+    });
   };
-  const onDismiss = () => cleanup();
-  joinBtn.addEventListener("click", onJoin);
-  dismissBtn.addEventListener("click", onDismiss);
+}
+
+function dropRingingCall(callId: string) {
+  ringingQueue = ringingQueue.filter((c) => c.call_id !== callId);
+  ringingCallIds.delete(callId);
+  renderRingingBanner();
 }
 
 async function pollIncomingNetworkCalls() {
-  let calls: NetworkCallSummary[];
+  let live: RingingCallSummary[];
   try {
-    calls = await api.listNetworkCalls();
+    live = await api.listRingingCalls();
   } catch {
     return; // best-effort — daemon not reachable yet, or a transient error
   }
-  for (const summary of calls) {
-    if (summary.call_id === activeCallId || seenNetworkCallIds.has(summary.call_id)) continue;
-    seenNetworkCallIds.add(summary.call_id);
-    showIncomingCallBanner(summary);
+
+  const liveIds = new Set(live.map((c) => c.call_id));
+  // Drop anything the daemon no longer reports as ringing (the caller hung
+  // up, or it was answered elsewhere) — otherwise both the queue and
+  // `ringingCallIds` grow for the lifetime of the process and a stale
+  // banner keeps offering a call that no longer exists.
+  ringingQueue = ringingQueue.filter((c) => liveIds.has(c.call_id));
+  for (const id of [...ringingCallIds]) {
+    if (!liveIds.has(id)) ringingCallIds.delete(id);
+  }
+  for (const summary of live) {
+    if (ringingCallIds.has(summary.call_id)) continue;
+    ringingCallIds.add(summary.call_id);
+    ringingQueue.push(summary);
+  }
+  renderRingingBanner();
+
+  try {
+    const networkCallIds = new Set((await api.listNetworkCalls()).map((c) => c.call_id));
+    for (const summary of networkCallIds) {
+      if (summary !== activeCallId) seenNetworkCallIds.add(summary);
+    }
+    // Same unbounded-growth fix as above: forget calls the daemon has
+    // finished with, keeping only the one this client placed itself.
+    for (const id of [...seenNetworkCallIds]) {
+      if (!networkCallIds.has(id) && !liveIds.has(id) && id !== activeCallId) {
+        seenNetworkCallIds.delete(id);
+      }
+    }
+  } catch {
+    /* same best-effort posture */
   }
 }
 
@@ -968,11 +1056,11 @@ function renderMessage(message: Message): HTMLDivElement {
     loadMessageSticker(message.message_id, bubble);
   }
   if (message.body !== null) {
-    const previewSlot = el("div");
-    stack.append(previewSlot);
-    renderLinkPreviewCard(message.body).then((card) => {
-      if (card) previewSlot.append(card);
-    });
+    // Renders a "Load preview" affordance, not a preview — nothing is
+    // fetched until the user presses it. See `renderLinkPreviewSlot`'s doc
+    // for why eager fetching was a covert read receipt for the sender.
+    const previewSlot = renderLinkPreviewSlot(message.body);
+    if (previewSlot) stack.append(previewSlot);
   }
 
   if (attachment && !isVoiceMessage) {
@@ -1101,6 +1189,17 @@ function formatDuration(seconds: number | null): string {
 /// A voice message's inline player. Audio bytes are fetched lazily on
 /// first play, not eagerly for every message in the list — same "don't
 /// pull ciphertext off disk until asked" spirit as `renderAttachmentChip`.
+/// Object URLs minted for voice-message playback. Each one pins decrypted
+/// audio in memory for as long as it exists, so they're revoked whenever
+/// the thread they belong to is torn down (switching conversations, panic
+/// wipe) rather than leaking for the lifetime of the window.
+const voiceObjectUrls = new Set<string>();
+
+function releaseVoiceObjectUrls() {
+  for (const url of voiceObjectUrls) URL.revokeObjectURL(url);
+  voiceObjectUrls.clear();
+}
+
 function renderVoicePlayer(file: FileMetaPublic): HTMLDivElement {
   const wrap = el("div", "voice-player");
   const playBtn = el("button", "voice-play-btn", "▶") as HTMLButtonElement;
@@ -1122,7 +1221,9 @@ function renderVoicePlayer(file: FileMetaPublic): HTMLDivElement {
       const bytes = new Uint8Array(byteChars.length);
       for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
       const blob = new Blob([bytes], { type: downloaded.mime_type || "audio/webm" });
-      audioEl = new Audio(URL.createObjectURL(blob));
+      const objectUrl = URL.createObjectURL(blob);
+      voiceObjectUrls.add(objectUrl);
+      audioEl = new Audio(objectUrl);
       audioEl.addEventListener("play", () => {
         playBtn.textContent = "⏸";
       });
@@ -1164,8 +1265,17 @@ function renderAttachmentChip(
       const link = el("a") as HTMLAnchorElement;
       link.href = url;
       link.download = downloaded.file_name ?? "download";
+      // The anchor has to be in the document for the click to be honored
+      // in a webview, and the object URL has to outlive the click — the
+      // download reads it asynchronously, so revoking on the next line
+      // (as this used to) races the browser and can drop the file.
+      link.hidden = true;
+      document.body.append(link);
       link.click();
-      URL.revokeObjectURL(url);
+      setTimeout(() => {
+        link.remove();
+        URL.revokeObjectURL(url);
+      }, 60_000);
     } catch (err) {
       window.alert(errorMessage(err));
     } finally {
@@ -1915,7 +2025,12 @@ async function renderStore() {
           try {
             const purchase = await api.purchaseCosmetic(item.item_id);
             if (purchase.checkout_url) {
-              window.open(purchase.checkout_url, "_blank", "noopener,noreferrer");
+              // `window.open` is a no-op in this webview (WKWebView returns
+              // null with no UI delegate), so the checkout page never
+              // actually opened. `openUrl` hands it to the OS browser,
+              // which is where a payment page belongs anyway — it must not
+              // load inside the app's own webview.
+              await openExternal(purchase.checkout_url);
               window.alert("Invoice created. The cosmetic is granted once BTCPay confirms payment.");
             } else {
               window.alert(
@@ -1947,7 +2062,7 @@ async function renderStore() {
         try {
           await api.equipCosmetic(item.kind, item.item_id);
           await renderStore();
-          if (item.kind === "theme") applyEquippedTheme();
+          if (item.kind === "theme") await applyEquippedTheme();
         } catch (err) {
           window.alert(errorMessage(err));
         }
@@ -1968,6 +2083,7 @@ async function renderStore() {
         try {
           await api.unequipCosmetic(item.kind);
           await renderStore();
+          if (item.kind === "theme") await applyEquippedTheme();
         } catch (err) {
           window.alert(errorMessage(err));
         }
@@ -1981,11 +2097,23 @@ async function renderStore() {
   }
 }
 
-/// No real theming asset pipeline yet — this just toggles a class so an
-/// equipped theme is visibly different, consistent with the store's
-/// "cosmetic only" framing.
-function applyEquippedTheme() {
-  document.body.className = document.body.className.replace(/\btheme-\S+/g, "");
+/// No real theming asset pipeline yet — this just puts a `theme-<id>`
+/// class on `<body>` so an equipped theme is visibly different, consistent
+/// with the store's "cosmetic only" framing. It previously only ever
+/// *stripped* the class and never added one, so equipping a theme did
+/// nothing at all.
+async function applyEquippedTheme() {
+  const stripped = document.body.className.replace(/\btheme-\S+/g, "").trim();
+  let themeId: string | null = null;
+  try {
+    themeId = (await api.listCosmeticsEquipped()).find((i) => i.kind === "theme")?.item_id ?? null;
+  } catch {
+    // Leave the app on the default theme rather than failing the equip.
+  }
+  // The item id is server-supplied, so keep it to a class-name-safe shape
+  // instead of splicing it into `className` as-is.
+  const safeId = themeId?.replace(/[^a-zA-Z0-9_-]/g, "");
+  document.body.className = safeId ? `${stripped} theme-${safeId}`.trim() : stripped;
 }
 
 $<HTMLButtonElement>("open-store").addEventListener("click", async () => {
@@ -2166,7 +2294,7 @@ $<HTMLButtonElement>("open-security").addEventListener("click", async () => {
   $<HTMLDivElement>("blocklist-preview").replaceChildren();
   $<HTMLButtonElement>("blocklist-apply").hidden = true;
   $<HTMLParagraphElement>("blocklist-status").textContent = "";
-  await Promise.all([renderDevicesList(), renderLocalAuthStatus()]);
+  await Promise.all([renderDeviceRole(), renderDevicesList(), renderLocalAuthStatus()]);
 });
 $<HTMLInputElement>("typing-indicator-toggle").addEventListener("change", async (event) => {
   const checkbox = event.target as HTMLInputElement;
@@ -2244,8 +2372,9 @@ $<HTMLInputElement>("underline-links-toggle").addEventListener("change", (event)
 });
 $<HTMLInputElement>("quick-reactions-input").addEventListener("change", (event) => {
   const raw = (event.target as HTMLInputElement).value;
-  const emojis = Array.from(raw).filter((ch) => ch.trim().length > 0);
-  setQuickReactions(emojis);
+  // Grapheme-wise, not code-point-wise — see `splitGraphemes`' doc for why
+  // `Array.from` shredded `❤️`, skin tones, and ZWJ sequences here.
+  setQuickReactions(splitGraphemes(raw));
   (event.target as HTMLInputElement).value = getQuickReactions().join(" ");
 });
 $<HTMLButtonElement>("clear-link-preview-cache").addEventListener("click", () => {
@@ -3031,6 +3160,85 @@ $<HTMLButtonElement>("verify-group-crypto").addEventListener("click", async () =
 });
 
 // ---------------- devices / local unlock (security overlay) ----------------
+
+/// Says plainly which side of the primary/secondary split this daemon is
+/// on, because it changes what the app can do. A secondary holds no
+/// account identity: it delegates every send to the primary, so its
+/// messages sit pending while the primary is offline, and account-level
+/// actions (adding group members, verifying safety numbers, issuing
+/// invites, placing calls) are unavailable rather than merely hidden.
+/// Stating that is better than letting those actions fail with an
+/// unexplained error.
+async function renderDeviceRole() {
+  const box = $<HTMLDivElement>("device-role");
+  box.replaceChildren(el("div", "empty-note", "Loading…"));
+  try {
+    const role = await api.deviceRole();
+    box.replaceChildren();
+
+    if (role.role === "primary") {
+      box.append(el("div", "device-role-title", "Primary device"));
+      box.append(
+        el(
+          "p",
+          "hint-text",
+          "This device holds the account identity. It sends and receives on behalf of every linked device.",
+        ),
+      );
+      return;
+    }
+
+    if (role.role === "unprovisioned") {
+      box.append(el("div", "device-role-title", "Not set up yet"));
+      box.append(el("p", "hint-text", "Create an identity, or link this device to an existing account."));
+      return;
+    }
+
+    if (role.revoked_at !== null) {
+      box.append(el("div", "device-role-title", "Unlinked by the primary device"));
+      box.append(
+        el(
+          "p",
+          "hint-text",
+          "This device was removed from the account, so it no longer sends or receives. Its local history is still here until you wipe it.",
+        ),
+      );
+    } else {
+      box.append(el("div", "device-role-title", "Linked device"));
+      box.append(
+        el(
+          "p",
+          "hint-text",
+          "Messages you send here are handed to the primary device, which encrypts and sends them. They stay pending while that device is offline, and nothing new arrives here until it comes back.",
+        ),
+      );
+    }
+    if (role.device_id) {
+      box.append(el("div", "hint-text mono", `Device id: ${role.device_id.slice(0, 16)}…`));
+    }
+
+    const unlink = el("button", "chip-btn", "Unlink this device");
+    unlink.addEventListener("click", async () => {
+      if (
+        !window.confirm(
+          "Unlink this device from the account? It will stop syncing. This does not remove it from the primary device's list — do that there too.",
+        )
+      ) {
+        return;
+      }
+      try {
+        await api.unlinkSelf();
+        await renderDeviceRole();
+      } catch (err) {
+        window.alert(errorMessage(err));
+      }
+    });
+    box.append(unlink);
+  } catch (err) {
+    box.replaceChildren(el("div", "error-text", errorMessage(err)));
+  }
+}
+
 async function renderDevicesList() {
   const list = $<HTMLDivElement>("devices-list");
   list.replaceChildren(el("div", "empty-note", "Loading…"));
@@ -3300,8 +3508,14 @@ $<HTMLButtonElement>("enable-db-lock").addEventListener("click", async () => {
     const { challenge_json } = await api.passkeyRegisterStart();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rpId = (challenge_json as any).publicKey.rp.id as string;
-    const secret = await enrollDatabaseUnlockGate(rpId);
+    const { config, secret } = await enrollDatabaseUnlockGate(rpId);
+    // Order matters: the gate config is only written once the daemon has
+    // actually sealed its database key behind this secret. The other way
+    // round, a failed `setDbPin` left a gate on disk protecting nothing —
+    // every launch demanded the passkey while the database opened
+    // unprotected anyway. See `enrollDatabaseUnlockGate`'s doc comment.
     await api.setDbPin(bytesToHex(secret));
+    await savePrfUnlockConfig(config);
     window.alert(
       "Database lock enabled. The daemon will ask for this passkey the next time it starts.",
     );

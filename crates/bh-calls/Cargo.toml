@@ -12,6 +12,15 @@ tracing = { workspace = true }
 serde = { workspace = true }
 bytes = "1"
 
+# Ephemeral TURN credentials (coturn's `use-auth-secret`/TURN REST API
+# scheme, see `transport::default_ice_servers`) — HMAC-SHA1 is what that
+# protocol mandates for interop with coturn itself, not a choice made here;
+# same "audited primitive, not homegrown" pattern bh-crypto::webhook.rs
+# already uses with HMAC-SHA256.
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+
 bh-crypto = { workspace = true }
 
 # WebRTC transport: ICE/DTLS/SRTP and RTP (de)packetization. This gives us

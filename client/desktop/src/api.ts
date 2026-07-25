@@ -250,6 +250,19 @@ export interface SyncedMessage {
   ratchet_roundtrip_ok: boolean;
 }
 
+/// Which side of the primary/secondary split this daemon is on. A
+/// secondary has no account identity of its own — it delegates every send
+/// to the primary, so most account-level actions are simply unavailable
+/// on it (see `bh-api::device_role`).
+export interface DeviceRole {
+  role: "primary" | "secondary" | "unprovisioned";
+  device_id: string | null;
+  linked_at: number | null;
+  /// Set once the primary unlinked this device. The row is kept rather
+  /// than cleared so this screen can say why syncing stopped.
+  revoked_at: number | null;
+}
+
 export interface DeviceSyncResponse {
   device_id: string;
   synced: SyncedMessage[];
@@ -441,6 +454,16 @@ export interface NetworkCallSummary {
   contact_id: string;
 }
 
+/// An incoming call offer that has arrived but has *not* been answered:
+/// no microphone, no camera, no WebRTC session exists for it yet. It
+/// becomes a `NetworkCallSummary` only after `answerRingingCall`.
+export interface RingingCallSummary {
+  call_id: string;
+  contact_id: string;
+  video: boolean;
+  received_at: number;
+}
+
 // ---------------- dead man's switch ----------------
 
 export interface DeadMansSwitchStatus {
@@ -604,7 +627,11 @@ export const api = {
       sealed_base64: sealedBase64,
     }),
 
-  // ---------------- device linking (local simulation) ----------------
+  // ---------------- device role (primary / linked secondary) ----------------
+  deviceRole: () => call<DeviceRole>("GET", "/devices/role"),
+  unlinkSelf: () => call<void>("POST", "/devices/unlink-self", {}),
+
+  // ---------------- device linking ----------------
   listDevices: () => call<Device[]>("GET", "/devices"),
   revokeDevice: (deviceId: string) => call<void>("POST", `/devices/${encodeURIComponent(deviceId)}/revoke`),
   beginDeviceLink: () => call<BeginLinkResponse>("POST", "/devices/link/begin", {}),
@@ -621,7 +648,7 @@ export const api = {
       { response_ciphertext_b64: responseCiphertextB64 },
     ),
 
-  // ---------------- device sync (local simulation) ----------------
+  // ---------------- device sync ----------------
   syncDevice: (deviceId: string) => call<DeviceSyncResponse>("GET", `/devices/${encodeURIComponent(deviceId)}/sync`),
   deviceSyncStatus: (deviceId: string) =>
     call<DeviceSyncStatusResponse>("GET", `/devices/${encodeURIComponent(deviceId)}/sync/status`),
@@ -781,12 +808,18 @@ export const api = {
   completeCall: (callId: string, answer: CallSignal) =>
     call<void>("POST", `/calls/${encodeURIComponent(callId)}/complete`, { answer }),
   hangupCall: (callId: string) => call<void>("POST", `/calls/${encodeURIComponent(callId)}/hangup`),
-  // Polled for minimal "a real-network call just went live" visibility —
-  // see `main.ts`'s incoming-call banner. There's no "ringing, not yet
-  // answered" state to notify on (the daemon auto-accepts an incoming
-  // offer immediately), so this only ever reports calls that are already
-  // connected.
+  // Calls that are already connected. Offers still waiting on the user
+  // are reported by `listRingingCalls` instead.
   listNetworkCalls: () => call<NetworkCallSummary[]>("GET", "/calls/network"),
+
+  // Incoming offers awaiting an explicit answer — the daemon deliberately
+  // does not connect one on arrival (it would open the microphone with no
+  // prompt), so this is what drives the incoming-call banner.
+  listRingingCalls: () => call<RingingCallSummary[]>("GET", "/calls/ringing"),
+  answerRingingCall: (callId: string) =>
+    call<void>("POST", `/calls/ringing/${encodeURIComponent(callId)}/answer`),
+  declineRingingCall: (callId: string) =>
+    call<void>("POST", `/calls/ringing/${encodeURIComponent(callId)}/decline`),
 
   startCamera: (callId: string, fps?: number) =>
     call<void>("POST", `/calls/${encodeURIComponent(callId)}/camera/start`, { fps }),

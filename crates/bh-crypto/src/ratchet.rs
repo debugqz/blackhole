@@ -692,7 +692,53 @@ impl Session {
         Ok(())
     }
 
+    /// A working copy of every field [`decrypt_committing`] may mutate, so
+    /// a decryption attempt can be rolled back wholesale. Private and
+    /// hand-written rather than a derived `Clone`: this duplicates live
+    /// key material, which is exactly the kind of thing that shouldn't
+    /// become part of this type's public API by accident.
+    fn trial_copy(&self) -> Self {
+        Self {
+            associated_data: self.associated_data.clone(),
+            root_key: self.root_key.clone(),
+            dh_self_secret: self.dh_self_secret.clone(),
+            dh_self_public: self.dh_self_public,
+            dh_remote_public: self.dh_remote_public,
+            sending_chain_key: self.sending_chain_key.clone(),
+            receiving_chain_key: self.receiving_chain_key.clone(),
+            send_count: self.send_count,
+            recv_count: self.recv_count,
+            prev_chain_len: self.prev_chain_len,
+            skipped_keys: self.skipped_keys.clone(),
+        }
+    }
+
+    /// Decrypts one message, **atomically**: ratchet state advances only
+    /// if the AEAD check actually passes.
+    ///
+    /// This distinction is not cosmetic. The steps that precede the AEAD
+    /// check ([`Self::dh_ratchet`], [`Self::skip_receiving_keys`], and
+    /// consuming a chain key) all mutate the session, and a
+    /// `RatchetMessage` is attacker-supplied in the sense that matters
+    /// here: mailbox entries live in a public DHT, so anyone can replay a
+    /// previously-delivered message verbatim, sealed-sender signature and
+    /// all. Applying those mutations before verifying meant one replayed
+    /// message advanced the receiving chain past where the peer actually
+    /// was — permanently desynchronizing the session, so every subsequent
+    /// *legitimate* message failed too. Running the attempt on a copy and
+    /// committing only on success is what Signal's own implementation
+    /// does, and it makes a replay a no-op instead of a kill shot.
     pub fn decrypt(&mut self, msg: &RatchetMessage) -> Result<Vec<u8>, CryptoError> {
+        let mut trial = self.trial_copy();
+        let plaintext = trial.decrypt_committing(msg)?;
+        *self = trial;
+        Ok(plaintext)
+    }
+
+    /// The actual ratchet steps, mutating `self` as it goes. Private —
+    /// every caller goes through [`decrypt`](Self::decrypt), which runs
+    /// this against a throwaway copy so a failure leaves nothing behind.
+    fn decrypt_committing(&mut self, msg: &RatchetMessage) -> Result<Vec<u8>, CryptoError> {
         let message_key = if let Some(mk) = self.try_skipped(msg) {
             mk
         } else {
@@ -1038,6 +1084,91 @@ mod tests {
             bob.skipped_keys.len(),
             800,
             "a rejected skip must not partially insert keys"
+        );
+    }
+
+    /// The bug that made a replay a permanent kill shot: `decrypt` used to
+    /// advance the receiving chain *before* checking the AEAD, so a
+    /// replayed (or forged) message consumed a chain step that the real
+    /// next message then needed. Anyone can replay a mailbox entry — they
+    /// live in a public DHT — so this had to become atomic.
+    #[test]
+    fn a_replayed_message_does_not_desynchronize_the_session() {
+        let (mut alice, mut bob) = establish_session_pair();
+
+        let m1 = alice.encrypt(b"one").unwrap();
+        let m2 = alice.encrypt(b"two").unwrap();
+        let m3 = alice.encrypt(b"three").unwrap();
+
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"one");
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"two");
+
+        // Replay a message Bob already consumed: it must fail (its message
+        // key is gone) *without* disturbing anything else.
+        assert!(bob.decrypt(&m1).is_err(), "a replayed message must fail");
+        assert!(bob.decrypt(&m2).is_err(), "a replayed message must fail");
+
+        // The conversation must continue exactly as if the replays never
+        // happened.
+        assert_eq!(
+            bob.decrypt(&m3).unwrap(),
+            b"three",
+            "a replay must not consume the chain step the next real message needs"
+        );
+        let m4 = alice.encrypt(b"four").unwrap();
+        assert_eq!(bob.decrypt(&m4).unwrap(), b"four");
+    }
+
+    /// A forged header (an unknown `dh_public` with a plausible counter)
+    /// would otherwise force a DH ratchet step before the AEAD ever ran,
+    /// throwing away the chain the real peer is still using.
+    #[test]
+    fn a_forged_ratchet_header_does_not_destroy_the_session() {
+        let (mut alice, mut bob) = establish_session_pair();
+
+        let m1 = alice.encrypt(b"before").unwrap();
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"before");
+
+        let forged = RatchetMessage {
+            dh_public: [0xAB; 32],
+            prev_chain_len: 0,
+            counter: 0,
+            ciphertext: vec![0u8; 48],
+        };
+        assert!(bob.decrypt(&forged).is_err());
+
+        let m2 = alice.encrypt(b"after").unwrap();
+        assert_eq!(
+            bob.decrypt(&m2).unwrap(),
+            b"after",
+            "a forged header must not ratchet the session away from the real peer"
+        );
+    }
+
+    /// The skipped-key cache must survive a failed attempt too: `decrypt`
+    /// removes a skipped key before using it, so a rolled-back attempt has
+    /// to put it back or an out-of-order message would be lost by any
+    /// failure that happened to precede it.
+    #[test]
+    fn a_failed_decrypt_does_not_consume_a_cached_skipped_key() {
+        let (mut alice, mut bob) = establish_session_pair();
+
+        let m1 = alice.encrypt(b"one").unwrap();
+        let m2 = alice.encrypt(b"two").unwrap();
+
+        // Receiving m2 first caches m1's message key as skipped.
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"two");
+
+        // A message that reuses m1's header but carries garbage must fail
+        // and leave m1's cached key intact.
+        let mut corrupt = m1.clone();
+        corrupt.ciphertext = vec![0u8; m1.ciphertext.len()];
+        assert!(bob.decrypt(&corrupt).is_err());
+
+        assert_eq!(
+            bob.decrypt(&m1).unwrap(),
+            b"one",
+            "a failed attempt must not consume the cached skipped key"
         );
     }
 

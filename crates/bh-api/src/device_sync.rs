@@ -43,16 +43,17 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use bh_crypto::envelope::Envelope;
+use bh_crypto::envelope::{Envelope, SyncedContact};
 use bh_crypto::identity::IdentityKeyPair;
 use bh_crypto::ratchet::{self, PreKeyBundle, Session, SignedPreKey};
-use bh_storage::models::{Contact, ConversationKind};
+use bh_storage::models::Contact;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
 use crate::AppState;
 
@@ -244,24 +245,35 @@ async fn sync_device_over_network(
         .list_messages_since(cursor_sent_at, cursor_message_id.as_deref(), limit)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Mirror the contact book before any message: a mirrored message
+    // names its conversation by `contact_id`, and the receiving device
+    // refuses one it has no contact row for (it cannot invent an identity
+    // nobody verified). Sending contacts first is what keeps a device's
+    // very first sync from bouncing every message it is sent.
+    push_contact_sync(state, network, &pseudo_contact).await;
+
     let mut synced = Vec::new();
     let mut new_cursor = (cursor_sent_at, cursor_message_id);
     for message in &pending {
-        // Only `Direct` conversations sync over the real network this pass
-        // — see module doc.
+        // Every conversation kind mirrors now, not just `Direct`. Under
+        // the hub model that costs nothing extra: this device already
+        // decrypted the message with whatever real state it needed (a
+        // ratchet session, or MLS for a group), and what travels here is
+        // the resulting plaintext either way — a secondary is never an MLS
+        // member. See the design doc's §4.
         let Ok(Some(conversation)) = state.db().get_conversation(&message.conversation_id) else {
             continue;
         };
-        if conversation.kind != ConversationKind::Direct {
-            continue;
-        }
-        let Some(peer_contact_id) = conversation.contact_id.clone() else {
+        let Some(reference) = crate::device_delegation::conversation_ref(&conversation) else {
+            // An ephemeral-identity conversation deliberately doesn't
+            // speak for the account, so it has no cross-device name and
+            // is not mirrored.
             continue;
         };
 
         let envelope_bytes = Envelope::DeviceSyncMessage {
             message_id: message.message_id.clone(),
-            peer_contact_id,
+            conversation: reference,
             sender_contact_id: message.sender_contact_id.clone(),
             body: message.body.clone(),
             sent_at: message.sent_at,
@@ -456,4 +468,178 @@ pub async fn sync_status(
         cursor_message_id,
         pending_count,
     }))
+}
+
+/// How many contacts travel in one `Envelope::ContactSync`. `Envelope::
+/// encode` pads to size buckets up to 64 KiB and then grows in whole
+/// blocks, and `bh-network::mailbox` caps a DHT record — so the contact
+/// book is mirrored in batches rather than as one list that would waste
+/// padding at best and be rejected at worst.
+const CONTACT_SYNC_BATCH: usize = 32;
+
+/// How often the primary sweeps its linked devices. Slow on purpose: this
+/// is a catch-up mechanism for a device that was offline, not the delivery
+/// path for a live conversation, and every push costs proof-of-work.
+const DEVICE_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How many messages one automatic sweep pushes per device, so a long
+/// backlog drains over several ticks instead of in one burst.
+const AUTOMATIC_SYNC_LIMIT: i64 = 32;
+
+/// Mirrors this profile's contact book to one linked device.
+///
+/// Only public identity material travels (see `bh_crypto::envelope::
+/// SyncedContact`): no ratchet session, no prekey, nothing a secondary
+/// could encrypt to a contact with, because it never needs to — it
+/// delegates. `verified` is mirrored rather than recomputed because
+/// safety-number verification is a human act performed against the
+/// account's identity, so it belongs to the account rather than to
+/// whichever device happened to perform it.
+///
+/// Pseudo-contacts are skipped: the rows this account keeps for its own
+/// devices and its primary are local plumbing (`device_role::
+/// ensure_pseudo_contact`), and mirroring them would show a user their own
+/// devices as if they were people.
+async fn push_contact_sync(
+    state: &AppState,
+    network: &bh_network::supervised::SupervisedNetwork,
+    device_contact: &Contact,
+) {
+    let Ok(contacts) = state.db().list_contacts() else {
+        return;
+    };
+    let own_device_keys: Vec<Vec<u8>> = state
+        .db()
+        .list_own_devices()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| d.public_key)
+        .collect();
+    let real: Vec<SyncedContact> = contacts
+        .into_iter()
+        .filter(|c| {
+            c.identity_public_key.len() >= 32
+                && !own_device_keys
+                    .iter()
+                    .any(|k| k.as_slice() == &c.identity_public_key[..32])
+        })
+        .map(|c| SyncedContact {
+            contact_id: c.contact_id,
+            identity_public_key: c.identity_public_key,
+            display_name: c.display_name,
+            verified: c.verified,
+            blocked: c.blocked,
+            added_at: c.added_at,
+        })
+        .collect();
+
+    for (index, batch) in real.chunks(CONTACT_SYNC_BATCH).enumerate() {
+        let Ok(bytes) = (Envelope::ContactSync {
+            contacts: batch.to_vec(),
+        })
+        .encode() else {
+            continue;
+        };
+        // A stable id per (device, batch) rather than a fresh uuid: a
+        // re-sent batch overwrites its own previous mailbox entry instead
+        // of piling a new copy of the contact book into the manifest on
+        // every sweep.
+        let entry_id = format!("contact-sync-{}-{index}", device_contact.contact_id);
+        if let Err(err) = crate::message_crypto::send_encrypted_over_network(
+            state,
+            network,
+            device_contact,
+            &entry_id,
+            &bytes,
+        )
+        .await
+        {
+            tracing::warn!(?err, "device sync: contact mirror push failed");
+            return;
+        }
+    }
+}
+
+/// The secondary side: writes mirrored contacts into this device's own
+/// book.
+///
+/// Ids are preserved verbatim, which is not incidental — it is what makes
+/// `ConversationRef::Direct` mean the same thing on both devices (see that
+/// type's doc comment). Never deletes: a contact missing from a batch may
+/// simply be in another batch, and this device losing contacts because a
+/// sync was truncated would be worse than briefly keeping a stale one.
+pub(crate) fn apply_contact_sync(state: &AppState, contacts: Vec<SyncedContact>) {
+    for synced in contacts {
+        let contact = Contact {
+            contact_id: synced.contact_id,
+            identity_public_key: synced.identity_public_key,
+            display_name: synced.display_name,
+            verified: synced.verified,
+            blocked: synced.blocked,
+            added_at: synced.added_at,
+        };
+        if let Err(err) = state.db().upsert_contact(&contact) {
+            tracing::warn!(%err, "device sync: failed to apply a mirrored contact");
+        }
+    }
+}
+
+/// Runs device sync on a cadence instead of waiting for someone to press
+/// "Sync now".
+///
+/// A secondary that only receives what the user manually pushed to it is a
+/// viewer, not a device — this is what makes the pair behave like one
+/// account. Spawned once against the whole `AppState` and re-reads the
+/// active profile every tick, the same shape `message_receive::
+/// spawn_receive_loop` uses (and for the same reason: it never holds a
+/// per-profile handle across a tick, so a profile switch needs no restart).
+pub fn spawn_device_sync_loop(state: Arc<AppState>, interval: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            device_sync_tick(&state).await;
+        }
+    })
+}
+
+/// The default-cadence spawn, for `daemon/src/main.rs`.
+pub fn spawn_default_device_sync_loop(state: Arc<AppState>) -> JoinHandle<()> {
+    spawn_device_sync_loop(state, DEVICE_SYNC_INTERVAL)
+}
+
+async fn device_sync_tick(state: &AppState) {
+    let Some(network) = state.network.as_ref() else {
+        return;
+    };
+
+    // A secondary has nothing to push — it has no devices of its own —
+    // but it does have delegated sends that may still be waiting on a
+    // primary that was offline. Draining them here means "the primary came
+    // back" is enough, with no user action.
+    if let Some(linked) = crate::device_role::active_linked_account(state) {
+        crate::device_delegation::retry_pending_delegations(state, &linked).await;
+        return;
+    }
+
+    let Ok(devices) = state.db().list_own_devices() else {
+        return;
+    };
+    for device in devices {
+        if device.revoked_at.is_some() {
+            continue;
+        }
+        let Some(agreement_key) = device.identity_agreement_key.clone() else {
+            // Linked before per-device agreement keys existed, so it
+            // cannot be addressed on the network at all — see this
+            // module's doc comment.
+            continue;
+        };
+        if let Err(err) =
+            sync_device_over_network(state, network, &device, agreement_key, AUTOMATIC_SYNC_LIMIT)
+                .await
+        {
+            tracing::debug!(?err, device_id = %device.device_id, "automatic device sync failed");
+        }
+    }
 }

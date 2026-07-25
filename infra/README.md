@@ -4,9 +4,11 @@ Blackhole is deliberately infra-minimal (P2P, no servers hold message
 content — see `CLAUDE.md`/`docs/SPEC.md`). Three small pieces still need a
 real server, and as of this pass **the code for all three is done and
 tested**; what's in this directory is everything needed to actually stand
-them up quickly. Nothing here has been deployed to a real cloud
-account/domain by anyone — that step is yours (see "What this does *not*
-do" below).
+them up quickly. This guide stays generic for any operator standing up
+their own instance — see "Current live deployment" under "After
+deploying" for the one this project itself actually runs today (see "What
+this does *not* do" below for what a fresh deployment still requires from
+you).
 
 | Piece | What it's for | Code | Deploy artifact |
 |---|---|---|---|
@@ -41,11 +43,13 @@ community member just handed you their multiaddr, see
 - Doesn't generate real secrets. `.env.example`/`*.env.example` files have
   placeholder values — replace every one before starting anything
   internet-facing.
-- Doesn't add push-relay registration authentication or ephemeral
-  (short-lived) TURN credentials — both are real, known, *already
-  documented* gaps (`docs/THREAT_MODEL.md` §3.12 item 17, and this file's
-  own TURN section below), not fixed by this pass. Track them separately;
-  they don't block getting a basic deployment running.
+- Doesn't add push-relay registration authentication — a real, known,
+  *already documented* gap (`docs/THREAT_MODEL.md` §3.12 item 17), not
+  fixed by this pass. Doesn't block getting a basic deployment running.
+  (Ephemeral, short-lived TURN credentials *are* now available — see this
+  file's TURN section below and `docs/THREAT_MODEL.md` §3.15 — opt-in via
+  `TURN_AUTH_SECRET` instead of the original static
+  `TURN_USERNAME`/`TURN_CREDENTIAL` pair.)
 
 ## Order of operations
 
@@ -241,27 +245,37 @@ Only needed for calls where both peers are behind a symmetric NAT — the
 public STUN default (`BLACKHOLE_STUN_SERVERS`,
 `crates/bh-calls/src/transport.rs`) already covers ordinary NATs without
 any infrastructure of your own. This code's TURN support is
-**configuration only** — a `BLACKHOLE_TURN_SERVERS`/`_USERNAME`/
-`_CREDENTIAL` env var triple, all three required together — pointing at a
-real coturn instance you run separately (nothing in this repo implements
-a TURN server itself).
+**configuration only** — pointing at a real coturn instance you run
+separately (nothing in this repo implements a TURN server itself) — via
+one of two credential schemes.
 
-### Important limitation: static credentials only
+### Two credential schemes — pick one
 
-`default_ice_servers()` supports exactly one fixed username/credential
-pair via env vars — not coturn's time-limited `use-auth-secret` REST
-mechanism. That means whatever credential you set is effectively
-permanent until you change it and restart every daemon. This is a real
-production tradeoff (a leaked static credential is leaked forever,
-whereas a time-limited one expires on its own) — acceptable to get
-started, but if you want ephemeral per-session TURN credentials later,
-that needs a code change to `default_ice_servers()` first, not just a
-coturn config change.
+- **`TURN_AUTH_SECRET` (recommended).** coturn's `use-auth-secret`/TURN
+  REST API scheme. `bh-calls::transport::default_ice_servers` derives a
+  fresh, time-limited username/credential pair per call from this shared
+  secret (HMAC-SHA1 over an expiry-embedding username, exactly as
+  coturn's own REST API spec defines it — the secret itself never goes
+  out over the wire). A leaked *derived* credential expires on its own
+  (`BLACKHOLE_TURN_CREDENTIAL_TTL_SECS`, default 24h); only the shared
+  secret is permanent, and coturn never sees it directly either — it
+  recomputes the same HMAC itself to verify.
+- **`TURN_USERNAME`/`TURN_CREDENTIAL` (simpler, permanent).** One fixed
+  long-term-credential pair (coturn's `lt-cred-mech`). Whatever you set
+  is effectively permanent until you change it and restart every daemon —
+  a leaked static credential is leaked forever. Kept for setups that
+  don't want the extra `TURN_AUTH_SECRET` coordination step.
+
+If both are set, `TURN_AUTH_SECRET` wins on both the coturn side (this
+compose file's entrypoint) and the daemon side
+(`default_ice_servers`) — consistently, so the two ends never disagree
+about which scheme is actually in effect.
 
 ### Docker
 
 ```sh
-cp infra/.env.example infra/.env   # fill in TURN_REALM/_USERNAME/_CREDENTIAL/TURN_PUBLIC_IP
+cp infra/.env.example infra/.env   # fill in TURN_REALM/TURN_PUBLIC_IP, and either
+                                    # TURN_AUTH_SECRET or TURN_USERNAME+TURN_CREDENTIAL
 docker compose -f infra/docker-compose.yml up -d coturn
 ```
 
@@ -276,26 +290,42 @@ packaged one; use `coturn/turnserver.conf.example` with your distro's
 
 ### Wiring it into Blackhole daemons
 
-Set on every daemon that should use this TURN server for calls:
+Set on every daemon that should use this TURN server for calls — matching
+whichever scheme you picked above:
 
 ```sh
+# Option A — TURN_AUTH_SECRET (recommended):
+export BLACKHOLE_TURN_SERVERS="turn:turn.example.org:3478"
+export BLACKHOLE_TURN_AUTH_SECRET="<the same secret as TURN_AUTH_SECRET above>"
+# Optional: export BLACKHOLE_TURN_USERNAME="<a user label>" to embed one in
+# the derived username (coturn doesn't require it); export
+# BLACKHOLE_TURN_CREDENTIAL_TTL_SECS to override the 24h default.
+
+# Option B — static TURN_USERNAME/TURN_CREDENTIAL:
 export BLACKHOLE_TURN_SERVERS="turn:turn.example.org:3478"
 export BLACKHOLE_TURN_USERNAME="blackhole"
 export BLACKHOLE_TURN_CREDENTIAL="<the same secret as TURN_CREDENTIAL above>"
 ```
 
-If only `BLACKHOLE_TURN_SERVERS` is set without both username and
-credential, `default_ice_servers()` logs a `tracing::warn!` and skips
-adding a TURN entry rather than building a config `webrtc-rs` would
-reject at connection time — check daemon logs if calls still fail to
-connect after this step.
+If `BLACKHOLE_TURN_SERVERS` is set but neither scheme is fully configured,
+`default_ice_servers()` logs a `tracing::warn!` and skips adding a TURN
+entry rather than building a config `webrtc-rs` would reject at
+connection time — check daemon logs if calls still fail to connect after
+this step.
 
 ### Verifying it
 
-Any standard ICE/TURN test tool works against the `turn:`/`turns:` URL and
-credentials above (e.g. Mozilla's public "Trickle ICE" tester, or
-`turnutils_uclient` which ships with coturn itself:
-`turnutils_uclient -u blackhole -w <credential> turn.example.org`).
+For the static-credential scheme, any standard ICE/TURN test tool works
+directly against the `turn:`/`turns:` URL and credentials above (e.g.
+Mozilla's public "Trickle ICE" tester, or `turnutils_uclient` which ships
+with coturn itself: `turnutils_uclient -u blackhole -w <credential>
+turn.example.org`). For `TURN_AUTH_SECRET`, generate a username/credential
+pair the same way `default_ice_servers()` does before pointing a test tool
+at it — e.g. `turnutils_uclient` doesn't speak the REST scheme itself, so
+mint a short Python one-liner:
+`python3 -c "import hmac,hashlib,base64,time; u=str(int(time.time())+3600); print(u, base64.b64encode(hmac.new(b'<TURN_AUTH_SECRET>', u.encode(), hashlib.sha1).digest()).decode())"`
+then pass the printed `username`/`credential` to `turnutils_uclient -u
+<username> -w <credential> turn.example.org`.
 
 ### Firewall
 
@@ -317,3 +347,37 @@ consistently on both ends).
 - Consider monitoring/alerting on the bootstrap node's uptime specifically
   — it's the one single point of failure new peers depend on to find
   anyone at all (mitigate by running at least two, per §1 above).
+
+### Current live deployment
+
+Push relay and TURN are up on one AWS Lightsail instance; the bootstrap
+node runs there *and* on a second, independent Lightsail instance in a
+different region, for the redundancy §1 above recommends:
+
+| Piece | Address | Notes |
+|---|---|---|
+| Bootstrap node #1 | `/ip4/13.221.175.136/tcp/4001/p2p/12D3KooWKLwn3VqANVSf6QiHRoqSYkH1vf3me6rCxSTz3pXUeGfe` | AWS Lightsail, `us-east-1`. `docker run`-managed, not compose (see below) |
+| Bootstrap node #2 | `/ip4/34.215.163.120/tcp/4001/p2p/12D3KooWS5WqhkFTsJgrCfVBdk6FNkVFiHACLh29suxXQUryrxWF` | AWS Lightsail, `us-west-2`, standalone host — only runs the bootstrap node, nothing else. `BLACKHOLE_BOOTSTRAP_PEERS` on each points at the other, so they share one DHT swarm instead of being disjoint islands |
+| Push relay | `https://push.vanglaw.org` | On bootstrap-1's host. `docker compose`-managed (push-relay + Caddy); no host port for push-relay itself, only Caddy is internet-facing |
+| TURN | `13.221.175.136:3478` (`turn:`), `:5349` (`turns:`, no valid cert yet — no domain assigned to coturn) | On bootstrap-1's host. `docker run`-managed; static long-term credential, not yet switched to the `TURN_AUTH_SECRET` scheme §3.15 added |
+
+Known gaps against this specific deployment, not fixed as part of
+standing it up:
+
+- **`bh-push-relay`'s `forward_to_push_provider` is still a stub** — the
+  relay is live and reachable over real TLS, but doesn't wake a real
+  device (no APNs/FCM wired in yet).
+- **Bootstrap nodes and coturn are `docker run`-managed, not
+  `docker compose`-managed** — deliberately not migrated, to avoid any
+  risk to either bootstrap node's persistent on-disk network identity
+  (`BLACKHOLE_PERSISTENT_NETWORK_IDENTITY`) during the switch. Push-relay
+  and Caddy *are* compose-managed (`infra/docker-compose.yml`).
+- **No monitoring/alerting** is configured for any of the pieces above —
+  two bootstrap nodes lowers the odds of *simultaneous* downtime, but
+  nothing pages anyone if either goes dark individually.
+- **Bootstrap node #2's host is not a `git clone`-free copy** — unlike
+  bootstrap-1 (originally set up by copying source), bootstrap-2's
+  `/home/ubuntu/blackhole` *is* a real `git clone` of the repo's `origin`,
+  tracking whatever `main` was at setup time — a real (if partial) fix for
+  the "no clean update path" gap noted elsewhere; bootstrap-1 hasn't been
+  converted to match yet.

@@ -401,6 +401,20 @@ pub async fn finish_link(
         Err(other) => return Err(other),
     };
 
+    // Make the outcome durable. Everything above this point negotiated a
+    // real per-device identity and recovered the account's public identity
+    // — and then dropped both on the floor, which is why a genuinely
+    // separate new-device daemon used to finish linking and still listen
+    // to nothing. Note what is *not* installed: the account's private key
+    // material from `linked_identity` never becomes this profile's
+    // `own_identity` (see this module's doc comment), only its public half
+    // is kept, as an address and a sender to verify against.
+    crate::device_role::persist_secondary_role(
+        &state,
+        &new_device.device_identity,
+        linked_identity.public_identity_bytes(),
+    )?;
+
     Ok(Json(FinishLinkResponse {
         confirmed,
         device_signing_key_hex: hex::encode(

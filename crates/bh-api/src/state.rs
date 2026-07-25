@@ -101,6 +101,14 @@ pub struct AppState {
     pub calls: Arc<CallRegistry>,
     /// In-memory device-linking ceremony state (see `device_link.rs`).
     pub device_link: Arc<DeviceLinkRegistry>,
+    /// Which mailbox envelopes the receive loop has already acted on, so a
+    /// replayed one isn't delivered twice (see
+    /// `message_receive::ReplayGuard`). Not per-profile and not persisted:
+    /// it guards against an attacker re-publishing a DHT record during a
+    /// daemon's run, and a restart re-derives everything it protects
+    /// anyway (a replayed prekey message after a restart still can't
+    /// corrupt session state, since `Session::decrypt` is atomic).
+    pub replay_guard: Arc<crate::message_receive::ReplayGuard>,
     /// In-memory passkey/TOTP enrollment ceremony state (see
     /// `local_auth.rs`).
     pub local_auth: Arc<LocalAuthRegistry>,
@@ -192,6 +200,7 @@ impl AppState {
             ephemeral_identity_sweeper: Mutex::new(None),
             calls: Arc::new(CallRegistry::default()),
             device_link: Arc::new(DeviceLinkRegistry::default()),
+            replay_guard: Arc::new(crate::message_receive::ReplayGuard::default()),
             local_auth: Arc::new(LocalAuthRegistry::default()),
             passkey: Arc::new(passkey),
             network: None,

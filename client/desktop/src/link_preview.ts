@@ -20,6 +20,7 @@
 // `LINK_PREVIEW_SETTING_COPY` below for the exact wording shown in the UI.
 
 import { invoke } from "@tauri-apps/api/core";
+import { openExternal } from "./external_link";
 
 const SETTING_KEY = "bh_link_previews_enabled";
 
@@ -28,14 +29,18 @@ const SETTING_KEY = "bh_link_previews_enabled";
 // stated identically everywhere it's surfaced, not paraphrased differently
 // in different corners of the UI.
 export const LINK_PREVIEW_SETTING_COPY = {
-  label: "Show link previews",
+  label: "Allow link previews",
   warning:
-    "Off by default. Turning this on means that when a message contains a link, " +
-    "your device will connect directly to that link's website to fetch its " +
-    "title, description, and image — revealing your IP address and that you " +
-    "opened this link to that site's operator, outside Blackhole's control. " +
-    "This request never goes through Blackhole's daemon or network stack, " +
-    "but it is not anonymized or proxied either.",
+    "Off by default. With this on, a message containing a link gets a " +
+    "\"Load preview\" button — nothing is fetched until you press it. " +
+    "Pressing it makes your device connect directly to that link's website " +
+    "to fetch its title, description, and image, revealing your IP address " +
+    "and the fact that you opened this link to that site's operator, " +
+    "outside Blackhole's control. This request never goes through " +
+    "Blackhole's daemon or network stack, but it is not anonymized or " +
+    "proxied either. Previews are never loaded automatically: a sender " +
+    "must not be able to learn when you opened a conversation just by " +
+    "putting a link in it.",
 };
 
 // ---------------- opt-in setting ----------------
@@ -135,6 +140,35 @@ export function getCachedLinkPreview(url: string): LinkPreviewData | null | unde
 export function clearLinkPreviewCache(): void {
   cache.clear();
   inFlight.clear();
+  imageCache.clear();
+}
+
+interface FetchLinkPreviewImageResponse {
+  content_type: string;
+  bytes_base64: string;
+}
+
+// Resolved `data:` URLs, keyed by the remote image URL. `null` = fetched
+// and rejected (non-image, too large, unreachable, blocked address).
+const imageCache = new Map<string, string | null>();
+
+/// Fetches a preview image through the Tauri command and returns it as a
+/// `data:` URL — see `buildLinkPreviewCard` for why the webview must not
+/// request the remote URL itself.
+async function fetchPreviewImageDataUrl(imageUrl: string): Promise<string | null> {
+  const cached = imageCache.get(imageUrl);
+  if (cached !== undefined) return cached;
+  try {
+    const response = await invoke<FetchLinkPreviewImageResponse>("fetch_link_preview_image", {
+      url: imageUrl,
+    });
+    const dataUrl = `data:${response.content_type};base64,${response.bytes_base64}`;
+    imageCache.set(imageUrl, dataUrl);
+    return dataUrl;
+  } catch {
+    imageCache.set(imageUrl, null);
+    return null;
+  }
 }
 
 /// Fetches (or returns the cached result for) a link preview. Callers must
@@ -268,31 +302,84 @@ function decodeHtmlEntities(value: string): string {
 
 // ---------------- rendering ----------------
 
-// Renders a preview card for a link, or `null` if previews are off, the
-// text has no URL, or nothing came back for it (the caller should just
-// render nothing in that case rather than an empty box).
-export async function renderLinkPreviewCard(messageText: string): Promise<HTMLElement | null> {
+/**
+ * Builds the per-message preview slot: `null` when previews are off or the
+ * text has no URL, otherwise a container holding a "Load preview" button.
+ *
+ * **Nothing is fetched until that button is pressed.** This used to fetch
+ * eagerly for every rendered message, which meant opening a conversation
+ * fired one outbound request per link in its entire history — handing the
+ * sender a covert read receipt (they learn exactly when you opened the
+ * thread) plus your IP, with no interaction on your part, and for old
+ * messages from contacts you may since have blocked. The privacy tradeoff
+ * link previews carry is only acceptable when the user takes it
+ * deliberately, per link.
+ *
+ * A link already in `cache` renders immediately: its cost was paid the
+ * first time, and re-hiding it behind a button would only lose state the
+ * user already chose to reveal.
+ */
+export function renderLinkPreviewSlot(messageText: string): HTMLElement | null {
   if (!isLinkPreviewsEnabled()) return null;
   const url = findFirstUrl(messageText);
   if (!url) return null;
-  const data = await fetchLinkPreview(url);
-  if (!data) return null;
-  return buildLinkPreviewCard(data);
+
+  const slot = document.createElement("div");
+  slot.className = "link-preview-slot";
+
+  const cached = cache.get(url);
+  if (cached) {
+    slot.append(buildLinkPreviewCard(cached));
+    return slot;
+  }
+  if (cached === null) return null; // already tried, nothing renderable
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "link-preview-load";
+  button.textContent = "Load preview";
+  button.title = `Connects your device directly to ${url}`;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    button.textContent = "Loading…";
+    const data = await fetchLinkPreview(url);
+    slot.replaceChildren();
+    if (data) slot.append(buildLinkPreviewCard(data));
+  });
+  slot.append(button);
+  return slot;
 }
 
 export function buildLinkPreviewCard(data: LinkPreviewData): HTMLElement {
   const card = document.createElement("a");
   card.className = "link-preview-card";
   card.href = data.finalUrl;
-  card.target = "_blank";
   card.rel = "noopener noreferrer";
+  // `target="_blank"` did nothing in this webview; worse, a plain
+  // navigation would load the remote page in the same webview that holds
+  // the daemon bridge. Hand it to the OS browser instead — see
+  // `external_link.ts`.
+  card.addEventListener("click", (event) => {
+    event.preventDefault();
+    void openExternal(data.finalUrl);
+  });
 
   if (data.image) {
     const img = document.createElement("img");
     img.className = "link-preview-image";
-    img.src = data.image;
     img.alt = "";
-    img.loading = "lazy";
+    // Fetched through the Tauri command (same SSRF guards + pinned DNS
+    // resolver as the HTML fetch) and inlined as a `data:` URL, rather
+    // than pointing `src` at the remote host. An `og:image` is a URL the
+    // untrusted page chose: a direct `<img src>` would be issued by the
+    // webview's own network stack, which never passes through
+    // `validate_preview_url`/`PinningResolver`, so the page could aim it
+    // at loopback, the LAN, or an unrelated tracker. See
+    // `src-tauri/src/link_preview.rs::fetch_image`.
+    void fetchPreviewImageDataUrl(data.image).then((dataUrl) => {
+      if (dataUrl) img.src = dataUrl;
+      else img.remove();
+    });
     // A broken/unreachable preview image shouldn't leave a broken-image
     // icon sitting in the card — just drop the image slot.
     img.addEventListener("error", () => img.remove());

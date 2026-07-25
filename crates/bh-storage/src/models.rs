@@ -9,6 +9,41 @@ pub struct OwnIdentity {
     pub created_at: i64,
 }
 
+/// Marks this daemon as a linked *secondary* device of some account,
+/// rather than that account's primary — see `schema.rs`'s `SCHEMA_V21`
+/// doc comment for why this row has to exist at all and what its absence
+/// means.
+///
+/// The invariant worth stating once: a profile has **either** an
+/// `own_identity` row (it is the primary, holds the account's real
+/// identity, and is the only device that ever encrypts to a contact or
+/// touches MLS group state) **or** a `linked_account` row (it is a
+/// secondary, holds only its own per-device identity, and delegates every
+/// send to the primary). Never both — `Database::set_linked_account`
+/// rejects the combination rather than letting a daemon be quietly
+/// ambiguous about which side of that split it is on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedAccount {
+    /// The `devices.device_id` the primary assigned this device during
+    /// linking, so both sides agree on one identifier for it (the primary
+    /// needs it to revoke; this device needs it to name itself in a
+    /// delegated send).
+    pub device_id: String,
+    /// This device's own 64-byte `signing || agreement` public identity.
+    pub device_public_key: Vec<u8>,
+    /// This device's own identity in `IdentityKeyPair::export_bytes`
+    /// form (64 bytes), never the account's.
+    pub device_private_key: Vec<u8>,
+    /// The account's 64-byte public identity — both the sender to verify
+    /// inbound envelopes against and the address to send delegated work
+    /// to (see `SCHEMA_V21`).
+    pub account_public_key: Vec<u8>,
+    pub linked_at: i64,
+    /// Set when this device learns it has been revoked by the primary, so
+    /// it stops trying to delegate and the UI can say why it went quiet.
+    pub revoked_at: Option<i64>,
+}
+
 /// This identity's own long-term X3DH prekey material — see `schema.rs`'s
 /// `SCHEMA_V15` doc comment for the v1 scoping (one non-rotating signed
 /// prekey, no one-time prekeys). `bh-crypto::ratchet::SignedPreKey`/

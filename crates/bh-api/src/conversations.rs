@@ -113,9 +113,45 @@ pub async fn send_message(
     Path(conversation_id): Path<String>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, StatusCode> {
+    // A linked secondary device holds no ratchet session with any contact
+    // and no MLS state for any group, so it cannot encrypt this itself —
+    // and must not try (see `device_role.rs`'s module doc on why two
+    // devices sharing one ratchet reuse message keys). It asks the primary
+    // to send instead, and stores the message locally as pending until the
+    // primary answers.
+    if let Some(linked) = crate::device_role::active_linked_account(&state) {
+        return crate::device_delegation::delegate_send(&state, &linked, &conversation_id, req)
+            .await
+            .map(Json);
+    }
+    send_message_inner(&state, &conversation_id, req, None)
+        .await
+        .map(Json)
+}
+
+/// The one real send path in this codebase: local persistence plus, when a
+/// network is attached, genuine X3DH/Double-Ratchet (`Direct`) or MLS
+/// (`Group`) encryption and a mailbox push.
+///
+/// Split out of the handler above so a delegated send arriving from a
+/// linked secondary device (`device_delegation::handle_outbound_request`)
+/// goes through *exactly* this code rather than a parallel
+/// re-implementation — the property that keeps a secondary from ever
+/// needing contact key material.
+///
+/// `forced_message_id` lets that caller reuse the secondary's own
+/// `request_id` as the message id, which is what makes delegation
+/// idempotent against the database instead of against in-memory state a
+/// restart would lose.
+pub(crate) async fn send_message_inner(
+    state: &AppState,
+    conversation_id: &str,
+    req: SendMessageRequest,
+    forced_message_id: Option<String>,
+) -> Result<SendMessageResponse, StatusCode> {
     let conversation = state
         .db()
-        .get_conversation(&conversation_id)
+        .get_conversation(conversation_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
@@ -136,14 +172,14 @@ pub async fn send_message(
     if sender_contact_id.is_some() {
         let group = state
             .db()
-            .get_group_for_conversation(&conversation_id)
+            .get_group_for_conversation(conversation_id)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if group.is_some_and(|g| g.broadcast_only) {
             return Err(StatusCode::FORBIDDEN);
         }
     }
 
-    let message_id = uuid::Uuid::new_v4().to_string();
+    let message_id = forced_message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     match conversation.kind {
         // No counterparty for a self-conversation, so there is no
@@ -206,7 +242,7 @@ pub async fn send_message(
                 .encode()
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 crate::message_crypto::send_encrypted_over_network(
-                    &state,
+                    state,
                     network,
                     &contact,
                     &message_id,
@@ -241,7 +277,7 @@ pub async fn send_message(
                 .encode()
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 let ciphertext =
-                    crate::groups::encrypt_group_message(&state, group_id, &envelope_bytes)?;
+                    crate::groups::encrypt_group_message(state, group_id, &envelope_bytes)?;
 
                 let sent_at = now();
                 let pow = bh_network::mailbox::Mailbox::solve_pow(
@@ -271,12 +307,12 @@ pub async fn send_message(
     let sent_at = now();
     let expires_at = state
         .db()
-        .compute_message_expiry(&conversation_id, sent_at)
+        .compute_message_expiry(conversation_id, sent_at)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let message = Message {
         message_id,
-        conversation_id,
+        conversation_id: conversation_id.to_string(),
         sender_contact_id,
         body: Some(req.body),
         sent_at,
@@ -299,7 +335,7 @@ pub async fn send_message(
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         })?;
 
-    Ok(Json(SendMessageResponse { message }))
+    Ok(SendMessageResponse { message })
 }
 
 /// Edits a message's body, storing over the same local-storage path
