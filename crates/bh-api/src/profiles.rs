@@ -7,7 +7,6 @@
 //! payments and messaging, applied here between identities instead.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -21,16 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::device_sync::DeviceSyncRegistry;
 use crate::groups::GroupRegistry;
+use crate::now;
 use crate::presence::PresenceRegistry;
 use crate::state::ProfileSession;
 use crate::AppState;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 pub async fn list_profiles(
     State(state): State<Arc<AppState>>,

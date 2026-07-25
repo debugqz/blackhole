@@ -40,7 +40,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -53,19 +52,13 @@ use bh_storage::models::{Device, DeviceOwner};
 use serde::{Deserialize, Serialize};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
+use crate::now;
 use crate::AppState;
 
 #[derive(Default)]
 pub struct DeviceLinkRegistry {
     primary_sessions: Mutex<HashMap<String, LinkingSession>>,
     new_device_sessions: Mutex<HashMap<String, NewDevice>>,
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
 }
 
 fn own_identity_keypair(state: &AppState) -> Result<IdentityKeyPair, StatusCode> {

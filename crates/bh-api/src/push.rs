@@ -33,7 +33,9 @@
 
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::now;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -234,13 +236,6 @@ async fn register_with_relay(relay_url: &str, token: &str) -> Result<(), StatusC
     } else {
         Err(StatusCode::SERVICE_UNAVAILABLE)
     }
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
 }
 
 fn generate_token() -> Result<String, StatusCode> {

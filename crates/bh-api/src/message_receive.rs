@@ -32,10 +32,12 @@
 //! than treated as malformed.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bh_crypto::envelope::Envelope;
 use bh_crypto::identity::{recipient_key_hash, IdentityKeyPair};
+
+use crate::now;
 use bh_crypto::mls::MlsMember;
 use bh_crypto::ratchet::{self, session_associated_data, RatchetMessage, Session, SignedPreKey};
 use bh_network::sealed_sender::{self, SealedSenderEnvelope};
@@ -48,13 +50,6 @@ use crate::message_crypto::{
     OutgoingEnvelope,
 };
 use crate::AppState;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 /// Spawns the loop; runs for the daemon's process lifetime, following
 /// whichever profile is currently active (see module doc).

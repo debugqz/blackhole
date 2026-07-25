@@ -26,9 +26,11 @@
 //!   `Group`'s `Envelope::GroupInvite` delivery, since inviting someone
 //!   presupposes an existing 1:1 session with them.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::http::StatusCode;
+
+use crate::now;
 use bh_crypto::identity::{recipient_key_hash, IdentityKeyPair};
 use bh_crypto::pq_hybrid::HybridSecretKey;
 use bh_crypto::push_relay::PushRelayRecord;
@@ -54,17 +56,9 @@ pub(crate) const MAILBOX_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 /// This identity's one non-rotating signed prekey id (see module doc).
 const OWN_SIGNED_PREKEY_ID: u32 = 1;
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
-
 /// Loads this profile's real identity keypair — same pattern as
 /// `device_sync.rs::own_identity_keypair`, duplicated rather than shared
-/// across modules per this codebase's existing convention (see e.g. every
-/// file's own private `now()`).
+
 pub(crate) fn own_identity_keypair(state: &AppState) -> Result<IdentityKeyPair, StatusCode> {
     let own = state
         .db()

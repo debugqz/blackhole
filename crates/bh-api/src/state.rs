@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bh_crypto::auth::PasskeyManager;
+
+use crate::now;
 use bh_crypto::mls_storage::PersistentMlsProvider;
 use bh_crypto::CryptoError;
 use bh_network::supervised::SupervisedNetwork;
@@ -137,13 +139,6 @@ pub struct AppState {
 /// their `expires_at` — matches the interval `daemon/src/main.rs` used to
 /// pass in directly before this moved into `AppState`.
 const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 /// Auto check-in for the dead man's switch (`bh-api::dead_mans_switch`):
 /// called every time a profile becomes the active one — daemon boot for

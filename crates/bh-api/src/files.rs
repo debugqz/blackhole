@@ -23,11 +23,12 @@
 
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+
+use crate::now;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bh_files::chunking::{ChunkRef, Manifest};
@@ -54,13 +55,6 @@ pub const MAX_UPLOAD_BODY_BYTES: usize = 34 * 1024 * 1024;
 /// input reaching the filesystem directly (see `delete_attachment`).
 fn is_valid_content_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
 }
 
 pub(crate) fn chunk_dir(data_dir: &FsPath, content_hash: &str) -> PathBuf {

@@ -41,6 +41,13 @@ pub mod tree_head;
 pub use server::ApiServer;
 pub use state::AppState;
 
+pub fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before 1970")
+        .as_secs() as i64
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("server error: {0}")]

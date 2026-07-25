@@ -17,9 +17,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
+
+use crate::now;
 use axum::http::StatusCode;
 use axum::Json;
 use bh_crypto::auth::TotpSecret;
@@ -39,13 +40,6 @@ pub struct LocalAuthRegistry {
     /// Unconfirmed TOTP enrollments — not persisted until
     /// [`totp_enroll_confirm`] proves possession with a real code.
     pending_totp: Mutex<HashMap<String, TotpSecret>>,
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
 }
 
 /// There is exactly one local-auth identity per profile — a fixed nil UUID

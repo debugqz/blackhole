@@ -21,7 +21,6 @@
 //! a real BTCPay webhook config) can produce. See docs/THREAT_MODEL.md.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -33,6 +32,7 @@ use bh_storage::payments_models::{CosmeticCatalogItem, CryptoAsset, Purchase};
 use bh_storage::{PaymentsDatabase, StorageError};
 use serde::{Deserialize, Serialize};
 
+use crate::now;
 use crate::AppState;
 
 /// Header carrying the hex-encoded HMAC-SHA256 signature over the
@@ -85,13 +85,6 @@ fn verify_webhook_signature(
     } else {
         Err(StatusCode::UNAUTHORIZED)
     }
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
 }
 
 fn status_for(err: StorageError) -> StatusCode {

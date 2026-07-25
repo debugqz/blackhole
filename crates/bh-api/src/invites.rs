@@ -7,7 +7,6 @@
 //! not authoritatively enforce it (only the issuer's ledger can).
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -18,14 +17,8 @@ use bh_storage::invites::InviteValidity;
 use bh_storage::models::IssuedInvite;
 use serde::{Deserialize, Serialize};
 
+use crate::now;
 use crate::AppState;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 fn load_identity(state: &AppState) -> Result<IdentityKeyPair, StatusCode> {
     let stored = state

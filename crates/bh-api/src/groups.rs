@@ -57,9 +57,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
+
+use crate::now;
 use axum::http::StatusCode;
 use axum::Json;
 use bh_crypto::mls::{Group as MlsGroup, MlsMember};
@@ -163,13 +164,6 @@ impl GroupRegistry {
             .expect(LOCK_POISON_MSG)
             .insert(group_id.to_string(), group);
     }
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
 }
 
 const LOCK_POISON_MSG: &str = "groups registry lock poisoned";

@@ -4,7 +4,6 @@
 //! now, it's gone.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -13,14 +12,8 @@ use bh_crypto::identity::{IdentityKeyPair, SeedPhrase};
 use bh_storage::models::OwnIdentity;
 use serde::Serialize;
 
+use crate::now;
 use crate::AppState;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 fn split_public(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     if bytes.len() != 64 {

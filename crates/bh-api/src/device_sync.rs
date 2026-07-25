@@ -43,7 +43,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -54,6 +53,7 @@ use bh_crypto::ratchet::{self, PreKeyBundle, Session, SignedPreKey};
 use bh_storage::models::{Contact, ConversationKind};
 use serde::{Deserialize, Serialize};
 
+use crate::now;
 use crate::AppState;
 
 /// Live (in-memory-only, see module doc) Double Ratchet session state for
@@ -69,13 +69,6 @@ pub struct DeviceSyncRegistry {
 }
 
 const LOCK_POISON_MSG: &str = "device sync registry lock poisoned";
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 fn own_identity_keypair(state: &AppState) -> Result<IdentityKeyPair, StatusCode> {
     let own = state

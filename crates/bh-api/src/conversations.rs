@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -8,14 +7,8 @@ use bh_crypto::envelope::Envelope;
 use bh_storage::models::{Conversation, ConversationKind, Message};
 use serde::{Deserialize, Serialize};
 
+use crate::now;
 use crate::AppState;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 /// Every `GET /conversations` call is also this profile's "first access"
 /// check for the singleton local "Notes to self" conversation: lazily

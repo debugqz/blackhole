@@ -4,7 +4,6 @@
 //! never will be: that's a design principle, not a missing feature.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -12,14 +11,8 @@ use axum::Json;
 use bh_storage::models::{Message, MessageRequest, MessageRequestStatus};
 use serde::{Deserialize, Serialize};
 
+use crate::now;
 use crate::AppState;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 pub async fn unblock_contact(
     State(state): State<Arc<AppState>>,

@@ -137,6 +137,9 @@ body {
 body {
   color: var(--text);
   overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
   /* Ambient "event horizon" glow — the same accretion-disk gradient the
      avatars use, just diffuse and far in the background, behind whichever
      screen #app is currently showing (screens never stack — showOnly()
@@ -151,6 +154,16 @@ body {
 #app {
   height: 100vh;
   position: relative;
+
+  padding:
+    env(safe-area-inset-top, 0px)
+    env(safe-area-inset-right, 0px)
+    env(safe-area-inset-bottom, 0px)
+    env(safe-area-inset-left, 0px);
+}
+.selectable {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .screen {
@@ -203,6 +216,13 @@ button {
 
 input[type="checkbox"] {
   accent-color: var(--text);
+}
+
+img {
+  -webkit-user-drag: none;
+  user-drag: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 /* ---------------- unlock / seed screens ---------------- */

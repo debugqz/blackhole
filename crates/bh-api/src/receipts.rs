@@ -8,7 +8,6 @@
 //! decrypted by the intended recipient.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -16,14 +15,8 @@ use axum::Json;
 use bh_storage::models::{MessageReceipt, ReceiptStatus};
 use serde::Deserialize;
 
+use crate::now;
 use crate::AppState;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 #[derive(Deserialize)]
 pub struct RecordReceiptRequest {

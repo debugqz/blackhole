@@ -14,21 +14,14 @@
 //! local-storage-only behavior when `state.network` is `None`.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bh_crypto::identity::IdentityKeyPair;
 use bh_crypto::key_transparency::{entry_hash, sign_tree_head, tree_hash, verify_tree_head};
 use bh_network::supervised::SupervisedNetwork;
 use bh_network::tree_head::{fetch_tree_head, publish_tree_head};
 
+use crate::now;
 use crate::AppState;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 /// Publishes the currently-active profile's own tree head, if this daemon
 /// has both an identity and a live network attached. Logs and returns on

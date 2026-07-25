@@ -47,12 +47,13 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use bh_crypto::envelope::Envelope;
+
+use crate::now;
 use bh_crypto::identity::IdentityKeyPair;
 use bh_crypto::ratchet::{self, PreKeyBundle, Session, SignedPreKey};
 use bh_storage::models::{Contact, OwnIdentity};
@@ -63,13 +64,6 @@ use crate::AppState;
 /// How long a typing ping keeps the indicator lit before it's treated as
 /// stale. Purely a local display heuristic — never sent over the wire.
 const TYPING_TTL_SECS: i64 = 8;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 /// The sender-side and shadow-receiver-side halves of one conversation's
 /// Double Ratchet session — see the module doc for why both halves live in

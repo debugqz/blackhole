@@ -7,8 +7,6 @@
 //! this identity performs (`message_receive.rs`'s `Envelope::GroupInvite`
 //! handling calls [`regenerate_and_publish_own_key_package`] right after).
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use axum::http::StatusCode;
 use bh_crypto::identity::recipient_key_hash;
 use bh_crypto::mls::MlsMember;
@@ -16,14 +14,8 @@ use bh_network::key_package_directory;
 use bh_network::supervised::SupervisedNetwork;
 use bh_storage::models::OwnMlsKeyPackage;
 
+use crate::now;
 use crate::AppState;
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before 1970")
-        .as_secs() as i64
-}
 
 /// Generates a brand-new key package (a fresh `MlsMember`/signer — any
 /// previous one is abandoned, matching the single-use semantics the module
